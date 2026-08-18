@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polvista"
+version = "0.1.0"
+description = "Interactive PyQt5 visualizer for Faraday-depolarization models"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "medoug7" }]
+requires-python = ">=3.7"
+dependencies = [
+    "numpy",
+    "matplotlib",
+    "PyQt5",
+]
+
+[project.optional-dependencies]
+bayes = ["corner"]
+
+[project.scripts]
+polvista = "polvista.app:main"
+
+[tool.setuptools]
+packages = ["polvista"]
+package-dir = { "polvista" = "." }

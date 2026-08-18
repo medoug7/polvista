@@ -1,0 +1,80 @@
+\section{The complex polarization}
+We treat the linear polarization as a complex quantity by combining the fractional Stokes $q=Q/I$ and $u=U/I$ as shown in Equation \ref{eq:complex_pol}, where $p$ is the fractional linear polarization, and $\chi$ is the electric vector position angle (EVPA), given by Equation \ref{eq:evpa}:
+\begin{equation}\label{eq:complex_pol}
+    P = q+iu = p e^{2i\chi}
+\end{equation}
+\begin{equation}\label{eq:evpa}
+    \chi = \frac{1}{2}\arctan\left(\frac{u}{q}\right)
+\end{equation}
+
+Astrophysical radio sources are known to have $p$ and $\chi$ change with frequency, which is understood to be largely a consequence of the Faraday effect, whereby linearly polarized radiation propagating through a magnetized plasma experiences a rotation of its EVPAs in a wavelength-dependent manner. This medium is called the Faraday screen.
+
+In the simplest configuration, when the screen is uniform and spatially separated from the emitting region, it is said to be external, and it should cause a simple rotation of the EVPAs with a magnitude proportional to a quantity called the Rotation Measure (RM):
+\begin{equation}\label{eq:RM}
+    \text{RM} = \frac{d\chi}{d(\lambda^2)} \quad \textnormal{rad m}^2
+\end{equation}
+
+For this specific and very simple situation, we may write the polarization state of the observed radiation as $P(\lambda) = p e^{2i(\chi_0 + \phi\lambda^2)}$, where $\chi_0$ is the original (unrotated) EVPA, and the observed RM will be itendical to the Faraday depth:
+\begin{equation}\label{eq:depht}
+    \displaystyle\phi = 8.1\times 10^{5}\int \left(\frac{n_e}{\text{cm}^{-3}}\right) \left(\frac{B_\parallel}{\text{G}}\right) \left(\frac{dl}{\text{pc}}\right) \quad\textnormal{rad m}^{-2}
+\end{equation}
+where $n_e$ is the electron number density, $B_\parallel$ is the magnetic field component parallel to our line-of-sight, and $l$ is the path the radiation takes through the plasma towards the observer.
+
+The distinction between RM and Faraday depth is important because the RM is usually measured within relatively narrow regions of $\lambda$ space, and more complicated models for the Faraday screen can result in non-linear behavior of the EVPAs with $\lambda^2$ that only becomes clear when dealing with broadband polarimetric observations (spectropolarimetry).
+
+Furthermore, this simple picture expects the polarization degree to remain unchanged after the rotation $p=$constant, but real astronomical observation frequencly show $p$ decreasing towards longer wavelengths due to depolarization effects, and some sources can even display the opposite trend, i.e., longer wavelengths are more polarized, in what is called inverse or anomalous depolarization.
+
+Theoretical works can predict very complicated spectral behaviors for the polarization, depending on the nature of the screen or the number of Faraday components considered.
+The QU-fitting method allows us to deal with this complexity by directly fitting the wavelength dependence of the observed $q(\lambda)$ and $u(\lambda)$ to an analytical model of the screen.
+\\
+
+\section{Polarization models}
+
+\subsection{Turbulent external screen:}
+The simplest case that can account for depolarization is the one introduced by Burn in 1966, where turbulence in the external screen is characterized by a gaussian dispersion $\sigma_\phi$ of the Faraday depth related to the random field, which causes an exponential decrease in the degree of polarization with wavelength:
+\begin{equation}\label{eq:burn}
+    \displaystyle P = p_0e^{-2\sigma_\phi^2\lambda^4}e^{2i(\chi_0+\phi\lambda^2)}
+\end{equation}
+
+Note that this dispersion affects only the magnitude of the polarization $p$, leaving the $\chi(\lambda)$ behavior totally determined by the coherent field and, therefore, linear.
+\\
+
+\subsection{Partially resolved external screen:}
+Tribble developed this concept further in 1991 by considering how turbulence would change the observed polarization profile of a partially resolved source. In this model, $s = s_0/t$ is the ratio between the typical scale of the turbulent cells $s_0$ and the beam FWHM $t$, so the degree to which a source will be depolarized is essentially determined by how much of the RM structure can be resolved.
+\begin{center}
+$\displaystyle p(\lambda)  = p_0\sqrt{\frac{1-e^{-\frac{1}{2}s^2-4\sigma_\phi^2\lambda^4}}{1+8\sigma_\phi^2\lambda^4/s^2}+e^{-\frac{1}{2}s^2-4\sigma_\phi^2\lambda^4}}$
+\end{center}
+\begin{equation}\label{eq:tribble} 
+    \displaystyle  P  =  p(\lambda)e^{2i(\chi_0+\phi\lambda^2)}
+\end{equation}
+
+Equation \ref{eq:tribble} predicts a behavior similar to Burn's at higher frequencies but a slower $p\propto s/\lambda^{2}$ decrease at longer wavelengths. One can also see that we recover Burn's formula when the source is completely unresolved $s\rightarrow 0$; in the other extreme, if the RM structure is perfectly resolved $s\rightarrow \infty$, no depolarization should occur $p(\lambda)\rightarrow p_0$.
+\\
+
+\subsection{Partial coverage:}
+For some sources, $p$ may stabilizes around a certain value instead of decreasing to zero for longer wavelengths as Burn-like models predict. To account for this, Rossetti (2008) introduced the idea of an external turbulent screen that only covers a fraction $f$ of the emitting region, leaving the rest $(1-f)$ of the radiation unbothered.
+While their model can fit these particular cases, it was introduced in an ad-hoc way to reproduce the observed $p(\lambda)$ profiles without considering the effects of partial coverage on $\chi(\lambda)$, which would result from leaving some of the EVPAs unrotated. Therefore, to test partial coverage in a physically consistent way, we use the following prescription:
+\begin{equation}\label{eq:partial}
+    \displaystyle P=p_0 [fe^{-2\sigma_{\phi}^2\lambda^4}e^{2i(\chi_0+\phi\lambda^2)}+(1-f)e^{2i\chi_0}]
+\end{equation}
+
+The combination of rotated + unrotated radiation can produce an frequency-dependent interference pattern and lead to non-linear behavior in $\chi(\lambda^2)$.
+Equation \ref{eq:partial} reduces to the Burn model in the case of total coverage $f\rightarrow1$.
+\\
+
+\subsection{Internal rotation:}
+If the emitting and rotating regions are co-spatial, the screen is said to be internal. This might happen when the relativistic synchrotron-emitting plasma is mixed with thermal electrons, as the highly energetic electrons contribute less to the Faraday effect.
+Equation \ref{eq:intern} below describes a slab of emitting+rotating+depolarizing plasma from the original Burn paper from 1966.
+\begin{equation}\label{eq:intern}
+    \displaystyle P = p_0 \left[ \frac{1-e^{-2(\sigma_\phi^2\lambda^4-i\phi\lambda^2)}}{2(\sigma_\phi^2\lambda^4-i\phi\lambda^2)}\right] e^{2i\chi_0}
+\end{equation}
+
+The polarization spectrum of internal rotation with dispersion features an interference pattern from the radiation emitted at different Faraday depths within the source, which may lead to non-linear $\chi(\lambda^2)$ behavior.
+When the dispersion is small, the factor inside the brackets approaches $|\frac{\sin(\phi\lambda^2)}{\phi\lambda^2}|e^{i\phi\lambda^2}$, causing a characteristic regular beating behavior in $p(\lambda)$.
+\\
+
+\subsection{Multiple components:}
+Radio sources observed at arcsecond scales likely contain much substructure within the synthesized beam.
+Their total radiation then represents a superposition of emissions from all these different regions, which can have distinct intrinsic polarization and Faraday depths.
+Multi-component models can produce larger polarization at longer wavelengths than at shorter ones, which is relevant for cases of inverse depolarization. Additionally, the interference of the two components can also lead to non-linear $\chi(\lambda^2)$ behavior.
+
