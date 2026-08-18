@@ -542,7 +542,7 @@ class MeasurementsMixin:
         # added in.
         freq_rank = np.argsort([row.center.value() for row in self.band_rows]).argsort()
         rainbow = band_colors(len(self.band_rows))
-        band_colors = [rainbow[r] for r in freq_rank]
+        row_colors = [rainbow[r] for r in freq_rank]
 
         # Pin every band's own pivot -- both the Stokes I/Q/U amplitude
         # normalization (models.stokes_I's nu_min) and, for two-component
@@ -614,7 +614,7 @@ class MeasurementsMixin:
             p_obs, p_err = 100.0 * p_frac, 100.0 * p_frac_err
             X_obs_deg, X_err_deg = np.degrees(X_obs_rad), np.degrees(X_err_rad)
 
-            color = band_colors[b]
+            color = row_colors[b]
             w2 = wl_arr ** 2 * 1e6  # mm^2, matches ModelPlot's own convention
             p_bands.append(dict(color=color, w2=w2, p=p_obs, p_err=p_err,
                                  evpa=X_obs_deg, evpa_err=X_err_deg))

@@ -213,6 +213,17 @@ def comp2mixdep(x, params):
     return spectral_combine(x, term1, term2, eps, alpha1, alpha2)
 
 
+# Each two-component model's own per-component (term1, term2) building
+# blocks, in the same order as its own 11-param layout -- lets
+# stokes_components() recover each component's contribution without
+# duplicating comp2RMdep/comp2intern/comp2mixdep's own term selection.
+COMPONENT_TERM_FUNCS = {
+    comp2RMdep: (ext_term, ext_term),
+    comp2intern: (int_term, int_term),
+    comp2mixdep: (int_term, ext_term),
+}
+
+
 def evpa(fit):
     """EVPA [deg] of a complex fractional polarization array P = q+iu (e.g.
     a model's own p*e^(2i*chi) output)."""
@@ -284,6 +295,34 @@ def stokes_QU(wl, model, n_components, pars, nu_min=None):
     fit = model(wl, pars)
     I = stokes_I(wl, n_components, pars, nu_min=nu_min)
     return fit.real * I, fit.imag * I
+
+
+def stokes_components(wl, model, pars, nu_min=None):
+    """Decompose a two-component model's Stokes I/Q/U into each
+    component's own contribution: ((I1, Q1, U1), (I2, Q2, U2)), in the
+    same nu_min=1-normalized units as stokes_I/stokes_QU, so I1+I2 equals
+    stokes_I(...)'s own output and (Q1+Q2, U1+U2) equals stokes_QU(...)'s
+    -- each component's own term (see COMPONENT_TERM_FUNCS) weighted by
+    its own share (w1 or w2, see spectral_weights) of the same raw_ref
+    normalization stokes_I anchors the total to."""
+    term1_func, term2_func = COMPONENT_TERM_FUNCS[model]
+    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, eps, alpha1, alpha2 = pars
+    term1 = term1_func(wl, p1, X1, phi1, dphi1)
+    term2 = term2_func(wl, p2, X2, phi2, dphi2)
+
+    nu = C / wl / 1e6  # MHz
+    if nu_min is None:
+        nu_min = np.min(nu)
+    wl_ref = C / (nu_min * 1e6)  # wl [m] at nu_min, matching stokes_I's own anchor
+
+    w1, w2 = spectral_weights(wl, eps, alpha1, alpha2, nu_min=nu_min)
+    w1_ref, w2_ref = spectral_weights(np.array([wl_ref]), eps, alpha1, alpha2, nu_min=nu_min)
+    raw_ref = (w1_ref + w2_ref)[0]
+
+    I1, I2 = w1 / raw_ref, w2 / raw_ref
+    Q1, U1 = term1.real * I1, term1.imag * I1
+    Q2, U2 = term2.real * I2, term2.imag * I2
+    return (I1, Q1, U1), (I2, Q2, U2)
 
 
 # ── Model metadata: ModelSpec registry ────────────────────────────────────────

@@ -53,9 +53,11 @@ ensure_qt_plugin_path()
 import re
 import csv
 import json
+import colorsys
 
 import numpy as np
 import matplotlib as mpl
+import matplotlib.colors as mcolors
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QSlider, QComboBox,
@@ -66,16 +68,18 @@ from PyQt5.QtWidgets import (
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
+from matplotlib.collections import LineCollection
 
 from polvista.models import (
-    MODELS, MODELS_BY_NAME, C, Param, stokes_I, stokes_QU, evpa, pol,
+    MODELS, MODELS_BY_NAME, C, Param, stokes_I, stokes_QU, stokes_components, evpa, pol,
     set_spectral_shape, full_equation)
 from polvista.fitting import (
-    qu_fit, estimate_alpha, estimate_ssa_shape, fit_statistics, multinest_fit, load_previous_run)
+    qu_fit, estimate_alpha, estimate_ssa_shape, estimate_ssa_shape_2comp, fit_statistics,
+    multinest_fit, load_previous_run)
 from polvista.latex_stuff import latex_pixmap, fit_equation_pixmap, TexViewerDialog
 from polvista.widgets import ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDEST_UNIT
 from polvista.sampling import SamplingMixin
-from polvista.measurements import MeasurementsMixin
+from polvista.measurements import MeasurementsMixin, RAINBOW_HUE_MAX
 
 # pymultinest (Bayesian/nested-sampling fitting) is an optional dependency --
 # it's a compiled Fortran library wrapper that's a much heavier install than
@@ -111,6 +115,13 @@ mpl.rcParams['font.size'] = 16
 # negative numbers, scientific notation, wide mathtext labels) so the
 # right-side rotated ylabel + tick labels are always fully visible
 PLOT_MARGINS_PX = dict(left=85, right=125, bottom=75, top=25)
+
+# Continuous version of measurements.py's band_colors() red->violet HSV
+# sweep (same RAINBOW_HUE_MAX endpoint), used to color StokesPlot's Polar
+# view (Q, U) curve by frequency so it reads on the same red=low-nu,
+# violet=high-nu convention as the Measurements tab's simulated points.
+QU_RAINBOW_CMAP = mcolors.ListedColormap(
+    [colorsys.hsv_to_rgb(RAINBOW_HUE_MAX * t, 1.0, 1.0) for t in np.linspace(0, 1, 256)])
 
 
 def apply_fixed_margins(fig, canvas, extra_adjust=None):
@@ -590,62 +601,141 @@ class ModelPlot(FigureCanvas):
 
 
 class StokesPlot(FigureCanvas):
-    """Stokes I (left axis) and Q, U (right axis, twin) vs frequency nu [GHz]
-    -- the model's own trailing spectral params (alpha for a
+    """Stokes I (left subplot) and Q, U (right subplot) vs frequency nu
+    [GHz] -- the model's own trailing spectral params (alpha for a
     single component, eps/alpha1/alpha2 for two) double as a real
     (normalized, I_0=1) Stokes I(nu) model; Q(nu), U(nu) are then
     just I(nu) scaled by the same fractional-polarization complex number
-    p*e^(2i*EVPA) already used for the p/EVPA plot."""
+    p*e^(2i*EVPA) already used for the p/EVPA plot.
+
+    The two subplots sit flush against each other, no gap, matching
+    ModelPlot's own p/EVPA pair -- ax_QU's y-axis is mirrored onto its
+    right spine (see build_qu_mode) so its tick labels don't collide with
+    ax_I's across the shared middle seam.
+
+    The right subplot has two interchangeable views, picked via the
+    dropdown above it (see stokes_mode_combo): 'Spectra' plots Q(nu) and
+    U(nu) like the left subplot; 'Polar' instead plots the (Q, U)
+    trajectory traced out as nu varies, U vs Q, colored along its length
+    as a continuous red(low nu)->violet(high nu) rainbow (see
+    QU_RAINBOW_CMAP) matching the Measurements tab's own per-band
+    coloring. Its limits are square (equal Q/U numeric span) but the axes
+    box itself stays whatever rectangular shape the flush layout gives
+    it -- forcing a literal square box would fight the shared wspace=0
+    layout with ax_I. Switching modes rebuilds the right axis from
+    scratch (ax_QU.clear() + fresh artists) -- only happens on a rare,
+    user-initiated dropdown change, not per-frame, so it doesn't need the
+    set_data()-only treatment the rest of this canvas uses to keep slider
+    drags cheap."""
 
     def __init__(self, parent=None):
         self.fig = Figure(figsize=(10, 4))
         super().__init__(self.fig)
         self.setParent(parent)
-        self.ax_I = self.fig.add_subplot(111)
-        self.ax_QU = self.ax_I.twinx()
-        apply_fixed_margins(self.fig, self)
+        self.ax_I, self.ax_QU = self.fig.subplots(1, 2, gridspec_kw={'wspace': 0})
+        apply_fixed_margins(self.fig, self, extra_adjust={'wspace': 0.0})
 
         self.ax_I.set_xlabel(r'$\nu$ [ GHz ]')
-        self.ax_I.set_ylabel('I [ normalized ]')
-        self.ax_I.tick_params(axis='y')
+        self.ax_I.set_ylabel(r'$I$ [ normalized ]')
         self.ax_I.grid(True)
-        self.ax_QU.set_ylabel('Q, U [ normalized ]', rotation=270, labelpad=15)
-
-        self.line_I, = self.ax_I.plot([], [], color='black', label='I')
-        self.line_Q, = self.ax_QU.plot([], [], color='green', label='Q', linestyle='dashed')
-        self.line_U, = self.ax_QU.plot([], [], color='orange', label='U', linestyle='dashed')
-        lines = [self.line_I, self.line_Q, self.line_U]
-        self.ax_I.legend(lines, [l.get_label() for l in lines], loc='upper right')
+        self.line_I, = self.ax_I.plot([], [], color='black', label=r'$I$')
+        # Per-component curves for two-component models (see
+        # models.stokes_components) -- component 1 dashed, component 2
+        # dotted, same color as the total's own solid line; left empty
+        # (and so invisible) for single-component models. Spectra mode's
+        # own Q1/U1/Q2/U2 counterparts are built in build_qu_mode, since
+        # that axis is torn down/rebuilt on every mode switch.
+        self.line_I1, = self.ax_I.plot([], [], color='black', linestyle='dashed', label=r'$I_1$')
+        self.line_I2, = self.ax_I.plot([], [], color='black', linestyle='dotted', label=r'$I_2$')
+        # Tracks which legend (just 'I', or 'I'/'I_1'/'I_2') ax_I currently
+        # shows, so it's only rebuilt on an actual single/two-component
+        # switch (see update_plot) rather than on every redraw.
+        self.ax_I_two_comp = None
 
         self.xscale = None
+        self.mode = 'Spectra'
         self.ref_data = None  # (nu_ghz, I, I_err, Q, Q_err, U, U_err) or None
-        self.ref_artists = []
+        self.ref_artists_I = []
+        self.ref_artists_QU = []
         # See ModelPlot's own meas_bands/meas_artists -- same pattern,
         # keyed by nu/I/Q/U instead of w2/p/evpa.
         self.meas_bands = None
-        self.meas_artists = []
+        self.meas_artists_I = []
+        self.meas_artists_QU = []
 
-        # See ModelPlot.set_posterior_samples -- same pattern here.
+        # See ModelPlot.set_posterior_samples -- same pattern here. The
+        # right-hand pool (sample_lines_Q/U for Spectra, sample_lines_QU
+        # for Polar) is (re)built by build_qu_mode below, sized off
+        # self.posterior_samples, since it's mode-dependent.
         self.posterior_samples = None
         self.posterior_model = None
         self.sample_lines_I = []
         self.sample_lines_Q = []
         self.sample_lines_U = []
+        self.sample_lines_QU = []
+        self.line_Q = self.line_U = self.line_QU = None
+        self.line_Q1 = self.line_U1 = self.line_Q2 = self.line_U2 = None
+        self.build_qu_mode()
+
+    def build_qu_mode(self):
+        """(Re)configure the right-hand axis for self.mode: static
+        labels/grid/aspect, the main curve artist(s), and a posterior-
+        sample line pool sized to len(self.posterior_samples). Called
+        once at init, on every mode-dropdown switch, and whenever the
+        posterior-sample count changes (set_posterior_samples) -- all rare
+        enough that a full clear()+rebuild is fine."""
+        self.ax_QU.clear()
+        self.ax_QU.grid(True)
+        # Mirror the y-axis onto the right spine (like ModelPlot.ax_x) so
+        # it reads correctly against ax_I's own left-side axis across
+        # their shared, gapless seam.
+        self.ax_QU.yaxis.tick_right()
+        self.ax_QU.yaxis.set_label_position('right')
+        self.ref_artists_QU = []
+        self.meas_artists_QU = []
+        n_samples = len(self.posterior_samples) if self.posterior_samples is not None else 0
+        if self.mode == 'Polar':
+            self.ax_QU.set_xlabel(r'$Q$ [ normalized ]')
+            self.ax_QU.set_ylabel(r'$U$ [ normalized ]', rotation=270, labelpad=15)
+            self.line_Q = self.line_U = None
+            self.line_Q1 = self.line_U1 = self.line_Q2 = self.line_U2 = None
+            self.line_QU = LineCollection([], cmap=QU_RAINBOW_CMAP, norm=mcolors.Normalize(0, 1), zorder=3)
+            self.ax_QU.add_collection(self.line_QU)
+            self.sample_lines_Q, self.sample_lines_U = [], []
+            self.sample_lines_QU = [self.ax_QU.plot([], [], color='tab:purple', alpha=0.1, lw=0.6, zorder=1)[0]
+                                     for _ in range(n_samples)]
+        else:
+            self.ax_QU.set_xlabel(r'$\nu$ [ GHz ]')
+            self.ax_QU.set_ylabel(r'$Q$, $U$ [ normalized ]', rotation=270, labelpad=15)
+            self.ax_QU.set_xscale(self.xscale or 'linear')
+            self.line_QU = None
+            self.line_Q, = self.ax_QU.plot([], [], color='green', label=r'$Q$')
+            self.line_U, = self.ax_QU.plot([], [], color='orange', label=r'$U$')
+            # Per-component Q/U (see line_I1/line_I2) -- no label, so they
+            # stay out of the Q/U legend above.
+            self.line_Q1, = self.ax_QU.plot([], [], color='green', linestyle='dashed')
+            self.line_U1, = self.ax_QU.plot([], [], color='orange', linestyle='dashed')
+            self.line_Q2, = self.ax_QU.plot([], [], color='green', linestyle='dotted')
+            self.line_U2, = self.ax_QU.plot([], [], color='orange', linestyle='dotted')
+            self.ax_QU.legend(loc='upper right')
+            self.sample_lines_QU = []
+            self.sample_lines_Q = [self.ax_QU.plot([], [], color='green', alpha=0.08, lw=0.6, zorder=1)[0]
+                                    for _ in range(n_samples)]
+            self.sample_lines_U = [self.ax_QU.plot([], [], color='orange', alpha=0.08, lw=0.6, zorder=1)[0]
+                                    for _ in range(n_samples)]
+        self.draw_reference()
 
     def set_posterior_samples(self, samples, model_func):
-        for ln in self.sample_lines_I + self.sample_lines_Q + self.sample_lines_U:
+        for ln in self.sample_lines_I:
             ln.remove()
-        self.sample_lines_I, self.sample_lines_Q, self.sample_lines_U = [], [], []
+        self.sample_lines_I = []
         self.posterior_samples = samples
         self.posterior_model = model_func
         if samples is not None:
             for _ in range(len(samples)):
                 ln_I, = self.ax_I.plot([], [], color='black', alpha=0.08, lw=0.6, zorder=1)
-                ln_Q, = self.ax_QU.plot([], [], color='green', alpha=0.08, lw=0.6, zorder=1)
-                ln_U, = self.ax_QU.plot([], [], color='orange', alpha=0.08, lw=0.6, zorder=1)
                 self.sample_lines_I.append(ln_I)
-                self.sample_lines_Q.append(ln_Q)
-                self.sample_lines_U.append(ln_U)
+        self.build_qu_mode()
         self.draw_idle()
 
     def set_reference_data(self, nu_ghz, I, I_err, Q, Q_err, U, U_err):
@@ -664,35 +754,54 @@ class StokesPlot(FigureCanvas):
 
     # draw data
     def draw_reference(self):
-        for artist in self.ref_artists:
+        for artist in self.ref_artists_I:
             artist.remove()
-        self.ref_artists = []
+        self.ref_artists_I = []
+        for artist in self.ref_artists_QU:
+            artist.remove()
+        self.ref_artists_QU = []
         if self.ref_data is not None:
             nu, I, I_err, Q, Q_err, U, U_err = self.ref_data
-            self.ref_artists.append(self.ax_I.errorbar(
+            self.ref_artists_I.append(self.ax_I.errorbar(
                 nu, I, yerr=I_err, fmt='o', ms=4, color='black', ecolor='0.5', capsize=2, zorder=5))
-            self.ref_artists.append(self.ax_QU.errorbar(
-                nu, Q, yerr=Q_err, fmt='s', ms=4, color='darkgreen', ecolor='0.5', capsize=2, zorder=5))
-            self.ref_artists.append(self.ax_QU.errorbar(
-                nu, U, yerr=U_err, fmt='^', ms=4, color='darkorange', ecolor='0.5', capsize=2, zorder=5))
+            if self.mode == 'Polar':
+                self.ref_artists_QU.append(self.ax_QU.errorbar(
+                    Q, U, xerr=Q_err, yerr=U_err, fmt='o', ms=4, color='black', ecolor='0.5', capsize=2, zorder=5))
+            else:
+                self.ref_artists_QU.append(self.ax_QU.errorbar(
+                    nu, Q, yerr=Q_err, fmt='s', ms=4, color='darkgreen', ecolor='0.5', capsize=2, zorder=5))
+                self.ref_artists_QU.append(self.ax_QU.errorbar(
+                    nu, U, yerr=U_err, fmt='^', ms=4, color='darkorange', ecolor='0.5', capsize=2, zorder=5))
 
-        for artist in self.meas_artists:
+        for artist in self.meas_artists_I:
             artist.remove()
-        self.meas_artists = []
+        self.meas_artists_I = []
+        for artist in self.meas_artists_QU:
+            artist.remove()
+        self.meas_artists_QU = []
         if self.meas_bands:
             for band in self.meas_bands:
                 c = band['color']
-                self.meas_artists.append(self.ax_I.errorbar(
+                self.meas_artists_I.append(self.ax_I.errorbar(
                     band['nu'], band['I'], yerr=band['I_err'], fmt='o', ms=4, mew=0.5, mec='k',
                     color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
-                self.meas_artists.append(self.ax_QU.errorbar(
-                    band['nu'], band['Q'], yerr=band['Q_err'], fmt='s', ms=4, mew=0.5, mec='k',
-                    color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
-                self.meas_artists.append(self.ax_QU.errorbar(
-                    band['nu'], band['U'], yerr=band['U_err'], fmt='^', ms=4, mew=0.5, mec='k',
-                    color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
+                if self.mode == 'Polar':
+                    self.meas_artists_QU.append(self.ax_QU.errorbar(
+                        band['Q'], band['U'], xerr=band['Q_err'], yerr=band['U_err'], fmt='o', ms=4, mew=0.5,
+                        mec='k', color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
+                else:
+                    self.meas_artists_QU.append(self.ax_QU.errorbar(
+                        band['nu'], band['Q'], yerr=band['Q_err'], fmt='s', ms=4, mew=0.5, mec='k',
+                        color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
+                    self.meas_artists_QU.append(self.ax_QU.errorbar(
+                        band['nu'], band['U'], yerr=band['U_err'], fmt='^', ms=4, mew=0.5, mec='k',
+                        color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
 
-    def update_plot(self, wl_ext, model_func, n_components, pars, log_xscale=False, nu_min=None):
+    def update_plot(self, wl_ext, model_func, n_components, pars, log_xscale=False, nu_min=None, mode='Spectra'):
+        if mode != self.mode:
+            self.mode = mode
+            self.build_qu_mode()
+
         I = stokes_I(wl_ext, n_components, pars, nu_min=nu_min)
         Q, U = stokes_QU(wl_ext, model_func, n_components, pars, nu_min=nu_min)
         nu_ghz = C / wl_ext / 1e9
@@ -700,57 +809,148 @@ class StokesPlot(FigureCanvas):
         order = np.argsort(nu_ghz)
         nu_s, I_s, Q_s, U_s = nu_ghz[order], I[order], Q[order], U[order]
 
+        two_comp = n_components == 2
+        if two_comp:
+            (I1, Q1, U1), (I2, Q2, U2) = stokes_components(wl_ext, model_func, pars, nu_min=nu_min)
+            I1_s, Q1_s, U1_s = I1[order], Q1[order], U1[order]
+            I2_s, Q2_s, U2_s = I2[order], Q2[order], U2[order]
+
+        if two_comp != self.ax_I_two_comp:
+            self.ax_I_two_comp = two_comp
+            handles = [self.line_I, self.line_I1, self.line_I2] if two_comp else [self.line_I]
+            self.ax_I.legend(handles, [h.get_label() for h in handles], loc='upper right')
+
         xscale = 'log' if log_xscale else 'linear'
         if xscale != self.xscale:
             self.ax_I.set_xscale(xscale)
+            if self.mode == 'Spectra':
+                self.ax_QU.set_xscale(xscale)
             self.xscale = xscale
 
         self.line_I.set_data(nu_s, I_s)
-        self.line_Q.set_data(nu_s, Q_s)
-        self.line_U.set_data(nu_s, U_s)
+        if two_comp:
+            self.line_I1.set_data(nu_s, I1_s)
+            self.line_I2.set_data(nu_s, I2_s)
+        else:
+            self.line_I1.set_data([], [])
+            self.line_I2.set_data([], [])
 
         show_samples = self.posterior_samples is not None and self.posterior_model is model_func
-        sample_lines = zip(self.sample_lines_I, self.sample_lines_Q, self.sample_lines_U)
-        for i, (ln_I, ln_Q, ln_U) in enumerate(sample_lines):
+        for i, ln_I in enumerate(self.sample_lines_I):
             if show_samples:
-                s_pars = self.posterior_samples[i]
-                s_I = stokes_I(wl_ext, n_components, s_pars, nu_min=nu_min)[order]
-                s_Q, s_U = (a[order] for a in stokes_QU(wl_ext, model_func, n_components, s_pars, nu_min=nu_min))
+                s_I = stokes_I(wl_ext, n_components, self.posterior_samples[i], nu_min=nu_min)[order]
                 ln_I.set_data(nu_s, s_I)
-                ln_Q.set_data(nu_s, s_Q)
-                ln_U.set_data(nu_s, s_U)
             else:
                 ln_I.set_data([], [])
-                ln_Q.set_data([], [])
-                ln_U.set_data([], [])
+
+        if self.mode == 'Polar':
+            points = np.column_stack([Q_s, U_s]).reshape(-1, 1, 2)
+            segments = np.concatenate([points[:-1], points[1:]], axis=1)
+            self.line_QU.set_segments(segments)
+            # Color by each segment's own log10(nu) position within
+            # [nu_min, nu_max], not by index/sample order -- keeps the
+            # rainbow gradient identical regardless of whether the
+            # wavelength grid itself was sampled log- or linearly
+            # (log_xscale toggle), always matching the log-scale spacing.
+            # nu_s is sorted ascending, so this still walks low nu (red)
+            # -> high nu (violet) like band_colors().
+            log_nu = np.log10(nu_s)
+            span = log_nu[-1] - log_nu[0] if len(log_nu) else 0.0
+            t = (log_nu - log_nu[0]) / span if span > 0 else np.zeros_like(log_nu)
+            self.line_QU.set_array(t[:-1])
+            for i, ln_QU in enumerate(self.sample_lines_QU):
+                if show_samples:
+                    s_Q, s_U = (a[order] for a in stokes_QU(
+                        wl_ext, model_func, n_components, self.posterior_samples[i], nu_min=nu_min))
+                    ln_QU.set_data(s_Q, s_U)
+                else:
+                    ln_QU.set_data([], [])
+        else:
+            self.line_Q.set_data(nu_s, Q_s)
+            self.line_U.set_data(nu_s, U_s)
+            if two_comp:
+                self.line_Q1.set_data(nu_s, Q1_s)
+                self.line_U1.set_data(nu_s, U1_s)
+                self.line_Q2.set_data(nu_s, Q2_s)
+                self.line_U2.set_data(nu_s, U2_s)
+            else:
+                self.line_Q1.set_data([], [])
+                self.line_U1.set_data([], [])
+                self.line_Q2.set_data([], [])
+                self.line_U2.set_data([], [])
+            for i, (ln_Q, ln_U) in enumerate(zip(self.sample_lines_Q, self.sample_lines_U)):
+                if show_samples:
+                    s_Q, s_U = (a[order] for a in stokes_QU(
+                        wl_ext, model_func, n_components, self.posterior_samples[i], nu_min=nu_min))
+                    ln_Q.set_data(nu_s, s_Q)
+                    ln_U.set_data(nu_s, s_U)
+                else:
+                    ln_Q.set_data([], [])
+                    ln_U.set_data([], [])
 
         xlo, xhi = nu_s.min() * 0.9, nu_s.max() * 1.05
         i_max = max(I_s.max(), 1e-6)
-        qu_max = max(np.abs(Q_s).max(), np.abs(U_s).max(), 1e-6)
+        # Total-only Q/U extent -- what the Polar view's own limits are
+        # based on (see below): it only ever draws the total curve, so
+        # widening it to also cover the per-component curves (Spectra-only
+        # artists) would make its square limits depend on lines it never
+        # shows. q_min_spectra/q_max_spectra etc. are the Spectra view's
+        # own (component-widened) counterpart.
+        q_min, q_max = float(Q_s.min()), float(Q_s.max())
+        u_min, u_max = float(U_s.min()), float(U_s.max())
+        if two_comp:
+            i_max = max(i_max, I1_s.max(), I2_s.max())
         # Widen the autoscale to also cover any reference data loaded via
         # the Load Data... button, so it isn't silently clipped out of view.
         if self.ref_data is not None:
             ref_nu, ref_I, _, ref_Q, _, ref_U, _ = self.ref_data
             xlo, xhi = min(xlo, ref_nu.min() * 0.9), max(xhi, ref_nu.max() * 1.05)
             i_max = max(i_max, ref_I.max())
-            qu_max = max(qu_max, np.abs(ref_Q).max(), np.abs(ref_U).max())
+            q_min, q_max = min(q_min, ref_Q.min()), max(q_max, ref_Q.max())
+            u_min, u_max = min(u_min, ref_U.min()), max(u_max, ref_U.max())
         if self.meas_bands:
             for band in self.meas_bands:
                 xlo = min(xlo, band['nu'].min() * 0.9)
                 xhi = max(xhi, band['nu'].max() * 1.05)
                 i_max = max(i_max, (band['I'] + band['I_err']).max())
-                qu_max = max(qu_max, (np.abs(band['Q']) + band['Q_err']).max(),
-                              (np.abs(band['U']) + band['U_err']).max())
+                q_min = min(q_min, (band['Q'] - band['Q_err']).min())
+                q_max = max(q_max, (band['Q'] + band['Q_err']).max())
+                u_min = min(u_min, (band['U'] - band['U_err']).min())
+                u_max = max(u_max, (band['U'] + band['U_err']).max())
+
+        q_min_spectra, q_max_spectra = q_min, q_max
+        u_min_spectra, u_max_spectra = u_min, u_max
+        if two_comp:
+            q_min_spectra = min(q_min_spectra, Q1_s.min(), Q2_s.min())
+            q_max_spectra = max(q_max_spectra, Q1_s.max(), Q2_s.max())
+            u_min_spectra = min(u_min_spectra, U1_s.min(), U2_s.min())
+            u_max_spectra = max(u_max_spectra, U1_s.max(), U2_s.max())
 
         self.ax_I.set_xlim(xlo, xhi)
         self.ax_I.set_ylim(0, 1.3 * i_max)
-        self.ax_QU.set_ylim(-1.3 * qu_max, 1.3 * qu_max)
+
+        if self.mode == 'Polar':
+            # Square numeric limits (not a square axes box -- see class
+            # docstring): +/-1.25 * the larger of Q's and U's own max
+            # absolute extent, based on the total curve alone (+ ref/meas
+            # data) -- the Polar view never draws the per-component
+            # curves, so they don't belong in its own limits (see
+            # q_min/q_max/u_min/u_max above).
+            half_side = 1.25 * max(max(abs(q_min), abs(q_max)), max(abs(u_min), abs(u_max)))
+            half_side = max(half_side, 1e-6)
+            self.ax_QU.set_xlim(-half_side, half_side)
+            self.ax_QU.set_ylim(-half_side, half_side)
+        else:
+            qu_max = max(abs(q_min_spectra), abs(q_max_spectra), abs(u_min_spectra), abs(u_max_spectra), 1e-6)
+            self.ax_QU.set_xlim(xlo, xhi)
+            self.ax_QU.set_ylim(-1.3 * qu_max, 1.3 * qu_max)
+
         self.draw_reference()
         self.draw_idle()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        apply_fixed_margins(self.fig, self)
+        apply_fixed_margins(self.fig, self, extra_adjust={'wspace': 0.0})
 
 
 class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
@@ -1028,7 +1228,17 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         stokes_tab = QWidget()
         stokes_layout = QVBoxLayout(stokes_tab)
         stokes_layout.setContentsMargins(0, 0, 0, 0)
-        stokes_layout.addWidget(self.stokes_toolbar)
+
+        stokes_top_row = QHBoxLayout()
+        stokes_top_row.addWidget(self.stokes_toolbar)
+        stokes_top_row.addStretch(1)
+        stokes_top_row.addWidget(QLabel('Q, U view:'))
+        self.stokes_mode_combo = QComboBox()
+        self.stokes_mode_combo.addItems(['Spectra', 'Polar'])
+        self.stokes_mode_combo.currentIndexChanged.connect(self.update_plot)
+        stokes_top_row.addWidget(self.stokes_mode_combo)
+        stokes_layout.addLayout(stokes_top_row)
+
         stokes_layout.addWidget(self.stokes_canvas, stretch=1)
 
         # QTabWidget switches between the plot pages via clickable tabs. A
@@ -1233,7 +1443,8 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         log_xscale = self.log_xscale.isChecked()
         self.canvas.update_plot(wl_ext, func, pars, log_xscale=log_xscale)
         self.stokes_canvas.update_plot(wl_ext, func, spec.n_components, pars,
-                                        log_xscale=log_xscale, nu_min=self.data_nu_min)
+                                        log_xscale=log_xscale, nu_min=self.data_nu_min,
+                                        mode=self.stokes_mode_combo.currentText())
 
     # ── Menu bar ───────────────────────────────────────────────────────────
     def build_menu(self):
@@ -1343,11 +1554,16 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         regression under 'ssa' (see estimate_ssa_shape, and
         build_nu0_slider for why nu_0 only joins that regression once its
         own slider is unchecked) -- rather than being fit alongside
-        p/X/phi/dphi. For a two-component model, alpha1/alpha2 (and, under
-        'ssa', nu_0,1/nu_0,2) all end up equal: there's only one real I(nu)
-        dataset, so a single combined intensity regression is all QU-only
-        fitting can ever be anchored to -- same reasoning FIT_FIXED_EPSILON
-        already relies on.
+        p/X/phi/dphi. For a two-component model, alpha1/alpha2 always end
+        up equal: there's only one real I(nu) dataset, so a single shared
+        spectral index is all QU-only fitting can ever anchor two
+        components to -- same reasoning FIT_FIXED_EPSILON already relies
+        on. Under 'ssa', nu_0,1/nu_0,2 are the exception: each is fit or
+        pinned independently against that same shared-alpha regression,
+        per its own nu0_slider_1/2 fixed checkbox (see
+        estimate_ssa_shape_2comp) -- not forced equal, since a fixed
+        component's own turnover frequency is meaningful chosen input, not
+        just an unconstrained initial guess.
 
         Any slider whose fix_checkbox is checked is additionally (or
         instead, for epsilon/alpha) held fixed at its own current value()
@@ -1370,15 +1586,29 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         alpha_indices = spec.indices('alpha')
         if self.shape_combo.currentData() == 'ssa' and alpha_indices:
             alpha_init = self.sliders[alpha_indices[0]].value()
-            nu0_init_ghz = self.nu0_slider_1.value()
-            fit_nu0 = not self.nu0_slider_1.is_fixed()
             nu0_lo_ghz, nu0_hi_ghz = self.nu0_slider_1.bounds()
-            alpha_est, nu0_est_ghz = estimate_ssa_shape(
-                freq, I, nu0_init_ghz * 1e9, alpha_init,
-                (nu0_lo_ghz * 1e9, nu0_hi_ghz * 1e9), fit_nu0)
-            nu0_est_ghz = nu0_est_ghz / 1e9
-            self.nu0_slider_1.set_value(nu0_est_ghz)
-            self.nu0_slider_2.set_value(nu0_est_ghz)
+            nu0_bounds_hz = (nu0_lo_ghz * 1e9, nu0_hi_ghz * 1e9)
+            if spec.n_components == 2:
+                # Each component's own nu_0 is fit or pinned independently
+                # (per its own slider's fixed checkbox), never forced
+                # equal -- alpha is still shared, same reasoning
+                # FIT_FIXED_EPSILON below relies on for eps (see
+                # estimate_ssa_shape_2comp). eps itself mirrors the `fixed`
+                # dict built below: FIT_FIXED_EPSILON unless the user has
+                # pinned the eps slider to their own value.
+                eps_idx = spec.indices('eps')[0]
+                eps_val = self.sliders[eps_idx].value() if self.sliders[eps_idx].is_fixed() else FIT_FIXED_EPSILON
+                alpha_est, nu0_1_est_ghz, nu0_2_est_ghz = estimate_ssa_shape_2comp(
+                    freq, I, eps_val,
+                    self.nu0_slider_1.value() * 1e9, self.nu0_slider_2.value() * 1e9, alpha_init,
+                    nu0_bounds_hz, not self.nu0_slider_1.is_fixed(), not self.nu0_slider_2.is_fixed())
+                self.nu0_slider_1.set_value(nu0_1_est_ghz / 1e9)
+                self.nu0_slider_2.set_value(nu0_2_est_ghz / 1e9)
+            else:
+                alpha_est, nu0_est_ghz = estimate_ssa_shape(
+                    freq, I, self.nu0_slider_1.value() * 1e9, alpha_init,
+                    nu0_bounds_hz, not self.nu0_slider_1.is_fixed())
+                self.nu0_slider_1.set_value(nu0_est_ghz / 1e9)
             self.sync_nu0_ui()
         else:
             alpha_est = estimate_alpha(freq, I)

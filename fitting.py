@@ -259,6 +259,71 @@ def estimate_ssa_shape(freq, I, nu0_init, alpha_init, nu0_bounds, fit_nu0):
     return alpha_est, nu0_est
 
 
+def estimate_ssa_shape_2comp(freq, I, eps, nu0_1_init, nu0_2_init, alpha_init,
+                               nu0_bounds, fit_nu0_1, fit_nu0_2):
+    """Two-component counterpart of estimate_ssa_shape: nonlinear
+    regression of loaded I(nu) data against a shared-alpha SSA blend
+    eps*S'(nu; nu0_1, alpha) + (1-eps)*S'(nu; nu0_2, alpha) (see
+    source_function), anchored the same log(I/I[i0]) way. alpha is always
+    shared between both components -- QU-only fitting has only one real
+    I(nu) dataset to anchor it to, same reasoning FIT_FIXED_EPSILON
+    already relies on (see MainWindow.fit_spectrum_lsq) -- but nu0_1 and
+    nu0_2 are each independently fit or held pinned at their own *_init,
+    per fit_nu0_1/fit_nu0_2 (MainWindow.nu0_slider_1/2's own fixed
+    checkboxes), rather than forced equal: with both pinned, only alpha is
+    optimized (1-D); with exactly one free, that one nu0 and alpha are
+    jointly solved (2-D); with both free, all three go into one joint
+    solve (3-D).
+
+    Returns (alpha_est, nu0_1_est, nu0_2_est) -- a pinned nu0 is just its
+    own *_init echoed back. Falls back to all *_init values if every point
+    is at the same frequency (shape undefined) or the solve doesn't
+    converge."""
+    freq = np.asarray(freq)
+    I = np.asarray(I)
+    i0 = np.argmin(freq)
+    if np.all(freq == freq[i0]):
+        return 0.0, nu0_1_init, nu0_2_init
+    target = np.log(I / I[i0])
+
+    def shape_log_ratio(nu0_1, nu0_2, alpha):
+        S = eps * source_function(freq, nu0_1, alpha) + (1.0 - eps) * source_function(freq, nu0_2, alpha)
+        return np.log(S / S[i0])
+
+    lo_nu0, hi_nu0 = nu0_bounds
+
+    if not fit_nu0_1 and not fit_nu0_2:
+        result = least_squares(
+            lambda p: shape_log_ratio(nu0_1_init, nu0_2_init, p[0]) - target, x0=[alpha_init])
+        alpha_est = float(result.x[0]) if result.success else alpha_init
+        return alpha_est, nu0_1_init, nu0_2_init
+
+    if fit_nu0_1 and not fit_nu0_2:
+        result = least_squares(
+            lambda p: shape_log_ratio(p[0], nu0_2_init, p[1]) - target,
+            x0=[nu0_1_init, alpha_init], bounds=([lo_nu0, -np.inf], [hi_nu0, np.inf]))
+        if not result.success:
+            return alpha_init, nu0_1_init, nu0_2_init
+        return float(result.x[1]), float(result.x[0]), nu0_2_init
+
+    if fit_nu0_2 and not fit_nu0_1:
+        result = least_squares(
+            lambda p: shape_log_ratio(nu0_1_init, p[0], p[1]) - target,
+            x0=[nu0_2_init, alpha_init], bounds=([lo_nu0, -np.inf], [hi_nu0, np.inf]))
+        if not result.success:
+            return alpha_init, nu0_1_init, nu0_2_init
+        return float(result.x[1]), nu0_1_init, float(result.x[0])
+
+    result = least_squares(
+        lambda p: shape_log_ratio(p[0], p[1], p[2]) - target,
+        x0=[nu0_1_init, nu0_2_init, alpha_init],
+        bounds=([lo_nu0, lo_nu0, -np.inf], [hi_nu0, hi_nu0, np.inf]))
+    if not result.success:
+        return alpha_init, nu0_1_init, nu0_2_init
+    nu0_1_est, nu0_2_est, alpha_est = float(result.x[0]), float(result.x[1]), float(result.x[2])
+    return alpha_est, nu0_1_est, nu0_2_est
+
+
 # ── Bayesian (MultiNest) fitting ─────────────────────────────────────────────
 # Ported, down-scoped from ~/Downloads/pipe/qu_fit.py's MultiNest pipeline:
 # the unit-cube prior reparametrization (X's domain seam moved off +-pi/2,
@@ -686,8 +751,8 @@ def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
         modes.append(mode_summary(pars_pol, weight, logz, kinds_pol, rng))
 
     id_idx = mode_id_indices(kinds_pol)
-    swap_perm = swap_perm(kinds_pol) if model in DEGENERATE_PAIR_MODELS else None
-    groups = union_find_merge(modes, threshold, id_idx, kinds_pol, swap_perm)
+    perm = swap_perm(kinds_pol) if model in DEGENERATE_PAIR_MODELS else None
+    groups = union_find_merge(modes, threshold, id_idx, kinds_pol, perm)
 
     family_logz = [logsumexp([modes[k]['logz'] for k in g]) for g in groups]
     total_logz  = logsumexp(family_logz)
@@ -700,10 +765,10 @@ def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
         member_share = np.exp(member_logz - logsumexp(member_logz))
         n_per_member = np.maximum(np.round(member_share * 20000).astype(int), 1)
 
-        if swap_perm is not None:
+        if perm is not None:
             anchor_k = group[int(np.argmax(member_logz))]
             anchor = modes[anchor_k]
-            needs_swap = {k: (k != anchor_k and mode_swap_needed(anchor, modes[k], id_idx, kinds_pol, swap_perm))
+            needs_swap = {k: (k != anchor_k and mode_swap_needed(anchor, modes[k], id_idx, kinds_pol, perm))
                           for k in group}
         else:
             needs_swap = {k: False for k in group}
@@ -714,7 +779,7 @@ def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
             idx = pool_rng.choice(len(w), size=n_i, replace=True, p=w / w.sum())
             raw = modes[k]['pars_raw'][idx]
             if needs_swap[k]:
-                raw = raw[:, swap_perm]
+                raw = raw[:, perm]
             parts.append(raw)
         pooled_samples = np.concatenate(parts, axis=0)
 
@@ -792,16 +857,16 @@ def multinest_fit(wl, q, q_err, u, u_err, model, spectral_pars, kind_bounds,
 
     spec = MODELS[model]
     ndim_full = len(spec.params)
-    pol_idx = pol_idx(spec)
-    kinds_pol = [spec.params[i].kind for i in pol_idx]
-    ndim = len(pol_idx)
+    idx_pol = pol_idx(spec)
+    kinds_pol = [spec.params[i].kind for i in idx_pol]
+    ndim = len(idx_pol)
 
     y = np.asarray(q) + 1j * np.asarray(u)
     y_errs = np.asarray(q_err) + 1j * np.asarray(u_err)
     wl = np.asarray(wl)
 
-    cube_order = cube_order(kinds_pol)
-    kinds_cube = [kinds_pol[i] for i in cube_order]
+    order_cube = cube_order(kinds_pol)
+    kinds_cube = [kinds_pol[i] for i in order_cube]
     n_clustering_params = sum(1 for k in kinds_cube if k in ('X', 'phi'))
 
     def prior(cube, ndim_, nparams):
@@ -837,10 +902,10 @@ def multinest_fit(wl, q, q_err, u, u_err, model, spectral_pars, kind_bounds,
     def loglike(cube, ndim_, nparams):
         cube_vals = [cube[i] for i in range(ndim_)]
         pol_vals = [None] * ndim
-        for i, local_i in enumerate(cube_order):
+        for i, local_i in enumerate(order_cube):
             pol_vals[local_i] = cube_vals[i]
         m_pars = [0.0] * ndim_full
-        for i, v in zip(pol_idx, pol_vals):
+        for i, v in zip(idx_pol, pol_vals):
             m_pars[i] = v
         for i, v in spectral_pars.items():
             m_pars[i] = v
@@ -875,8 +940,8 @@ def multinest_fit(wl, q, q_err, u, u_err, model, spectral_pars, kind_bounds,
     analyzer = pymultinest.Analyzer(n_params=ndim, outputfiles_basename=outputfiles_basename)
     stats = analyzer.get_stats()
 
-    best_family_result = best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars, pol_idx, cube_order)
-    return assemble_result(spec, pol_idx, spectral_pars, best_family_result,
+    best_family_result = best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars, idx_pol, order_cube)
+    return assemble_result(spec, idx_pol, spectral_pars, best_family_result,
                              stats['global evidence'], stats['global evidence error'], 2 * len(wl))
 
 
@@ -956,10 +1021,10 @@ def load_previous_run(wl, q, q_err, u, u_err, model, spectral_pars, outputfiles_
     import pymultinest
 
     spec = MODELS[model]
-    pol_idx = pol_idx(spec)
-    kinds_pol = [spec.params[i].kind for i in pol_idx]
-    ndim = len(pol_idx)
-    cube_order = cube_order(kinds_pol)
+    idx_pol = pol_idx(spec)
+    kinds_pol = [spec.params[i].kind for i in idx_pol]
+    ndim = len(idx_pol)
+    order_cube = cube_order(kinds_pol)
 
     y = np.asarray(q) + 1j * np.asarray(u)
     y_errs = np.asarray(q_err) + 1j * np.asarray(u_err)
@@ -968,6 +1033,6 @@ def load_previous_run(wl, q, q_err, u, u_err, model, spectral_pars, outputfiles_
     analyzer = pymultinest.Analyzer(n_params=ndim, outputfiles_basename=outputfiles_basename)
     stats = analyzer.get_stats()
 
-    best_family_result = best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars, pol_idx, cube_order)
-    return assemble_result(spec, pol_idx, spectral_pars, best_family_result,
+    best_family_result = best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars, idx_pol, order_cube)
+    return assemble_result(spec, idx_pol, spectral_pars, best_family_result,
                              stats['global evidence'], stats['global evidence error'], 2 * len(wl))
