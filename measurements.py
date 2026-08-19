@@ -203,30 +203,60 @@ VLA_LOW_BANDS = [VLA_L, VLA_S, VLA_C, VLA_X]
 VLA_HIGH_BANDS = [VLA_K, VLA_KA, VLA_Q]
 VLA_ALL_BANDS = [VLA_L, VLA_S, VLA_C, VLA_X, VLA_KU, VLA_K, VLA_KA, VLA_Q]
 
-# MeerKAT -- UHF and L band (S band's 1750-3499 MHz falls almost entirely
-# outside the Full MeerKat preset's own 500-1800 MHz range, so it's left
-# out here), https://skaafrica.atlassian.net/wiki/spaces/ESDKB/pages/277315585/MeerKAT+specifications
+# MeerKAT -- UHF, L, and S band, https://skaafrica.atlassian.net/wiki/spaces/ESDKB/pages/277315585/MeerKAT+specifications
 MEERKAT_UHF = (0.77, 0.54, 4)   # UHF band: 544-1087 MHz
 MEERKAT_L = (1.21, 0.86, 4)     # L band:   856-1711 MHz
-MEERKAT_ALL_BANDS = [MEERKAT_UHF, MEERKAT_L]
+MEERKAT_S = (2.47, 1.75, 4)     # S band:   1750-3499 MHz
+MEERKAT_ALL_BANDS = [MEERKAT_UHF, MEERKAT_L, MEERKAT_S]
+
+# SDSS-like optical filters (g, r, i, z) -- SPARC4's own 4 simultaneous
+# channels, per its instrument papers -- using the same round-number
+# Fukugita et al. 1996 band edges as app.WAVELENGTH_PRESETS; center is
+# the geometric mean of each band's own nu_min/nu_max, bw = nu_max - nu_min.
+SDSS_G = (639200.0, 204400.0, 4)   # g band: 400-550 nm / 545-749 THz
+SDSS_R = (483200.0, 116800.0, 4)   # r band: 550-700 nm / 428-545 THz
+SDSS_I = (388700.0, 75600.0, 4)    # i band: 700-850 nm / 353-428 THz
+SDSS_Z = (325200.0, 52900.0, 4)    # z band: 850-1000 nm / 300-353 THz
+SDSS_ALL_BANDS = [SDSS_G, SDSS_R, SDSS_I, SDSS_Z]
+
+# SOFIA/HAWC+'s far-IR bands, per Harper et al. 2018 (center_um, bw_um):
+# A=53/8.7, C=89/17.0, D=154/34.0, E=214/44.0 -- Band B (63 um) is left out,
+# it has a known oversaturation issue and isn't used in science papers (see
+# app.WAVELENGTH_PRESETS). center/bw here follow the same nu_min/nu_max
+# geometric-mean/difference convention as SDSS_G etc. above, converting
+# each band's own (symmetric-in-wavelength) filter edges to frequency.
+HAWC_A = (5675.6, 934.8, 4)     # Band A: 53 um (48.65-57.35 um)
+HAWC_C = (3383.9, 649.3, 4)     # Band C: 89 um (80.5-97.5 um)
+HAWC_D = (1958.7, 435.1, 4)     # Band D: 154 um (137-171 um)
+HAWC_E = (1408.4, 291.1, 4)     # Band E: 214 um (192-236 um)
+HAWC_ALL_BANDS = [HAWC_A, HAWC_C, HAWC_D, HAWC_E]
+
+# Full radio combines ALMA + VLA (its own two lowest-frequency facilities
+# above) into one default list. ALMA Band 1 (35-50 GHz) and VLA's Q band
+# (40-50 GHz) overlap 40-50 GHz -- Band 1 is dropped and VLA_Q kept for
+# that stretch, per the rest of ALMA (Bands 2-10, from 67 GHz up) never
+# overlapping VLA's own top end.
+FULL_RADIO_BANDS = VLA_ALL_BANDS + [ALMA_BAND2, ALMA_BAND3, ALMA_BAND4,
+                                     ALMA_BAND5, ALMA_BAND6, ALMA_BAND7,
+                                     ALMA_BAND8, ALMA_BAND9, ALMA_BAND10]
 
 # Curated (center_ghz, bw_ghz, n_spw) defaults, keyed by the wavelength-
 # preset label they belong to -- auto-populated into the Bands box when
 # that preset is chosen from the Visualization tab's dropdown (see
 # MainWindow.apply_wl_preset / MeasurementsMixin.apply_default_bands).
-# The Full radio preset spans every facility above at once, with no single
-# obvious default band selection, so it deliberately maps to an empty list
-# instead of guessing one. Presets with no entry at all here (none, as of
-# this writing) would instead fall back to a single generic band spanning
-# their own range -- see default_bands_for_preset.
+# Presets with no entry at all here (none, as of this writing) would
+# instead fall back to a single generic band spanning their own range --
+# see default_bands_for_preset.
 DEFAULT_BANDS_BY_PRESET = {
     STANDARD_ALMA_LABEL: [ALMA_BAND3, ALMA_BAND6, ALMA_BAND7],
     'Full ALMA (0.25 - 9 mm / 30 - 1200 GHz)': ALMA_ALL_BANDS,
     'VLA high (0.6 - 2 cm / 15 - 50 GHz)': VLA_HIGH_BANDS,
     'VLA low (2 - 30 cm / 1 - 15 GHz)': VLA_LOW_BANDS,
     'Full VLA (0.6 - 30 cm / 1 - 50 GHz)': VLA_ALL_BANDS,
-    'Full MeerKat (17 - 70 cm / 500 - 1800 MHz)': MEERKAT_ALL_BANDS,
-    'Full radio (0.25mm - 70 cm / 500 MHz - 1200 GHz)': [],
+    'Full MeerKat (8.6 - 70 cm / 500 - 3500 MHz)': MEERKAT_ALL_BANDS,
+    'Full radio (0.25mm - 70 cm / 500 MHz - 1200 GHz)': FULL_RADIO_BANDS,
+    'Full SPARC4 optical (400 - 1000 nm / 300 - 750 THz)': SDSS_ALL_BANDS,
+    'Full HAWC+ FIR (40 - 250 um / 1.2 - 7.5 THz)': HAWC_ALL_BANDS,
 }
 
 
@@ -266,14 +296,16 @@ class BandRow(QWidget):
         spw_tip = 'Number of spectral windows (SPW) the band is split into'
 
         self.center = QDoubleSpinBox()
-        self.center.setRange(0.01, 2000.0)
+        # Upper bound reaches into optical frequencies (SDSS g/r/i/z run
+        # ~300,000-750,000 GHz) -- 2000 GHz used to clamp those.
+        self.center.setRange(0.01, 1000000.0)
         self.center.setDecimals(2)
         self.center.setFixedWidth(80)
         self.center.setValue(center_ghz)
         self.center.setToolTip(center_tip)
 
         self.bw = QDoubleSpinBox()
-        self.bw.setRange(0.001, 1000.0)
+        self.bw.setRange(0.001, 1000000.0)
         self.bw.setDecimals(2)
         self.bw.setFixedWidth(72)
         self.bw.setValue(bw_ghz)
@@ -290,9 +322,12 @@ class BandRow(QWidget):
         self.remove_button.setToolTip('Remove this band')
         self.remove_button.clicked.connect(lambda: self.removed.emit(self))
 
-        center_label, bw_label, spw_label = QLabel('ν₀'), QLabel('BW'), QLabel('SPW')
+        center_label, bw_label, spw_label = QLabel(), QLabel(), QLabel('SPW')
+        center_label.setPixmap(latex_pixmap(r'$\bar{\nu}$'))
         center_label.setToolTip(center_tip)
+        bw_label.setPixmap(latex_pixmap(r'$\Delta \nu$'))
         bw_label.setToolTip(bw_tip)
+        #spw_label.setPixmap(latex_pixmap('SPW'))
         spw_label.setToolTip(spw_tip)
 
         layout.addWidget(center_label)

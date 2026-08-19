@@ -10,7 +10,7 @@ SLIDER_STEPS = 10000  # integer resolution backing each QSlider
 
 # Physical unit shown next to each slider's readout, keyed by Param.kind.
 UNITS = {'p': '%', 'X': '°', 'phi': 'rad/m²', 'dphi': 'rad/m²', 'scale': '', 'alpha': '', 'eps': '',
-         'nu0': 'GHz'}
+         'nu0': 'GHz', 'temp': 'K'}
 # Widest unit string, used to fix every slider's unit label to the same
 # width so the value boxes above/below each other line up regardless of
 # which unit (or none) a given row happens to show.

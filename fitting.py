@@ -147,14 +147,14 @@ def fit_statistics(best_pars, result, wl, q, q_err, u, u_err, model):
     reduced), the Gaussian log-likelihood of the whitened q/u residuals,
     AIC/AICc/BIC, and the optimizer's own convergence report.
 
-    ll uses the standard independent-Gaussian normalization for the same
-    residuals qu_fit() minimizes (weighted_residuals) -- unlike the
-    `QU_fitting`-pipeline's own loglike(), it does not add phi/dphi alias
-    soft priors (those regularize that pipeline's MultiNest sampling, not
-    this least-squares objective) and uses ln(2*pi*sigma_q*sigma_u) rather
-    than that pipeline's ln(pi*sigma_q*sigma_u), so absolute ln L/AIC/BIC
-    values here are offset from -- not directly comparable to -- that
-    pipeline's, even for the same data and model.
+    ll uses the standard independent-Gaussian normalization ln(2*pi*sigma_q*
+    sigma_u) for the same residuals qu_fit() minimizes (weighted_residuals)
+    -- the same normalization (log_norm_const, defined below) the Bayesian
+    (MultiNest) path's own bayesian_loglike() uses, so ln L/AIC/BIC values
+    are directly comparable between the two fitting schemes for the same
+    data and model. Unlike the Bayesian path's loglike(), this does not add
+    phi/dphi alias soft priors -- those regularize MultiNest's sampling,
+    not this least-squares objective.
     """
     y_obs = np.asarray(q) + 1j * np.asarray(u)
     sigma = np.asarray(q_err) + 1j * np.asarray(u_err)
@@ -165,10 +165,7 @@ def fit_statistics(best_pars, result, wl, q, q_err, u, u_err, model):
     k = len(result.x)        # free (non-fixed) parameters actually optimized
     dof = n - k
 
-    sigma_real = sigma.real + EPS
-    sigma_imag = sigma.imag + EPS
-    log_norm_const = float(np.sum(np.log(2 * np.pi * sigma_real * sigma_imag)))
-    loglike = -0.5 * chi2 - log_norm_const
+    loglike = -0.5 * chi2 - log_norm_const(sigma)
 
     aic = 2 * k - 2 * loglike
     aicc = aic + (2 * k * (k + 1)) / (dof - 1) if dof > 1 else float('nan')
@@ -208,9 +205,10 @@ def estimate_alpha(freq, I):
 
 def estimate_ssa_shape(freq, I, nu0_init, alpha_init, nu0_bounds, fit_nu0):
     """Nonlinear regression of loaded I(nu) data against the SSA source
-    function shape S'(nu; nu0, alpha) (models.source_function -- the
-    caller must only invoke this while the 'ssa' shape is the active one,
-    see models.set_spectral_shape), anchored the same way estimate_alpha
+    function shape S'(nu; nu0, alpha, 'ssa') (models.source_function -- the
+    caller must only invoke this for a single-component model whose own
+    Spectrum-box shape is 'ssa', see models.set_spectral_shape), anchored
+    the same way estimate_alpha
     is: log(I/I[i0]) fit against log(S'/S'[i0]) at the lowest-frequency
     point i0, no free intercept.
 
@@ -241,7 +239,7 @@ def estimate_ssa_shape(freq, I, nu0_init, alpha_init, nu0_bounds, fit_nu0):
     target = np.log(I / I[i0])
 
     def shape_log_ratio(nu0, alpha):
-        S = source_function(freq, nu0, alpha)
+        S = source_function(freq, nu0, alpha, 'ssa')
         return np.log(S / S[i0])
 
     if not fit_nu0:
@@ -259,21 +257,34 @@ def estimate_ssa_shape(freq, I, nu0_init, alpha_init, nu0_bounds, fit_nu0):
     return alpha_est, nu0_est
 
 
-def estimate_ssa_shape_2comp(freq, I, eps, nu0_1_init, nu0_2_init, alpha_init,
-                               nu0_bounds, fit_nu0_1, fit_nu0_2):
+def estimate_shape_2comp(freq, I, eps, nu0_1_init, nu0_2_init, alpha_init,
+                          nu0_bounds, fit_nu0_1, fit_nu0_2, shape1, shape2,
+                          T1=None, T2=None, beta1=None, beta2=None):
     """Two-component counterpart of estimate_ssa_shape: nonlinear
-    regression of loaded I(nu) data against a shared-alpha SSA blend
-    eps*S'(nu; nu0_1, alpha) + (1-eps)*S'(nu; nu0_2, alpha) (see
-    source_function), anchored the same log(I/I[i0]) way. alpha is always
-    shared between both components -- QU-only fitting has only one real
-    I(nu) dataset to anchor it to, same reasoning FIT_FIXED_EPSILON
-    already relies on (see MainWindow.fit_spectrum_lsq) -- but nu0_1 and
-    nu0_2 are each independently fit or held pinned at their own *_init,
-    per fit_nu0_1/fit_nu0_2 (MainWindow.nu0_slider_1/2's own fixed
-    checkboxes), rather than forced equal: with both pinned, only alpha is
-    optimized (1-D); with exactly one free, that one nu0 and alpha are
-    jointly solved (2-D); with both free, all three go into one joint
-    solve (3-D).
+    regression of loaded I(nu) data against a shared-alpha blend
+    eps*S'(nu; nu0_1, alpha, shape1) + (1-eps)*S'(nu; nu0_2, alpha, shape2)
+    (see source_function) -- each component in its own shape, which need
+    not match the other's (a 'powerlaw' component and an 'ssa' component
+    can be blended together) -- anchored the same log(I/I[i0]) way. alpha
+    is always shared between both components -- QU-only fitting has only
+    one real I(nu) dataset to anchor it to, same reasoning
+    FIT_FIXED_EPSILON already relies on (see MainWindow.fit_spectrum_lsq)
+    -- but nu0_1 and nu0_2 are each independently fit or held pinned at
+    their own *_init, per fit_nu0_1/fit_nu0_2 (MainWindow.nu0_slider_1/2's
+    own fixed checkboxes -- always False for a component whose own shape
+    is 'powerlaw', since its reference frequency is always the shared band
+    edge, never a free parameter), rather than forced equal: with both
+    pinned, only alpha is optimized (1-D); with exactly one free, that one
+    nu0 and alpha are jointly solved (2-D); with both free, all three go
+    into one joint solve (3-D).
+
+    `T1`/`T2` are each component's own fixed electron temperature [K],
+    required (non-None) only when that component's own shape is 'thermal'
+    -- unlike nu0_1/nu0_2, T is never fit here (MainWindow.temp_slider_1/2
+    are always taken as-is), just passed through to source_function.
+    `beta1`/`beta2` are likewise each component's own fixed curvature
+    index, required only when that component's own shape is 'logparabola'
+    (MainWindow.beta_slider_1/2), also never fit here.
 
     Returns (alpha_est, nu0_1_est, nu0_2_est) -- a pinned nu0 is just its
     own *_init echoed back. Falls back to all *_init values if every point
@@ -287,7 +298,8 @@ def estimate_ssa_shape_2comp(freq, I, eps, nu0_1_init, nu0_2_init, alpha_init,
     target = np.log(I / I[i0])
 
     def shape_log_ratio(nu0_1, nu0_2, alpha):
-        S = eps * source_function(freq, nu0_1, alpha) + (1.0 - eps) * source_function(freq, nu0_2, alpha)
+        S = (eps * source_function(freq, nu0_1, alpha, shape1, T=T1, beta=beta1)
+             + (1.0 - eps) * source_function(freq, nu0_2, alpha, shape2, T=T2, beta=beta2))
         return np.log(S / S[i0])
 
     lo_nu0, hi_nu0 = nu0_bounds
@@ -369,17 +381,19 @@ def pol_idx(spec):
 
 
 def log_norm_const(sigma_complex):
-    """Sum[log(pi * sigma_qi * sigma_ui)] normalization for the
-    independent-Gaussian QU likelihood -- constant in the fit parameters,
-    but needed for ln L (and the family-lnZ score it feeds) to be an
-    absolute, comparable quantity rather than just something to minimize.
-    Uses the same pi (not fit_statistics()'s 2*pi) convention as
-    qu_fit.py; the two ln L conventions are not meant to be compared
-    directly, same as fit_statistics()'s own docstring already notes for
-    the least-squares path."""
+    """Sum[log(2*pi * sigma_qi * sigma_ui)] normalization for the
+    independent-Gaussian QU likelihood: each (q_j, u_j) pair is two
+    independent real Gaussians, so their joint normalization is
+    (2*pi*sigma_qj*sigma_uj)^-1, the standard bivariate-uncorrelated-
+    Gaussian constant -- constant in the fit parameters, but needed for
+    ln L (and the family-lnZ score it feeds) to be an absolute, comparable
+    quantity rather than just something to minimize. Shared by both fitting
+    paths (fit_statistics()'s least-squares ln L and bayesian_loglike()'s
+    MultiNest ln L both call this), so their reported ln L/AIC/BIC are on
+    the same absolute scale and can be compared directly."""
     sigma_real = sigma_complex.real + EPS
     sigma_imag = sigma_complex.imag + EPS
-    return np.sum(np.log(np.pi * sigma_real * sigma_imag))
+    return np.sum(np.log(2 * np.pi * sigma_real * sigma_imag))
 
 
 def bayesian_loglike(model, pars, wl, y, y_errs):
@@ -815,8 +829,8 @@ def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
 
 def multinest_fit(wl, q, q_err, u, u_err, model, spectral_pars, kind_bounds,
                    outputfiles_basename, n_live_points=400,
-                   evidence_tolerance=0.5, progress_callback=None,
-                   n_iter_before_update=100):
+                   sampling_efficiency=0.2, evidence_tolerance=0.5,
+                   progress_callback=None, n_iter_before_update=100):
     """Fit `model` to fractional Stokes q=Q/I, u=U/I data via MultiNest
     nested sampling with multimodal mode-finding enabled, then pick the
     winning mode-family (see best_family()) as the reported point
@@ -840,6 +854,12 @@ def multinest_fit(wl, q, q_err, u, u_err, model, spectral_pars, kind_bounds,
     linear mode's bounds may themselves be signed); dphi may not
     (log-uniform mode never draws a sign; linear mode's lower bound is
     clamped to 0).
+
+    `sampling_efficiency` is MultiNest's own target acceptance efficiency
+    (0-1) for its ellipsoidal sampling -- lower values (~0.2-0.3, the
+    default here) are recommended for a reliable Bayesian evidence
+    estimate, higher values (up to ~0.8) trade that off for speed and are
+    better suited to parameter estimation alone.
 
     `progress_callback(n_samples, logZ, logZerr)`, if given, is invoked
     periodically (every `n_iter_before_update` MultiNest iterations) via
@@ -928,7 +948,7 @@ def multinest_fit(wl, q, q_err, u, u_err, model, spectral_pars, kind_bounds,
         pymultinest.run(
             loglike, prior, ndim,
             outputfiles_basename=outputfiles_basename,
-            n_live_points=n_live_points, sampling_efficiency=0.2,
+            n_live_points=n_live_points, sampling_efficiency=sampling_efficiency,
             multimodal=True, importance_nested_sampling=False,
             n_clustering_params=n_clustering_params,
             evidence_tolerance=evidence_tolerance,
@@ -996,10 +1016,9 @@ def assemble_result(spec, pol_idx, spectral_pars, best_family_result,
         # Same field names/formulas as fit_statistics() (least-squares),
         # fed from the winning family's own chi2/lnL instead -- see
         # MainWindow.format_mn_stats, which reports both in the same
-        # layout. Not on the same absolute scale as fit_statistics()'s own
-        # ln L (see bayesian_loglike's docstring), so AIC/BIC here aren't
-        # directly comparable to a least-squares fit's -- only self-
-        # consistent within a MultiNest report.
+        # layout, and on the same absolute ln L scale (both ultimately go
+        # through log_norm_const), so directly comparable to a
+        # least-squares fit's AIC/BIC for the same data and model.
         chi2=chi2, dof=dof, chi2_red=winner_chi2, loglike=winner_lnZ,
         aic=aic, aicc=aicc, bic=bic, n_free=n_free, n_data=n_data,
     )

@@ -74,7 +74,7 @@ from polvista.models import (
     MODELS, MODELS_BY_NAME, C, Param, stokes_I, stokes_QU, stokes_components, evpa, pol,
     set_spectral_shape, full_equation)
 from polvista.fitting import (
-    qu_fit, estimate_alpha, estimate_ssa_shape, estimate_ssa_shape_2comp, fit_statistics,
+    qu_fit, estimate_alpha, estimate_ssa_shape, estimate_shape_2comp, fit_statistics,
     multinest_fit, load_previous_run)
 from polvista.latex_stuff import latex_pixmap, fit_equation_pixmap, TexViewerDialog
 from polvista.widgets import ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDEST_UNIT
@@ -163,22 +163,51 @@ ALPHA_RANGE = (-3.0, 2.0)
 EPS_RANGE = (0.0, 1.0)
 
 # Spectrum box's shape dropdown: (display label, models.set_spectral_shape key).
-SPECTRAL_SHAPES = [('Power-law', 'powerlaw'), ('SSA', 'ssa')]
+SPECTRAL_SHAPES = [('Power-law', 'powerlaw'), ('Log-parabola', 'logparabola'), ('SSA', 'ssa'), ('Thermal', 'thermal'),]
 
 # Multipliers applied to the current wavelength range's own (nu_min, nu_max)
-# to get the SSA turnover-frequency sliders' (lo, hi) bounds -- wide enough
-# to place a turnover well outside the plotted band in either direction.
+# to get the SSA/thermal turnover-frequency sliders' (lo, hi) bounds --
+# wide enough to place a turnover well outside the plotted band in either
+# direction.
 NU0_BOUNDS_MULT = (1e-3, 1e3)
 
+# (lo, hi) [K] bounds for the thermal shape's electron-temperature
+# sliders -- not tied to the plotted band (unlike NU0_BOUNDS_MULT), since T
+# sets the Wien cutoff/Rayleigh-Jeans amplitude rather than a frequency
+# within it. Spans cool photoionized gas (~1e2 K) through hot X-ray-emitting
+# plasma (~1e8 K).
+TEMP_BOUNDS_K = (1e-1, 1e7)
+DEFAULT_TEMP_K = 1e4  # typical HII-region/AGN narrow-line-region electron temperature
+
+# (lo, hi) bounds for the log-parabola shape's curvature-index (beta)
+# sliders -- linear, unlike nu0/T (beta doesn't span decades). Wide enough
+# to explore both a strongly peaked (beta<0) and a divergent (beta>0)
+# spectrum; beta=0 (the default) reduces the shape exactly to a plain
+# power law.
+BETA_BOUNDS = (-2.0, 2.0)
+DEFAULT_BETA = 0.0
+
 # Quick-select wavelength ranges (min_mm, max_mm) for the preset dropdown.
+# Full SPARC4 optical spans the standard (Fukugita et al. 1996) round-number
+# SDSS g/r/i/z band edges -- per SPARC4's own instrument papers, which
+# describe its 4 simultaneous channels as SDSS-like without republishing
+# their own numbers -- as SPARC4's optical range; z's red edge is nominally
+# CCD-QE-limited rather than a hard filter cutoff, so 1000 nm here is
+# itself just a common round-number convention.
+# Full HAWC+ spans SOFIA/HAWC+'s full filter-wheel range (Harper et al.
+# 2018) -- its five broadband filters run 40-250 um, though Band B (63 um)
+# has a known oversaturation issue and is left out of DEFAULT_BANDS_BY_PRESET
+# below in favor of the 4 bands (A/C/D/E) actually used in science papers.
 WAVELENGTH_PRESETS = [
     ('Standard ALMA (0.75 - 3.7 mm / 80 - 350 GHz)', 0.75, 3.7),
     ('Full ALMA (0.25 - 9 mm / 30 - 1200 GHz)', 0.25, 9.0),
     ('VLA high (0.6 - 2 cm / 15 - 50 GHz)', 6.0, 20.0),
     ('VLA low (2 - 30 cm / 1 - 15 GHz)', 20.0, 300.0),
     ('Full VLA (0.6 - 30 cm / 1 - 50 GHz)', 6.0, 300.0),
-    ('Full MeerKat (17 - 70 cm / 500 - 1800 MHz)', 170.0, 700.0),
-    ('Full radio (0.25mm - 70 cm / 500 MHz - 1200 GHz)', 0.25, 700.0)
+    ('Full MeerKat (8.6 - 70 cm / 500 - 3500 MHz)', 86.0, 700.0),
+    ('Full radio (0.25mm - 70 cm / 500 MHz - 1200 GHz)', 0.25, 700.0),
+    ('Full HAWC+ FIR (40 - 250 um / 1.2 - 7.5 THz)', 0.04, 0.25),
+    ('Full SPARC4 optical (400 - 1000 nm / 300 - 750 THz)', 4.0e-4, 1.0e-3),
 ]
 
 
@@ -267,6 +296,12 @@ class ParamSlider(QWidget):
             # over the caller-supplied (lo, hi) [GHz] is enough.
             self.lo, self.hi = np.log10(lo), np.log10(hi)
             default = 0.5 * (self.lo + self.hi)
+        elif self.kind == 'temp':
+            # log-scale like nu0 -- a thermal shape's Wien cutoff and
+            # Rayleigh-Jeans amplitude both depend on T across many decades
+            # (K, never 0).
+            self.lo, self.hi = np.log10(lo), np.log10(hi)
+            default = 0.5 * (self.lo + self.hi)
         else:  # 'scale' -- e.g. s, f
             self.lo, self.hi = lo, hi
             default = 0.5 * (lo + hi)
@@ -336,15 +371,15 @@ class ParamSlider(QWidget):
             return 10 ** working - 1
         if self.kind == 'p':
             return working / 100
-        if self.kind == 'nu0':
+        if self.kind in ('nu0', 'temp'):
             return 10 ** working
         return working  # scale, alpha, eps
 
     def encode(self, typed):
         """Inverse of decode: turn a number typed into the value field
         (in the same units/domain shown there -- degrees for X, percent
-        for p, the physical value itself for phi/dphi/nu0, unitless for
-        scale/alpha/eps) back into the slider's "working" domain."""
+        for p, the physical value itself for phi/dphi/nu0/temp, unitless
+        for scale/alpha/eps) back into the slider's "working" domain."""
         if self.kind in ('X', 'p'):
             return typed  # already the working-domain value (deg / %)
         if self.kind == 'phi':
@@ -355,7 +390,7 @@ class ParamSlider(QWidget):
             if typed <= 0:
                 return 0.0
             return np.log10(typed + 1)
-        if self.kind == 'nu0':
+        if self.kind in ('nu0', 'temp'):
             return np.log10(typed) if typed > 0 else self.lo
         return typed  # scale, alpha, eps
 
@@ -387,7 +422,7 @@ class ParamSlider(QWidget):
             typed = phys * 180 / np.pi
         elif self.kind == 'p':
             typed = phys * 100
-        else:  # phi/dphi/scale/alpha/eps/nu0 already share value()'s domain
+        else:  # phi/dphi/scale/alpha/eps/nu0/temp already share value()'s domain
             typed = phys
         self.slider.setValue(self.raw_from_working(self.encode(typed)))
         self.update_label()
@@ -399,8 +434,10 @@ class ParamSlider(QWidget):
             text = f'{working:.1f}'
         elif self.kind == 'p':
             text = f'{working:.2f}'
-        elif self.kind in ('phi', 'dphi', 'nu0'):
+        elif self.kind in ('phi', 'dphi', 'nu0', 'temp'):
             text = f'{phys:.2e}'
+        elif self.kind == 'eps':
+            text = f'{phys:.3f}'
         else:
             text = f'{phys:.2f}'
         self.value_label.setText(text)
@@ -600,6 +637,26 @@ class ModelPlot(FigureCanvas):
         apply_fixed_margins(self.fig, self, extra_adjust={'wspace': 0.0})
 
 
+def stokes_to_frac_qu(I, Q, U, I_err=None, Q_err=None, U_err=None):
+    """Fractional q=Q/I, u=U/I (dimensionless, same p*cos(2EVPA)/
+    p*sin(2EVPA) quantity the models themselves compute) and their
+    propagated errors -- errors are None if none of I_err/Q_err/U_err
+    were given, otherwise missing ones are treated as 0. Used by
+    StokesPlot's Polar view so its trajectory reflects pure polarization
+    state, undistorted by I's own separately-varying spectral shape --
+    same error-propagation formula as app.py's load_data_action."""
+    q, u = Q / I, U / I
+    if I_err is None and Q_err is None and U_err is None:
+        return q, u, None, None
+
+    def frac_err(val, val_err, denom, denom_err):
+        val_err = val_err if val_err is not None else 0.0
+        denom_err = denom_err if denom_err is not None else 0.0
+        return np.sqrt((val_err / denom) ** 2 + (val * denom_err / denom ** 2) ** 2)
+
+    return q, u, frac_err(Q, Q_err, I, I_err), frac_err(U, U_err, I, I_err)
+
+
 class StokesPlot(FigureCanvas):
     """Stokes I (left subplot) and Q, U (right subplot) vs frequency nu
     [GHz] -- the model's own trailing spectral params (alpha for a
@@ -615,12 +672,13 @@ class StokesPlot(FigureCanvas):
 
     The right subplot has two interchangeable views, picked via the
     dropdown above it (see stokes_mode_combo): 'Spectra' plots Q(nu) and
-    U(nu) like the left subplot; 'Polar' instead plots the (Q, U)
-    trajectory traced out as nu varies, U vs Q, colored along its length
-    as a continuous red(low nu)->violet(high nu) rainbow (see
-    QU_RAINBOW_CMAP) matching the Measurements tab's own per-band
-    coloring. Its limits are square (equal Q/U numeric span) but the axes
-    box itself stays whatever rectangular shape the flush layout gives
+    U(nu) like the left subplot; 'Polar' instead plots the fractional
+    (q=Q/I, u=U/I) trajectory traced out as nu varies, u vs q, colored
+    along its length as a continuous red(low nu)->violet(high nu) rainbow
+    (see stokes_to_frac_qu and QU_RAINBOW_CMAP) matching the Measurements
+    tab's own per-band coloring. Its limits are square (equal q/u numeric
+    span) but the axes box itself stays whatever rectangular shape the
+    flush layout gives
     it -- forcing a literal square box would fight the shared wspace=0
     layout with ax_I. Switching modes rebuilds the right axis from
     scratch (ax_QU.clear() + fresh artists) -- only happens on a rare,
@@ -637,6 +695,7 @@ class StokesPlot(FigureCanvas):
 
         self.ax_I.set_xlabel(r'$\nu$ [ GHz ]')
         self.ax_I.set_ylabel(r'$I$ [ normalized ]')
+        self.ax_I.set_yscale('log')
         self.ax_I.grid(True)
         self.line_I, = self.ax_I.plot([], [], color='black', label=r'$I$')
         # Per-component curves for two-component models (see
@@ -695,8 +754,8 @@ class StokesPlot(FigureCanvas):
         self.meas_artists_QU = []
         n_samples = len(self.posterior_samples) if self.posterior_samples is not None else 0
         if self.mode == 'Polar':
-            self.ax_QU.set_xlabel(r'$Q$ [ normalized ]')
-            self.ax_QU.set_ylabel(r'$U$ [ normalized ]', rotation=270, labelpad=15)
+            self.ax_QU.set_xlabel(r'$q$')
+            self.ax_QU.set_ylabel(r'$u$', rotation=270, labelpad=15)
             self.line_Q = self.line_U = None
             self.line_Q1 = self.line_U1 = self.line_Q2 = self.line_U2 = None
             self.line_QU = LineCollection([], cmap=QU_RAINBOW_CMAP, norm=mcolors.Normalize(0, 1), zorder=3)
@@ -704,6 +763,10 @@ class StokesPlot(FigureCanvas):
             self.sample_lines_Q, self.sample_lines_U = [], []
             self.sample_lines_QU = [self.ax_QU.plot([], [], color='tab:purple', alpha=0.1, lw=0.6, zorder=1)[0]
                                      for _ in range(n_samples)]
+            ylim = self.ax_QU.get_ylim()
+            xlim = self.ax_QU.get_xlim()
+            self.ax_QU.vlines(x=0.0, ymin=-ylim[1], ymax=ylim[1], linestyle='dashed', color='k')
+            self.ax_QU.hlines(y=0.0, xmin=-xlim[1], xmax=xlim[1], linestyle='dashed', color='k')
         else:
             self.ax_QU.set_xlabel(r'$\nu$ [ GHz ]')
             self.ax_QU.set_ylabel(r'$Q$, $U$ [ normalized ]', rotation=270, labelpad=15)
@@ -765,8 +828,9 @@ class StokesPlot(FigureCanvas):
             self.ref_artists_I.append(self.ax_I.errorbar(
                 nu, I, yerr=I_err, fmt='o', ms=4, color='black', ecolor='0.5', capsize=2, zorder=5))
             if self.mode == 'Polar':
+                q, u, q_err, u_err = stokes_to_frac_qu(I, Q, U, I_err, Q_err, U_err)
                 self.ref_artists_QU.append(self.ax_QU.errorbar(
-                    Q, U, xerr=Q_err, yerr=U_err, fmt='o', ms=4, color='black', ecolor='0.5', capsize=2, zorder=5))
+                    q, u, xerr=q_err, yerr=u_err, fmt='o', ms=4, color='black', ecolor='0.5', capsize=2, zorder=5))
             else:
                 self.ref_artists_QU.append(self.ax_QU.errorbar(
                     nu, Q, yerr=Q_err, fmt='s', ms=4, color='darkgreen', ecolor='0.5', capsize=2, zorder=5))
@@ -786,8 +850,10 @@ class StokesPlot(FigureCanvas):
                     band['nu'], band['I'], yerr=band['I_err'], fmt='o', ms=4, mew=0.5, mec='k',
                     color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
                 if self.mode == 'Polar':
+                    q, u, q_err, u_err = stokes_to_frac_qu(
+                        band['I'], band['Q'], band['U'], band['I_err'], band['Q_err'], band['U_err'])
                     self.meas_artists_QU.append(self.ax_QU.errorbar(
-                        band['Q'], band['U'], xerr=band['Q_err'], yerr=band['U_err'], fmt='o', ms=4, mew=0.5,
+                        q, u, xerr=q_err, yerr=u_err, fmt='o', ms=4, mew=0.5,
                         mec='k', color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
                 else:
                     self.meas_artists_QU.append(self.ax_QU.errorbar(
@@ -818,7 +884,7 @@ class StokesPlot(FigureCanvas):
         if two_comp != self.ax_I_two_comp:
             self.ax_I_two_comp = two_comp
             handles = [self.line_I, self.line_I1, self.line_I2] if two_comp else [self.line_I]
-            self.ax_I.legend(handles, [h.get_label() for h in handles], loc='upper right')
+            self.ax_I.legend(handles, [h.get_label() for h in handles], loc='lower right')
 
         xscale = 'log' if log_xscale else 'linear'
         if xscale != self.xscale:
@@ -844,7 +910,8 @@ class StokesPlot(FigureCanvas):
                 ln_I.set_data([], [])
 
         if self.mode == 'Polar':
-            points = np.column_stack([Q_s, U_s]).reshape(-1, 1, 2)
+            q_s, u_s = Q_s / I_s, U_s / I_s
+            points = np.column_stack([q_s, u_s]).reshape(-1, 1, 2)
             segments = np.concatenate([points[:-1], points[1:]], axis=1)
             self.line_QU.set_segments(segments)
             # Color by each segment's own log10(nu) position within
@@ -860,9 +927,10 @@ class StokesPlot(FigureCanvas):
             self.line_QU.set_array(t[:-1])
             for i, ln_QU in enumerate(self.sample_lines_QU):
                 if show_samples:
+                    s_I = stokes_I(wl_ext, n_components, self.posterior_samples[i], nu_min=nu_min)[order]
                     s_Q, s_U = (a[order] for a in stokes_QU(
                         wl_ext, model_func, n_components, self.posterior_samples[i], nu_min=nu_min))
-                    ln_QU.set_data(s_Q, s_U)
+                    ln_QU.set_data(s_Q / s_I, s_U / s_I)
                 else:
                     ln_QU.set_data([], [])
         else:
@@ -889,6 +957,7 @@ class StokesPlot(FigureCanvas):
                     ln_U.set_data([], [])
 
         xlo, xhi = nu_s.min() * 0.9, nu_s.max() * 1.05
+        i_min = max(I_s.min(), 1e-6)
         i_max = max(I_s.max(), 1e-6)
         # Total-only Q/U extent -- what the Polar view's own limits are
         # based on (see below): it only ever draws the total curve, so
@@ -899,12 +968,14 @@ class StokesPlot(FigureCanvas):
         q_min, q_max = float(Q_s.min()), float(Q_s.max())
         u_min, u_max = float(U_s.min()), float(U_s.max())
         if two_comp:
+            i_min = min(i_min, max(I1_s.min(), 1e-6), max(I2_s.min(), 1e-6))
             i_max = max(i_max, I1_s.max(), I2_s.max())
         # Widen the autoscale to also cover any reference data loaded via
         # the Load Data... button, so it isn't silently clipped out of view.
         if self.ref_data is not None:
             ref_nu, ref_I, _, ref_Q, _, ref_U, _ = self.ref_data
             xlo, xhi = min(xlo, ref_nu.min() * 0.9), max(xhi, ref_nu.max() * 1.05)
+            i_min = min(i_min, max(ref_I.min(), 1e-6))
             i_max = max(i_max, ref_I.max())
             q_min, q_max = min(q_min, ref_Q.min()), max(q_max, ref_Q.max())
             u_min, u_max = min(u_min, ref_U.min()), max(u_max, ref_U.max())
@@ -912,6 +983,7 @@ class StokesPlot(FigureCanvas):
             for band in self.meas_bands:
                 xlo = min(xlo, band['nu'].min() * 0.9)
                 xhi = max(xhi, band['nu'].max() * 1.05)
+                i_min = min(i_min, max((band['I'] - band['I_err']).min(), 1e-6))
                 i_max = max(i_max, (band['I'] + band['I_err']).max())
                 q_min = min(q_min, (band['Q'] - band['Q_err']).min())
                 q_max = max(q_max, (band['Q'] + band['Q_err']).max())
@@ -927,16 +999,35 @@ class StokesPlot(FigureCanvas):
             u_max_spectra = max(u_max_spectra, U1_s.max(), U2_s.max())
 
         self.ax_I.set_xlim(xlo, xhi)
-        self.ax_I.set_ylim(0, 1.3 * i_max)
+        self.ax_I.set_ylim(0.7 * i_min, 1.3 * i_max)
 
         if self.mode == 'Polar':
+            # Fractional (q, u) extent -- separate from q_min/q_max/
+            # u_min/u_max above (raw Q/U, used by the Spectra view only),
+            # since Polar plots q=Q/I, u=U/I instead. Based on the total
+            # curve alone (+ ref/meas data, central values only -- no
+            # error margin, matching q_min/q_max's own ref_data widening
+            # above) -- the Polar view never draws the per-component
+            # curves, so they don't belong in its own limits.
+            frac_q_min, frac_q_max = float(q_s.min()), float(q_s.max())
+            frac_u_min, frac_u_max = float(u_s.min()), float(u_s.max())
+            if self.ref_data is not None:
+                ref_I, ref_Q, ref_U = self.ref_data[1], self.ref_data[3], self.ref_data[5]
+                ref_q, ref_u, _, _ = stokes_to_frac_qu(ref_I, ref_Q, ref_U)
+                frac_q_min, frac_q_max = min(frac_q_min, ref_q.min()), max(frac_q_max, ref_q.max())
+                frac_u_min, frac_u_max = min(frac_u_min, ref_u.min()), max(frac_u_max, ref_u.max())
+            if self.meas_bands:
+                for band in self.meas_bands:
+                    band_q, band_u, band_q_err, band_u_err = stokes_to_frac_qu(
+                        band['I'], band['Q'], band['U'], band['I_err'], band['Q_err'], band['U_err'])
+                    frac_q_min = min(frac_q_min, (band_q - band_q_err).min())
+                    frac_q_max = max(frac_q_max, (band_q + band_q_err).max())
+                    frac_u_min = min(frac_u_min, (band_u - band_u_err).min())
+                    frac_u_max = max(frac_u_max, (band_u + band_u_err).max())
             # Square numeric limits (not a square axes box -- see class
-            # docstring): +/-1.25 * the larger of Q's and U's own max
-            # absolute extent, based on the total curve alone (+ ref/meas
-            # data) -- the Polar view never draws the per-component
-            # curves, so they don't belong in its own limits (see
-            # q_min/q_max/u_min/u_max above).
-            half_side = 1.25 * max(max(abs(q_min), abs(q_max)), max(abs(u_min), abs(u_max)))
+            # docstring): +/-1.25 * the larger of q's and u's own max
+            # absolute extent.
+            half_side = 1.25 * max(max(abs(frac_q_min), abs(frac_q_max)), max(abs(frac_u_min), abs(frac_u_max)))
             half_side = max(half_side, 1e-6)
             self.ax_QU.set_xlim(-half_side, half_side)
             self.ax_QU.set_ylim(-half_side, half_side)
@@ -958,7 +1049,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Polvista: Polarization Model Visualizer')
+        self.setWindowTitle('Polvista: POLarization VISualizer Tool for Astronomy')
         #self.resize(1800, 1000) # size of the window
         self.resize(1500, 700) # size of the window
 
@@ -1005,12 +1096,15 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # within the vertically-stacked wl_box.
         wl_row = QHBoxLayout()
         self.wl_min = QDoubleSpinBox()
-        self.wl_min.setRange(0.01, 1000.0)
-        self.wl_min.setDecimals(3)
+        # Lower bound/decimals go down to fractions of a nm (the SDSS
+        # optical presets run 4e-4 - 1e-3 mm) -- 3 decimals used to round
+        # those straight to 0.000 and 0.01mm used to clamp them.
+        self.wl_min.setRange(1e-4, 1000.0)
+        self.wl_min.setDecimals(6)
         self.wl_min.setValue(0.75)
         self.wl_max = QDoubleSpinBox()
-        self.wl_max.setRange(0.02, 2000.0)
-        self.wl_max.setDecimals(3)
+        self.wl_max.setRange(2e-4, 2000.0)
+        self.wl_max.setDecimals(6)
         self.wl_max.setValue(3.7)
         self.n_points = QSpinBox()
         self.n_points.setRange(10, 2000)
@@ -1049,43 +1143,61 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.spectral_box = QGroupBox()
         self.spectral_layout = QVBoxLayout(self.spectral_box)
 
-        # Dropdown selecting the source function S'(nu) used to weight each
-        # component's spectral contribution (see models.set_spectral_shape),
-        # placed in the box's own top-right corner, after its "Spectrum"
-        # title -- QGroupBox itself only supports a plain string title, so
-        # the title is instead a plain (non-bold) QLabel in this custom
-        # header row.
-        spectral_header = QHBoxLayout()
-        spectral_header.addWidget(QLabel('Spectrum'))
-        spectral_header.addStretch(1)
-        self.shape_combo = QComboBox()
-        for shape_label, shape_key in SPECTRAL_SHAPES:
-            self.shape_combo.addItem(shape_label, shape_key)
-        self.shape_combo.currentIndexChanged.connect(self.on_spectral_shape_changed)
-        spectral_header.addWidget(self.shape_combo)
-        self.spectral_layout.addLayout(spectral_header)
+        # Dropdown(s) selecting the source function S'(nu) used to weight
+        # each component's spectral contribution (see
+        # models.set_spectral_shape). A single-component model only ever
+        # needs one, shown as a "Spectrum" header at the top of the box
+        # (shape_header_single/shape_combo); a two-component model instead
+        # gets one per component, each its own "Component N" header
+        # (comp1_header/shape_combo_1, comp2_header/shape_combo_2) placed
+        # right before that component's own alpha slider -- letting the two
+        # components use different spectral shapes entirely (e.g. one
+        # power-law, one SSA). rebuild_sliders picks which of these are
+        # actually shown, and where, based on the current model's own
+        # component count -- none of them are placed into spectral_layout
+        # here.
+        self.shape_header_single, self.shape_combo = self.build_spectrum_header('Spectrum')
+        self.comp1_header, self.shape_combo_1 = self.build_spectrum_header('Component 1')
+        self.comp2_header, self.shape_combo_2 = self.build_spectrum_header('Component 2')
 
         # Turnover-frequency nu_0 slider(s) -- log-scale, like phi/dphi,
         # since a turnover can plausibly sit many decades from the plotted
-        # band -- only shown once 'SSA' is selected (see sync_nu0_ui). A
-        # two-component model gets an independent nu_0 per component
-        # (nu0_slider_2 only shown then); a single-component model only
-        # ever needs the first. Not placed into spectral_layout here --
-        # rebuild_sliders inserts nu0_container at the right spot among
-        # that model's own eps/alpha sliders (epsilon, then nu_0, then
-        # alpha(s); see its docstring).
-        self.nu0_container = QWidget()
-        nu0_container_layout = QVBoxLayout(self.nu0_container)
-        nu0_container_layout.setContentsMargins(0, 0, 0, 0)
+        # band -- only shown once its own component's shape dropdown is set
+        # to 'SSA' or 'Thermal' (see sync_spectrum_ui). A two-component
+        # model gets an independent nu_0 per component; a single-component
+        # model only ever needs the first (reused as-is, alongside
+        # shape_combo, for that case). Not placed into spectral_layout here
+        # -- rebuild_sliders inserts each at the right spot among that
+        # model's own eps/alpha sliders (epsilon, then component 1's own
+        # nu_0/T/alpha, then component 2's; see its docstring).
         nu0_lo, nu0_hi = self.nu0_bounds_ghz()
         default_nu0 = self.default_nu0_ghz()
         self.nu0_slider_1 = self.build_nu0_slider(
-            nu0_lo, nu0_hi, default_nu0, r'$\nu_0$', 'SSA turnover frequency.')
+            nu0_lo, nu0_hi, default_nu0, r'$\nu_0$', 'SSA/thermal turnover frequency.')
         self.nu0_slider_2 = self.build_nu0_slider(
-            nu0_lo, nu0_hi, default_nu0, r'$\nu_{0,2}$', "Component 2's SSA turnover frequency.")
-        nu0_container_layout.addWidget(self.nu0_slider_1)
-        nu0_container_layout.addWidget(self.nu0_slider_2)
-        self.nu0_container.setVisible(False)
+            nu0_lo, nu0_hi, default_nu0, r'$\nu_{0,2}$', "Component 2's SSA/thermal turnover frequency.")
+
+        # Electron-temperature T slider(s) -- log-scale (see TEMP_BOUNDS_K),
+        # only shown once its own component's shape dropdown is set to
+        # 'Thermal' (see sync_spectrum_ui). Same one-or-two-per-model
+        # pattern as the nu_0 sliders above.
+        temp_lo, temp_hi = TEMP_BOUNDS_K
+        self.temp_slider_1 = self.build_temp_slider(
+            temp_lo, temp_hi, DEFAULT_TEMP_K, r'$T$', 'Thermal free-free electron temperature.')
+        self.temp_slider_2 = self.build_temp_slider(
+            temp_lo, temp_hi, DEFAULT_TEMP_K, r'$T_2$', "Component 2's thermal free-free electron temperature.")
+
+        # Curvature-index beta slider(s) -- linear (see BETA_BOUNDS), only
+        # shown once its own component's shape dropdown is set to
+        # 'Log-parabola' (see sync_spectrum_ui). Same one-or-two-per-model
+        # pattern as the nu_0/T sliders above; unlike those, log-parabola
+        # doesn't need its own nu_0/T (it shares the band nu_0 like a plain
+        # power law), so beta is the only extra control it adds.
+        beta_lo, beta_hi = BETA_BOUNDS
+        self.beta_slider_1 = self.build_beta_slider(
+            beta_lo, beta_hi, DEFAULT_BETA, r'$\beta$', 'Log-parabola curvature index.')
+        self.beta_slider_2 = self.build_beta_slider(
+            beta_lo, beta_hi, DEFAULT_BETA, r'$\beta_2$', "Component 2's log-parabola curvature index.")
 
         self.spectral_layout.addStretch(1)
 
@@ -1234,7 +1346,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         stokes_top_row.addStretch(1)
         stokes_top_row.addWidget(QLabel('Q, U view:'))
         self.stokes_mode_combo = QComboBox()
-        self.stokes_mode_combo.addItems(['Spectra', 'Polar'])
+        self.stokes_mode_combo.addItems(['Polar', 'Spectra'])
         self.stokes_mode_combo.currentIndexChanged.connect(self.update_plot)
         stokes_top_row.addWidget(self.stokes_mode_combo)
         stokes_layout.addLayout(stokes_top_row)
@@ -1266,15 +1378,21 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # remove the trailing stretch, re-add sliders, then put stretch back
         self.param_layout.takeAt(self.param_layout.count() - 1)
         self.spectral_layout.takeAt(self.spectral_layout.count() - 1)
-        # nu0_container isn't one of self.sliders (see _build_ui) so it
-        # survives the setParent(None) loop above untouched -- pull it out
-        # of spectral_layout too, so it can be re-inserted below at the
-        # spot matching this model's own spectral params (epsilon, then
-        # nu_0, then alpha(s) -- see the loop's comment).
-        self.spectral_layout.removeWidget(self.nu0_container)
+        # None of the Spectrum-box header/nu_0 widgets below are one of
+        # self.sliders (see _build_ui) so they survive the setParent(None)
+        # loop above untouched -- pull them all out of spectral_layout too,
+        # so each can be re-inserted below at the spot matching this
+        # model's own component count and spectral params (see the loop's
+        # comment).
+        for w in (self.shape_header_single, self.comp1_header, self.comp2_header,
+                  self.nu0_slider_1, self.nu0_slider_2, self.temp_slider_1, self.temp_slider_2,
+                  self.beta_slider_1, self.beta_slider_2):
+            self.spectral_layout.removeWidget(w)
 
         has_spectral = False
-        nu0_placed = False
+        two_comp = spec.n_components == 2
+        if not two_comp:
+            self.spectral_layout.addWidget(self.shape_header_single)
         for i, param in enumerate(spec.params):
             sl = ParamSlider(param, lo_bounds[i], hi_bounds[i])
             sl.valueChanged.connect(self.update_plot)
@@ -1282,25 +1400,49 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             # which box a slider is displayed in -- update_plot() reads this
             # list positionally, matching the model function's param order.
             self.sliders.append(sl)
-            if param.kind in ('alpha', 'eps'):
-                # Display order: epsilon (2-component models only), then
-                # nu_0 (see nu0_container -- inserted right before the
-                # first alpha slider, i.e. right after epsilon when there
-                # is one), then alpha(s).
-                if param.kind == 'alpha' and not nu0_placed:
-                    self.spectral_layout.addWidget(self.nu0_container)
-                    nu0_placed = True
+            if param.kind == 'eps':
+                # Display order for a two-component model: epsilon, then
+                # "Component 1" (its own shape dropdown, nu_0, and alpha1),
+                # then "Component 2" (likewise) -- see the 'alpha' branch
+                # below for where each component's own header/nu_0 land.
                 self.spectral_layout.addWidget(sl)
                 has_spectral = True
+                if two_comp:
+                    self.spectral_layout.addWidget(self.comp1_header)
+            elif param.kind == 'alpha':
+                has_spectral = True
+                if param.name == 'alpha2':
+                    self.spectral_layout.addWidget(self.nu0_slider_2)
+                    self.spectral_layout.addWidget(self.temp_slider_2)
+                    self.spectral_layout.addWidget(sl)
+                    self.spectral_layout.addWidget(self.beta_slider_2)
+                else:
+                    self.spectral_layout.addWidget(self.nu0_slider_1)
+                    self.spectral_layout.addWidget(self.temp_slider_1)
+                    self.spectral_layout.addWidget(sl)
+                    self.spectral_layout.addWidget(self.beta_slider_1)
+                    if two_comp:
+                        self.spectral_layout.addWidget(self.comp2_header)
             else:
                 self.param_layout.addWidget(sl)
-        if not nu0_placed:
-            self.spectral_layout.addWidget(self.nu0_container)
 
         self.param_layout.addStretch(1)
         self.spectral_layout.addStretch(1)
         self.param_box.setTitle(spec.title)
         self.spectral_scroll.setVisible(has_spectral)
+
+        # removeWidget above only detaches a widget from the layout -- it
+        # doesn't hide it, so whichever of these wasn't re-added this pass
+        # (e.g. shape_header_single for a two-component model) would
+        # otherwise still report itself visible, stale geometry and all.
+        # Done only now, after the addWidget calls above have given
+        # comp1_header/comp2_header a real parent at least once -- setting
+        # a still-parentless QWidget visible makes Qt treat it as its own
+        # top-level window instead, which then breaks the *next* addWidget
+        # reparenting.
+        self.shape_header_single.setVisible(not two_comp)
+        self.comp1_header.setVisible(two_comp)
+        self.comp2_header.setVisible(two_comp)
 
         if hasattr(self, 'results_label'):
             self.results_label.setText(self.NO_FIT_TEXT)
@@ -1308,29 +1450,80 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.rebuild_sampling_bounds()
 
         # A model switch can change the component count (single- vs
-        # two-component), which the SSA turnover-frequency row(s) need to
-        # track -- see sync_nu0_ui.
-        self.sync_nu0_ui()
+        # two-component), which the SSA/thermal turnover-frequency (and
+        # thermal temperature) row(s) need to track -- see sync_spectrum_ui.
+        self.sync_spectrum_ui()
 
         self.refit_equation()
 
         self.update_plot()
 
+    def build_spectrum_header(self, label_text):
+        """One (container, combo) pair for a Spectrum-box header row:
+        `label_text` on the left, a Power-law/SSA/Thermal/Log-parabola shape dropdown on the
+        right, wired to on_spectral_shape_changed -- used for the
+        single-component "Spectrum" header and, for two-component models,
+        each component's own "Component N" header (see _build_ui/
+        rebuild_sliders). Returned as a standalone container (not yet
+        placed in any layout) so rebuild_sliders can insert it wherever the
+        current model's own component count calls for."""
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel(label_text))
+        row.addStretch(1)
+        combo = QComboBox()
+        for shape_label, shape_key in SPECTRAL_SHAPES:
+            combo.addItem(shape_label, shape_key)
+        combo.currentIndexChanged.connect(self.on_spectral_shape_changed)
+        row.addWidget(combo)
+        return container, combo
+
     def build_nu0_slider(self, lo_ghz, hi_ghz, default_ghz, latex, description):
         """One nu_0 ParamSlider (log-scale, like a dphi slider) for the
-        Spectrum box's SSA turnover-frequency controls -- see _build_ui,
-        which builds one or two of these depending on the current model's
-        component count (see sync_nu0_ui). `default_ghz` is applied (and
-        its own valueChanged wired up) only after construction, so building
-        the slider itself can't prematurely fire the app-level handler.
+        Spectrum box's SSA/thermal turnover-frequency controls -- see
+        _build_ui, which builds one or two of these depending on the
+        current model's component count (see sync_spectrum_ui).
+        `default_ghz` is applied (and its own valueChanged wired up) only
+        after construction, so building the slider itself can't
+        prematurely fire the app-level handler.
 
         Starts *fixed* (checkbox checked) -- at its default (~1% of the
         band's own nu_min, deep in the optically-thin regime), a fit
         should start out assuming there's no turnover in view and only fit
         alpha; the user frees this slider (unchecks it) to let a fit
-        jointly solve for nu_0 too (see MainWindow.fit_spectrum_lsq)."""
+        jointly solve for nu_0 too (see MainWindow.fit_spectrum_lsq -- note
+        this joint solve only happens for 'ssa'; a 'thermal' component's
+        nu_0/T are always taken as-is from these sliders, never fit)."""
         sl = ParamSlider(Param('nu0', latex, 'nu0', description), lo_ghz, hi_ghz)
         sl.set_value(default_ghz)
+        sl.fix_checkbox.setChecked(True)
+        sl.valueChanged.connect(self.on_spectral_shape_changed)
+        return sl
+
+    def build_temp_slider(self, lo_k, hi_k, default_k, latex, description):
+        """One T ParamSlider (log-scale, like build_nu0_slider) for the
+        Spectrum box's thermal electron-temperature controls -- see
+        _build_ui/sync_spectrum_ui. Starts *fixed*, like the nu_0 sliders:
+        least-squares fitting never solves for a thermal component's own
+        T (see fit_spectrum_lsq), so there's no "let the fit vary this"
+        state to default to -- the checkbox only matters in that it keeps
+        this slider visually consistent with nu_0's own default."""
+        sl = ParamSlider(Param('temp', latex, 'temp', description), lo_k, hi_k)
+        sl.set_value(default_k)
+        sl.fix_checkbox.setChecked(True)
+        sl.valueChanged.connect(self.on_spectral_shape_changed)
+        return sl
+
+    def build_beta_slider(self, lo, hi, default, latex, description):
+        """One beta ParamSlider (linear, 'scale' kind -- same generic
+        slider used for e.g. Tribble's s or the covering fraction f, since
+        beta doesn't need nu_0/temp's log-scale) for the Spectrum box's
+        log-parabola curvature controls -- see _build_ui/sync_spectrum_ui.
+        Starts *fixed*, like the nu_0/T sliders, for the same reason: beta
+        is never solved for during fitting (see fit_spectrum_lsq)."""
+        sl = ParamSlider(Param('beta', latex, 'scale', description), lo, hi)
+        sl.set_value(default)
         sl.fix_checkbox.setChecked(True)
         sl.valueChanged.connect(self.on_spectral_shape_changed)
         return sl
@@ -1359,35 +1552,83 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         nu_min_ghz = C / (hi_mm * 1e-3) / 1e9
         return 0.01 * nu_min_ghz
 
-    def sync_nu0_ui(self):
-        """Keep the Spectrum box's nu_0 slider(s) matched to the shape
-        dropdown's current selection and the current model's component
-        count, and push their values into models' global spectral-shape
-        state (see models.set_spectral_shape) -- called whenever either the
-        shape dropdown, a nu_0 slider, or the model itself changes."""
-        shape = self.shape_combo.currentData()
-        is_ssa = shape == 'ssa'
+    def current_shapes(self):
+        """(shape1, shape2) currently selected in the Spectrum box --
+        `shape1` is the single-component shape dropdown for a
+        single-component model, or component 1's own dropdown for a
+        two-component model; `shape2` is component 2's own dropdown,
+        meaningful only for a two-component model (mirrors `shape1`
+        otherwise, since a single-component model has no second
+        component)."""
         n_components = MODELS[self.model_combo.currentData()].n_components
-        self.nu0_container.setVisible(is_ssa)
-        self.nu0_slider_2.setVisible(is_ssa and n_components == 2)
+        if n_components == 2:
+            return self.shape_combo_1.currentData(), self.shape_combo_2.currentData()
+        shape = self.shape_combo.currentData()
+        return shape, shape
+
+    def sync_spectrum_ui(self):
+        """Keep the Spectrum box's nu_0/T/beta slider(s) -- and each
+        component's own alpha slider's visibility -- matched to each
+        component's own shape dropdown and the current model's component
+        count, and push nu_0/T/beta's values into models' global
+        spectral-shape state (see models.set_spectral_shape) -- called
+        whenever any shape dropdown, a nu_0/T/beta slider, or the model
+        itself changes."""
+        shape1, shape2 = self.current_shapes()
+        spec = MODELS[self.model_combo.currentData()]
+        two_comp = spec.n_components == 2
+        needs_nu0_1 = shape1 in ('ssa', 'thermal')
+        needs_nu0_2 = two_comp and shape2 in ('ssa', 'thermal')
+        needs_temp_1 = shape1 == 'thermal'
+        needs_temp_2 = two_comp and shape2 == 'thermal'
+        needs_beta_1 = shape1 == 'logparabola'
+        needs_beta_2 = two_comp and shape2 == 'logparabola'
+        self.nu0_slider_1.setVisible(needs_nu0_1)
+        self.nu0_slider_2.setVisible(needs_nu0_2)
+        self.temp_slider_1.setVisible(needs_temp_1)
+        self.temp_slider_2.setVisible(needs_temp_2)
+        self.beta_slider_1.setVisible(needs_beta_1)
+        self.beta_slider_2.setVisible(needs_beta_2)
         self.nu0_slider_1.name_label.setPixmap(
-            latex_pixmap(r'$\nu_{0,1}$' if n_components == 2 else r'$\nu_0$'))
-        nu0 = self.nu0_slider_1.value() * 1e3 if is_ssa else None  # GHz -> MHz
-        nu0_2 = self.nu0_slider_2.value() * 1e3 if is_ssa else None
-        set_spectral_shape(shape, nu0=nu0, nu0_2=nu0_2)
+            latex_pixmap(r'$\nu_{0,1}$' if two_comp else r'$\nu_0$'))
+        self.temp_slider_1.name_label.setPixmap(
+            latex_pixmap(r'$T_1$' if two_comp else r'$T$'))
+        self.beta_slider_1.name_label.setPixmap(
+            latex_pixmap(r'$\beta_1$' if two_comp else r'$\beta$'))
+        # A thermal component's own spectral index is emergent from T, not
+        # a free parameter (see source_function/thermal_source) -- hide
+        # its alpha slider rather than show an inert control (log-parabola
+        # still uses alpha directly, alongside its own beta, so its alpha
+        # slider stays visible). alpha_indices follows spec.params' own
+        # order: index 0 is the single alpha for a single-component model,
+        # or alpha1 (tied to shape1) for a two-component one; index 1,
+        # when present, is alpha2 (shape2).
+        alpha_indices = spec.indices('alpha')
+        if alpha_indices:
+            self.sliders[alpha_indices[0]].setVisible(shape1 != 'thermal')
+            if len(alpha_indices) > 1:
+                self.sliders[alpha_indices[1]].setVisible(shape2 != 'thermal')
+        nu0 = self.nu0_slider_1.value() * 1e3 if needs_nu0_1 else None  # GHz -> MHz
+        nu0_2 = self.nu0_slider_2.value() * 1e3 if needs_nu0_2 else None
+        T = self.temp_slider_1.value() if needs_temp_1 else None
+        T2 = self.temp_slider_2.value() if needs_temp_2 else None
+        beta = self.beta_slider_1.value() if needs_beta_1 else None
+        beta2 = self.beta_slider_2.value() if needs_beta_2 else None
+        set_spectral_shape(shape1, nu0=nu0, shape2=shape2, nu0_2=nu0_2, T=T, T2=T2,
+                            beta=beta, beta2=beta2)
 
     def on_spectral_shape_changed(self, *_):
-        """Slot for the Spectrum box's shape dropdown and nu_0 spin
+        """Slot for the Spectrum box's shape dropdown(s) and nu_0/T spin
         box(es): re-sync models' spectral-shape state and redraw the
         equation card and plots to reflect it."""
-        self.sync_nu0_ui()
+        self.sync_spectrum_ui()
         self.refit_equation()
         self.update_plot()
 
     def refit_equation(self):
         spec = MODELS[self.model_combo.currentData()]
-        shape = self.shape_combo.currentData()
-        eq = full_equation(spec, shape)
+        shape1, shape2 = self.current_shapes()
+        eq = full_equation(spec, shape1, shape2)
         viewport = self.eq_scroll.viewport().size()
         # Leave room for the label's own padding (6px/side, see its
         # stylesheet) plus a little breathing room.
@@ -1498,10 +1739,11 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         Corner plot tab, if either is showing -- both are tied to a
         specific fit's result, which a reset discards.
 
-        The SSA turnover-frequency sliders aren't part of self.sliders (see
+        The SSA/thermal turnover-frequency, thermal temperature, and
+        log-parabola curvature sliders aren't part of self.sliders (see
         _build_ui), so rebuild_sliders alone wouldn't reset them -- move
         them back to their own default value *and* fixed state explicitly
-        (see build_nu0_slider)."""
+        (see build_nu0_slider/build_temp_slider/build_beta_slider)."""
         self.data_nu_min = None
         self.clear_posterior_samples()
         self.remove_corner_tab()
@@ -1510,6 +1752,14 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.nu0_slider_2.set_value(default_nu0)
         self.nu0_slider_1.fix_checkbox.setChecked(True)
         self.nu0_slider_2.fix_checkbox.setChecked(True)
+        self.temp_slider_1.set_value(DEFAULT_TEMP_K)
+        self.temp_slider_2.set_value(DEFAULT_TEMP_K)
+        self.temp_slider_1.fix_checkbox.setChecked(True)
+        self.temp_slider_2.fix_checkbox.setChecked(True)
+        self.beta_slider_1.set_value(DEFAULT_BETA)
+        self.beta_slider_2.set_value(DEFAULT_BETA)
+        self.beta_slider_1.fix_checkbox.setChecked(True)
+        self.beta_slider_2.fix_checkbox.setChecked(True)
         self.rebuild_sliders()
 
     def clear_data(self):
@@ -1550,20 +1800,25 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         Only a QU fit: epsilon defaults to fixed at
         FIT_FIXED_EPSILON (q, u data alone can't constrain it) and alpha
         defaults to a direct regression against the loaded I(nu) data --
-        estimate_alpha under 'powerlaw', or a joint (nu_0, alpha) nonlinear
-        regression under 'ssa' (see estimate_ssa_shape, and
-        build_nu0_slider for why nu_0 only joins that regression once its
-        own slider is unchecked) -- rather than being fit alongside
-        p/X/phi/dphi. For a two-component model, alpha1/alpha2 always end
-        up equal: there's only one real I(nu) dataset, so a single shared
-        spectral index is all QU-only fitting can ever anchor two
-        components to -- same reasoning FIT_FIXED_EPSILON already relies
-        on. Under 'ssa', nu_0,1/nu_0,2 are the exception: each is fit or
-        pinned independently against that same shared-alpha regression,
-        per its own nu0_slider_1/2 fixed checkbox (see
-        estimate_ssa_shape_2comp) -- not forced equal, since a fixed
-        component's own turnover frequency is meaningful chosen input, not
-        just an unconstrained initial guess.
+        estimate_alpha when every component's shape is 'powerlaw', or a
+        joint (nu_0, alpha) nonlinear regression otherwise (see
+        estimate_ssa_shape/estimate_shape_2comp, and build_nu0_slider for
+        why a component's own nu_0 only joins that regression once its own
+        slider is unchecked -- and only when that component's own shape is
+        'ssa' to begin with, since a power-law component's reference
+        frequency is always the shared band edge, never a free parameter)
+        -- rather than being fit alongside p/X/phi/dphi. For a
+        two-component model, alpha1/alpha2 always end up equal regardless
+        of the two components' own shapes: there's only one real I(nu)
+        dataset, so a single shared spectral index is all QU-only fitting
+        can ever anchor two components to -- same reasoning
+        FIT_FIXED_EPSILON already relies on. Each component's own nu_0 (for
+        whichever of the two is 'ssa') is the exception: it's fit or pinned
+        independently against that same shared-alpha regression, per its
+        own nu0_slider_1/2 fixed checkbox (see estimate_shape_2comp) -- not
+        forced equal to the other component's, since a fixed component's
+        own turnover frequency is meaningful chosen input, not just an
+        unconstrained initial guess.
 
         Any slider whose fix_checkbox is checked is additionally (or
         instead, for epsilon/alpha) held fixed at its own current value()
@@ -1584,32 +1839,59 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         wl, q, q_err, u, u_err, freq, I = self.fit_data
 
         alpha_indices = spec.indices('alpha')
-        if self.shape_combo.currentData() == 'ssa' and alpha_indices:
+        shape1, shape2 = self.current_shapes()
+        if spec.n_components == 2 and alpha_indices and (shape1 == 'ssa' or shape2 == 'ssa'):
             alpha_init = self.sliders[alpha_indices[0]].value()
             nu0_lo_ghz, nu0_hi_ghz = self.nu0_slider_1.bounds()
             nu0_bounds_hz = (nu0_lo_ghz * 1e9, nu0_hi_ghz * 1e9)
-            if spec.n_components == 2:
-                # Each component's own nu_0 is fit or pinned independently
-                # (per its own slider's fixed checkbox), never forced
-                # equal -- alpha is still shared, same reasoning
-                # FIT_FIXED_EPSILON below relies on for eps (see
-                # estimate_ssa_shape_2comp). eps itself mirrors the `fixed`
-                # dict built below: FIT_FIXED_EPSILON unless the user has
-                # pinned the eps slider to their own value.
-                eps_idx = spec.indices('eps')[0]
-                eps_val = self.sliders[eps_idx].value() if self.sliders[eps_idx].is_fixed() else FIT_FIXED_EPSILON
-                alpha_est, nu0_1_est_ghz, nu0_2_est_ghz = estimate_ssa_shape_2comp(
-                    freq, I, eps_val,
-                    self.nu0_slider_1.value() * 1e9, self.nu0_slider_2.value() * 1e9, alpha_init,
-                    nu0_bounds_hz, not self.nu0_slider_1.is_fixed(), not self.nu0_slider_2.is_fixed())
+            # Each component's own nu_0 is fit or pinned independently (per
+            # its own slider's fixed checkbox), never forced equal -- alpha
+            # is still shared, same reasoning FIT_FIXED_EPSILON below
+            # relies on for eps (see estimate_shape_2comp). eps itself
+            # mirrors the `fixed` dict built below: FIT_FIXED_EPSILON
+            # unless the user has pinned the eps slider to their own value.
+            # A component whose own shape is 'powerlaw' always evaluates at
+            # the shared band nu0 (see models.component_reference_nu), not
+            # its own (irrelevant, hidden) nu0 slider -- so its own init is
+            # the band edge itself and it's never fit, regardless of that
+            # slider's own fixed checkbox.
+            eps_idx = spec.indices('eps')[0]
+            eps_val = self.sliders[eps_idx].value() if self.sliders[eps_idx].is_fixed() else FIT_FIXED_EPSILON
+            band_nu0_hz = float(freq.min())
+            nu0_1_init = self.nu0_slider_1.value() * 1e9 if shape1 in ('ssa', 'thermal') else band_nu0_hz
+            nu0_2_init = self.nu0_slider_2.value() * 1e9 if shape2 in ('ssa', 'thermal') else band_nu0_hz
+            fit_nu0_1 = shape1 == 'ssa' and not self.nu0_slider_1.is_fixed()
+            fit_nu0_2 = shape2 == 'ssa' and not self.nu0_slider_2.is_fixed()
+            # A 'thermal' component's own T is never fit (see
+            # build_temp_slider) -- just its current slider value, passed
+            # through so estimate_shape_2comp's internal source_function
+            # calls don't crash on a missing T (see thermal_source).
+            T1 = self.temp_slider_1.value() if shape1 == 'thermal' else None
+            T2 = self.temp_slider_2.value() if shape2 == 'thermal' else None
+            # Same reasoning for a 'logparabola' component's own beta --
+            # never fit (see build_beta_slider), just passed through so
+            # estimate_shape_2comp's internal source_function calls don't
+            # crash on a missing beta.
+            beta1 = self.beta_slider_1.value() if shape1 == 'logparabola' else None
+            beta2 = self.beta_slider_2.value() if shape2 == 'logparabola' else None
+            alpha_est, nu0_1_est_ghz, nu0_2_est_ghz = estimate_shape_2comp(
+                freq, I, eps_val, nu0_1_init, nu0_2_init, alpha_init,
+                nu0_bounds_hz, fit_nu0_1, fit_nu0_2, shape1, shape2,
+                T1=T1, T2=T2, beta1=beta1, beta2=beta2)
+            if shape1 == 'ssa':
                 self.nu0_slider_1.set_value(nu0_1_est_ghz / 1e9)
+            if shape2 == 'ssa':
                 self.nu0_slider_2.set_value(nu0_2_est_ghz / 1e9)
-            else:
-                alpha_est, nu0_est_ghz = estimate_ssa_shape(
-                    freq, I, self.nu0_slider_1.value() * 1e9, alpha_init,
-                    nu0_bounds_hz, not self.nu0_slider_1.is_fixed())
-                self.nu0_slider_1.set_value(nu0_est_ghz / 1e9)
-            self.sync_nu0_ui()
+            self.sync_spectrum_ui()
+        elif spec.n_components == 1 and shape1 == 'ssa' and alpha_indices:
+            alpha_init = self.sliders[alpha_indices[0]].value()
+            nu0_lo_ghz, nu0_hi_ghz = self.nu0_slider_1.bounds()
+            nu0_bounds_hz = (nu0_lo_ghz * 1e9, nu0_hi_ghz * 1e9)
+            alpha_est, nu0_est_ghz = estimate_ssa_shape(
+                freq, I, self.nu0_slider_1.value() * 1e9, alpha_init,
+                nu0_bounds_hz, not self.nu0_slider_1.is_fixed())
+            self.nu0_slider_1.set_value(nu0_est_ghz / 1e9)
+            self.sync_spectrum_ui()
         else:
             alpha_est = estimate_alpha(freq, I)
 
@@ -1656,9 +1938,11 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
 
     def save_model_action(self):
         """Write the current model + parameter values, plus the Spectrum
-        box's own state (spectral shape, and its nu_0(s) under 'ssa') --
-        that state lives outside spec.params/self.sliders (see
-        build_nu0_slider), so it isn't already covered by `parameters`
+        box's own state (each component's own spectral shape, its nu_0
+        under 'ssa'/'thermal', T under 'thermal', and beta under
+        'logparabola') -- that state lives outside spec.params/
+        self.sliders (see build_nu0_slider/build_temp_slider/
+        build_beta_slider), so it isn't already covered by `parameters`
         below -- to a JSON file."""
         func, spec, pars, _ = self.current_state()
         # QFileDialog.getSaveFileName pops up the native "Save As" dialog;
@@ -1670,16 +1954,26 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             return
         if not path.endswith('.json'):
             path += '.json'
-        shape = self.shape_combo.currentData()
+        shape1, shape2 = self.current_shapes()
         data = {
             'model': func.__name__,
             'parameters': dict(zip(spec.param_names, pars)),
-            'spectral_shape': shape,
+            'spectral_shape': shape1,
         }
-        if shape == 'ssa':
+        if spec.n_components == 2:
+            data['spectral_shape_2'] = shape2
+        if shape1 in ('ssa', 'thermal'):
             data['nu0_ghz'] = self.nu0_slider_1.value()
-            if spec.n_components == 2:
-                data['nu0_2_ghz'] = self.nu0_slider_2.value()
+        if spec.n_components == 2 and shape2 in ('ssa', 'thermal'):
+            data['nu0_2_ghz'] = self.nu0_slider_2.value()
+        if shape1 == 'thermal':
+            data['temp_k'] = self.temp_slider_1.value()
+        if spec.n_components == 2 and shape2 == 'thermal':
+            data['temp_2_k'] = self.temp_slider_2.value()
+        if shape1 == 'logparabola':
+            data['beta'] = self.beta_slider_1.value()
+        if spec.n_components == 2 and shape2 == 'logparabola':
+            data['beta_2'] = self.beta_slider_2.value()
         try:
             with open(path, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -1727,21 +2021,26 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             return
         if not path.endswith('.tex'):
             path += '.tex'
+        shape1, shape2 = self.current_shapes()
         try:
             with open(path, 'w') as f:
-                f.write(full_equation(spec, self.shape_combo.currentData()) + '\n')
+                f.write(full_equation(spec, shape1, shape2) + '\n')
         except OSError as e:
             QMessageBox.warning(self, 'Save Equation', f'Could not save equation file:\n{e}')
 
     def load_model_action(self):
-        """Read a model + parameters (+ spectral shape/nu_0) JSON file (as
-        written by save_model_action) and apply it: switch the Spectrum
-        box's shape dropdown and nu_0 slider(s), switch the model dropdown,
-        then move each slider to the saved value.
+        """Read a model + parameters (+ per-component spectral
+        shape/nu_0/T/beta) JSON file (as written by save_model_action) and
+        apply it: switch the Spectrum box's shape dropdown(s) and
+        nu_0/T/beta slider(s), switch the model dropdown, then move each
+        slider to the saved value.
 
-        `spectral_shape` defaults to 'powerlaw' (and nu_0 is left alone)
-        for files saved before this was tracked, so older Save Model
-        output still loads the same as it always did."""
+        `spectral_shape` defaults to 'powerlaw' (and nu_0/T/beta are left
+        alone) for files saved before this was tracked, so older Save
+        Model output still loads the same as it always did;
+        `spectral_shape_2` similarly defaults to `spectral_shape` for
+        files saved before the two components could have independent
+        shapes."""
         # getOpenFileName is the read-side counterpart of getSaveFileName.
         path, _ = QFileDialog.getOpenFileName(self, 'Load Model', '', 'JSON files (*.json)')
         if not path:
@@ -1751,26 +2050,46 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
                 data = json.load(f)
             func = MODELS_BY_NAME[data['model']]
             params = data['parameters']
-            shape = data.get('spectral_shape', 'powerlaw')
+            shape1 = data.get('spectral_shape', 'powerlaw')
+            shape2 = data.get('spectral_shape_2', shape1)
             nu0_ghz = data.get('nu0_ghz')
             nu0_2_ghz = data.get('nu0_2_ghz', nu0_ghz)
+            temp_k = data.get('temp_k')
+            temp_2_k = data.get('temp_2_k', temp_k)
+            beta = data.get('beta')
+            beta_2 = data.get('beta_2', beta)
         except (OSError, ValueError, KeyError) as e:
             QMessageBox.warning(self, 'Load Model', f'Could not load model file:\n{e}')
             return
 
         # Set the Spectrum box's own state first -- rebuild_sliders below
         # (triggered by the model switch) re-syncs it from whatever's
-        # currently selected (see sync_nu0_ui), so shape/nu_0 need to
-        # already be in place before that runs.
-        shape_idx = self.shape_combo.findData(shape)
-        if shape_idx >= 0:
-            self.shape_combo.blockSignals(True)
-            self.shape_combo.setCurrentIndex(shape_idx)
-            self.shape_combo.blockSignals(False)
+        # currently selected (see sync_spectrum_ui), so shape/nu_0/T need
+        # to already be in place before that runs. Both the single-component
+        # dropdown and each two-component dropdown are set from the same
+        # saved shape1/shape2 -- current_shapes() only ever reads whichever
+        # pair matches the loaded model's own component count, so setting
+        # the other is harmless (and keeps a later model switch's own
+        # starting point sane).
+        for combo, shape in ((self.shape_combo, shape1), (self.shape_combo_1, shape1),
+                              (self.shape_combo_2, shape2)):
+            idx = combo.findData(shape)
+            if idx >= 0:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
         if nu0_ghz is not None:
             self.nu0_slider_1.set_value(nu0_ghz)
         if nu0_2_ghz is not None:
             self.nu0_slider_2.set_value(nu0_2_ghz)
+        if temp_k is not None:
+            self.temp_slider_1.set_value(temp_k)
+        if temp_2_k is not None:
+            self.temp_slider_2.set_value(temp_2_k)
+        if beta is not None:
+            self.beta_slider_1.set_value(beta)
+        if beta_2 is not None:
+            self.beta_slider_2.set_value(beta_2)
 
         idx = self.model_combo.findData(func)
         self.model_combo.blockSignals(True)
@@ -1922,7 +2241,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         box = QMessageBox(self)
         box.setWindowTitle('About Polvista')
         box.setTextFormat(Qt.RichText)
-        box.setText('<b>Polvista: Polarization Model Visualizer</b><br><br>'
+        box.setText('<b>Polvista: POLarization VISualizer Tool for Astronomy</b><br><br>'
                     'Interactive tool to explore the Faraday effect and maybe even fit some spectropolarimetric data!<br><br>'
                     'Author: Douglas Carlos, 2026 <a href="https://github.com/medoug7/polvista">GitHub</a>')
 

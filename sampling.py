@@ -399,9 +399,9 @@ class SamplingMixin:
 
     def build_sampling_tab(self):
         """Build the "Sampling" tab (MultiNest fit options: output dir, #
-        live points, evidence tolerance, prior-bounds rows, Load samples)
-        and add it to self.left_tabs. Only called from MainWindow.__init__
-        when HAS_PYMULTINEST is True."""
+        live points, sampling efficiency, evidence tolerance, prior-bounds
+        rows, Load samples) and add it to self.left_tabs. Only called from
+        MainWindow.__init__ when HAS_PYMULTINEST is True."""
         self.sampling_tab = QWidget()
         sampling_layout = QVBoxLayout(self.sampling_tab)
 
@@ -415,23 +415,56 @@ class SamplingMixin:
         outdir_row.addWidget(self.sampling_outdir_button)
         sampling_layout.addLayout(outdir_row)
 
+        live_tip = ('Number of live points MultiNest maintains during nested sampling. '
+                    'More live points resolve the posterior (and multiple modes) more finely '
+                    'and give a more reliable evidence estimate, at the cost of more '
+                    'likelihood evaluations (slower).')
         live_row = QHBoxLayout()
-        live_row.addWidget(QLabel('# of live points:'))
+        live_label = QLabel('# of live points:')
+        live_label.setToolTip(live_tip)
+        live_row.addWidget(live_label)
         live_row.addStretch(1)
         self.sampling_n_live = QSpinBox()
         self.sampling_n_live.setRange(1, 10000)
         self.sampling_n_live.setValue(400)
+        self.sampling_n_live.setToolTip(live_tip)
         live_row.addWidget(self.sampling_n_live)
         sampling_layout.addLayout(live_row)
 
+        eff_tip = ('Target acceptance efficiency (0-1) for MultiNest\'s ellipsoidal '
+                   'sampling. Lower values (~0.2-0.3, the recommended range for a '
+                   'reliable Bayesian evidence) sample more conservatively; higher '
+                   'values (up to ~0.8) run faster but are only recommended if you '
+                   'only care about the parameter estimate, not the evidence.')
+        eff_row = QHBoxLayout()
+        eff_label = QLabel('Sampling efficiency:')
+        eff_label.setToolTip(eff_tip)
+        eff_row.addWidget(eff_label)
+        eff_row.addStretch(1)
+        self.sampling_efficiency = QDoubleSpinBox()
+        self.sampling_efficiency.setRange(0.01, 1)
+        self.sampling_efficiency.setDecimals(2)
+        self.sampling_efficiency.setSingleStep(0.01)
+        self.sampling_efficiency.setValue(0.2)
+        self.sampling_efficiency.setToolTip(eff_tip)
+        eff_row.addWidget(self.sampling_efficiency)
+        sampling_layout.addLayout(eff_row)
+
+        tol_tip = ('Stopping criterion: MultiNest halts once its estimate of the '
+                   'remaining (unsampled) evidence contribution falls below this '
+                   'tolerance. Smaller values sample longer but converge the '
+                   'evidence estimate more tightly.')
         tol_row = QHBoxLayout()
-        tol_row.addWidget(QLabel('Evidence tolerance:'))
+        tol_label = QLabel('Evidence tolerance:')
+        tol_label.setToolTip(tol_tip)
+        tol_row.addWidget(tol_label)
         tol_row.addStretch(1)
         self.sampling_evidence_tol = QDoubleSpinBox()
         self.sampling_evidence_tol.setRange(0.01, 1)
         self.sampling_evidence_tol.setDecimals(2)
         self.sampling_evidence_tol.setSingleStep(0.01)
         self.sampling_evidence_tol.setValue(0.5)
+        self.sampling_evidence_tol.setToolTip(tol_tip)
         tol_row.addWidget(self.sampling_evidence_tol)
         sampling_layout.addLayout(tol_row)
 
@@ -655,6 +688,7 @@ class SamplingMixin:
             spectral_pars=spectral_pars, kind_bounds=kind_bounds,
             outputfiles_basename=basename,
             n_live_points=self.sampling_n_live.value(),
+            sampling_efficiency=self.sampling_efficiency.value(),
             evidence_tolerance=self.sampling_evidence_tol.value(),
         ))
         self.mn_worker.progress.connect(self.on_mn_progress)

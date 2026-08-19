@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Callable
 
 C = 299792458.0  # m/s
+H_PLANCK = 6.62607015e-34   # J s
+K_BOLTZMANN = 1.380649e-23  # J/K
 
 
 # ── Spectral shape: normalized source function S'(nu) ─────────────────────────
@@ -13,40 +15,82 @@ C = 299792458.0  # m/s
 # models, stokes_I's single-component branch) shapes a component's relative
 # intensity via a normalized source function S'(nu), S'(nu0)=1. The standard
 # choice is a power law (nu/nu0)**alpha, with nu0 auto-set to the lowest
-# frequency in the currently plotted band; the alternative is the classic
-# synchrotron self-absorbed (SSA) spectrum, which has no band edge to fall
-# back on and needs an explicit turnover frequency nu0 instead.
+# frequency in the currently plotted band. A log-parabola (nu/nu0)**
+# (alpha+beta*ln(nu/nu0)) shares that same shared-band nu0 -- it's a
+# one-parameter generalization of the power law, adding a curvature term
+# beta on top of alpha rather than a new reference frequency. Two other
+# alternatives instead need an explicit turnover frequency nu0 (there's no
+# band edge to fall back on): the classic synchrotron self-absorbed (SSA)
+# spectrum, and a thermal free-free spectrum (full Planck function x
+# free-free opacity, see thermal_source), which also needs an electron
+# temperature T.
 #
 # Module-level rather than threaded through every model func's fixed
-# (x, params) signature -- there's only ever one "current" shape/nu0 in this
-# single-window app, set by the Spectrum box's dropdown (see
-# app.MainWindow.on_spectral_shape_changed).
+# (x, params) signature -- there's only ever one "current"
+# shape/nu0/T/beta in this single-window app, set by the Spectrum box's
+# dropdown(s) (see app.MainWindow.on_spectral_shape_changed).
+# SPECTRAL_SHAPE/SPECTRAL_NU0/SPECTRAL_TEMP/SPECTRAL_BETA are a
+# single-component model's own shape/turnover/temperature/curvature, or a
+# two-component model's component-1 shape/turnover/temperature/curvature;
+# the _2 globals are component 2's own, fully independent values -- a
+# two-component model may mix e.g. 'powerlaw' for one component with
+# 'ssa'/'thermal'/'logparabola' for the other. SPECTRAL_TEMP(_2) is only
+# ever read when the matching shape is 'thermal'; SPECTRAL_BETA(_2) only
+# when it's 'logparabola'.
 SPECTRAL_SHAPE = 'powerlaw'
-SPECTRAL_NU0 = None    # MHz -- SSA turnover frequency: a single-component
-                         # model's own nu0, or a two-component model's
-                         # component-1 nu0 (see set_spectral_shape)
-SPECTRAL_NU0_2 = None   # MHz -- two-component SSA models' component-2
-                         # turnover frequency, independent of SPECTRAL_NU0
+SPECTRAL_SHAPE_2 = 'powerlaw'
+SPECTRAL_NU0 = None    # MHz -- SSA/thermal turnover frequency: a
+                         # single-component model's own nu0, or a
+                         # two-component model's component-1 nu0 (see
+                         # set_spectral_shape)
+SPECTRAL_NU0_2 = None   # MHz -- two-component SSA/thermal models'
+                         # component-2 turnover frequency, independent of
+                         # SPECTRAL_NU0
+SPECTRAL_TEMP = None    # K -- thermal shape's electron temperature: a
+                         # single-component model's own T, or a
+                         # two-component model's component-1 T
+SPECTRAL_TEMP_2 = None  # K -- two-component thermal models' component-2
+                         # temperature, independent of SPECTRAL_TEMP
+SPECTRAL_BETA = None    # log-parabola's curvature index: a
+                         # single-component model's own beta, or a
+                         # two-component model's component-1 beta
+SPECTRAL_BETA_2 = None  # two-component log-parabola models' component-2
+                         # curvature index, independent of SPECTRAL_BETA
 
 
-def set_spectral_shape(shape, nu0=None, nu0_2=None):
-    """Select the source function S'(nu) used by every model's spectral
+def set_spectral_shape(shape, nu0=None, shape2=None, nu0_2=None, T=None, T2=None,
+                        beta=None, beta2=None):
+    """Select the source function(s) S'(nu) used by every model's spectral
     weighting from here on: 'powerlaw' (the default; nu0 auto-derived per
     call, always shared between both components of a two-component model --
-    see reference_nu/component_reference_nu) or 'ssa' (classic
-    synchrotron self-absorption; `nu0` [MHz] is then required -- there's no
-    band edge to default to).
+    see reference_nu/component_reference_nu), 'ssa' (classic synchrotron
+    self-absorption; `nu0` [MHz] is then required -- there's no band edge
+    to default to), 'thermal' (thermal free-free; `nu0` [MHz] and `T` [K]
+    are then required -- see thermal_source), or 'logparabola' (curved
+    power law sharing the same shared-band nu0 as 'powerlaw'; `beta` is
+    then required -- see source_function).
 
-    `nu0` is a single-component model's own turnover frequency, or a
-    two-component model's component-1 turnover frequency; `nu0_2` is
-    component 2's own, independent turnover frequency -- unlike the
-    power-law shape, an SSA two-component model may have each component
-    turn over at a different frequency. Falls back to `nu0` when `nu0_2`
-    isn't given."""
-    global SPECTRAL_SHAPE, SPECTRAL_NU0, SPECTRAL_NU0_2
+    `shape`/`nu0`/`T`/`beta` is a single-component model's own
+    shape/turnover frequency/temperature/curvature, or a two-component
+    model's component-1 shape/turnover/temperature/curvature;
+    `shape2`/`nu0_2`/`T2`/`beta2` is component 2's own, fully independent
+    shape/turnover/temperature/curvature -- a two-component model's
+    components need not share a spectral shape at all, and (under 'ssa' or
+    'thermal') need not turn over at the same frequency (or temperature)
+    either. All default to component 1's own value when not given, so
+    single-component callers (and any two-component caller that hasn't
+    been updated to pick component 2's shape independently) still get one
+    shared shape/nu0/T/beta as before."""
+    global SPECTRAL_SHAPE, SPECTRAL_SHAPE_2, SPECTRAL_NU0, SPECTRAL_NU0_2
+    global SPECTRAL_TEMP, SPECTRAL_TEMP_2, SPECTRAL_BETA, SPECTRAL_BETA_2
     SPECTRAL_SHAPE = shape
+    SPECTRAL_SHAPE_2 = shape2 if shape2 is not None else shape
     SPECTRAL_NU0 = nu0
     SPECTRAL_NU0_2 = nu0_2 if nu0_2 is not None else nu0
+    SPECTRAL_TEMP = T
+    SPECTRAL_TEMP_2 = T2 if T2 is not None else T
+    SPECTRAL_BETA = beta
+    SPECTRAL_BETA_2 = beta2 if beta2 is not None else beta
 
 
 def band_nu0(nu, nu_min):
@@ -55,43 +99,107 @@ def band_nu0(nu, nu_min):
     return nu_min if nu_min is not None else np.min(nu)
 
 
-def reference_nu(nu, nu_min=None):
-    """The nu0 [MHz] that anchors S'(nu0)=1 for a single-component model:
-    the SSA turnover frequency set via set_spectral_shape when that shape
-    is active, otherwise the shared band nu0 (see band_nu0)."""
-    if SPECTRAL_SHAPE == 'ssa' and SPECTRAL_NU0 is not None:
-        return SPECTRAL_NU0
-    return band_nu0(nu, nu_min)
-
-
-def component_reference_nu(nu, nu_min, nu0_override):
-    """The nu0 [MHz] that anchors one component's S'(nu0)=1 in a
-    two-component model: `nu0_override` (that component's own SSA turnover
-    frequency, set via set_spectral_shape) when SSA is active and it's set,
-    otherwise the shared band nu0 (see band_nu0) -- i.e. only 'ssa' lets
-    the two components use different reference frequencies; 'powerlaw'
-    always shares one."""
-    if SPECTRAL_SHAPE == 'ssa' and nu0_override is not None:
+def component_reference_nu(nu, nu_min, nu0_override, shape):
+    """The nu0 [MHz] that anchors one component's S'(nu0)=1: `nu0_override`
+    (that component's own SSA/thermal turnover frequency, set via
+    set_spectral_shape) when `shape` is 'ssa' or 'thermal' and it's set,
+    otherwise the shared band nu0 (see band_nu0) -- i.e. only 'ssa'/
+    'thermal' let a component use its own reference frequency; 'powerlaw'
+    always uses the shared one. Used directly for a single-component
+    model's own reference_nu, and by spectral_weights for each of a
+    two-component model's components (with that component's own
+    shape/nu0_override)."""
+    if shape in ('ssa', 'thermal') and nu0_override is not None:
         return nu0_override
     return band_nu0(nu, nu_min)
 
 
-def source_function(nu, nu0, alpha):
-    """Normalized source function S'(nu), S'(nu0)=1, in the currently
-    selected shape (see set_spectral_shape).
+def reference_nu(nu, nu_min=None):
+    """The nu0 [MHz] that anchors S'(nu0)=1 for a single-component model:
+    the SSA turnover frequency set via set_spectral_shape when that shape
+    is active, otherwise the shared band nu0 (see band_nu0)."""
+    return component_reference_nu(nu, nu_min, SPECTRAL_NU0, SPECTRAL_SHAPE)
+
+
+def thermal_source(ratio, nu0, T):
+    """Normalized thermal free-free source function
+    S'(nu) = B_nu(T)*(1-e^-tau_nu) / [B_nu0(T)*(1-e^-tau0)], `ratio` =
+    nu/nu0, tau0 fixed to 1 and tau_nu = (nu/nu0)**-2.1 the free-free
+    opacity (folding the usual tau0 normalization into nu0, same
+    convention as 'ssa' -- nu0 is where tau_nu=1). `nu0` [MHz] is only
+    used to get the dimensionless Theta = h*nu0/(k_B*T) below; `T` [K] is
+    the electron temperature.
+
+    This single expression has three asymptotes, set by Theta: optically
+    thick (ratio << 1) is the Rayleigh-Jeans blackbody, S' ~ ratio**2;
+    optically thin and still Rayleigh-Jeans (1 << ratio << 1/Theta) is the
+    classical thermal-bremsstrahlung index, S' ~ ratio**-0.1; and
+    ratio >> 1/Theta (h*nu >~ k_B*T) is an exponential Wien cutoff, from
+    B_nu(T) itself -- so the -0.1 window is only visible when Theta << 1,
+    i.e. nu0 well below k_B*T/h.
+
+    A nu0 placed deep in (or past) that Wien cutoff -- Theta >~ 700 -- is
+    unphysical for a real thermal source, but the sliders don't forbid it
+    (see app.TEMP_BOUNDS_K/NU0_BOUNDS_MULT), and QU-fitting's own nu_0
+    solve (fitting.estimate_shape_2comp) can wander there mid-search even
+    starting from a sane guess. planck(ratio)/planck0 = ratio**3 *
+    (e^Theta-1)/(e^(Theta*ratio)-1) is computed below via the algebraic
+    identity (e^a-1)/(e^b-1) = e^(a-b) * (1-e^-a)/(1-e^-b), which only ever
+    evaluates e^(-x) for x>=0 (safely in [0,1]) instead of the e^(+x) that
+    overflows straight to inf once Theta is that large -- and the exponent
+    is clipped before the final exp() so a genuinely out-of-float64-range
+    answer saturates at a large finite number instead of overflowing,
+    since an inf/nan source function is a non-finite residual that
+    scipy's least_squares (used by estimate_shape_2comp) rejects outright,
+    aborting the fit."""
+    nu0_hz = nu0 * 1e6
+    theta = H_PLANCK * nu0_hz / (K_BOLTZMANN * T)
+    tau = ratio ** -2.1
+    bracket = -np.expm1(-tau)
+    tau0 = 1.0
+    bracket0 = -np.expm1(-tau0)
+    theta_ratio = theta * ratio
+    with np.errstate(over='ignore', invalid='ignore'):
+        log_planck_ratio = (3 * np.log(ratio) + theta * (1 - ratio)
+                             + np.log1p(-np.exp(-theta)) - np.log1p(-np.exp(-theta_ratio)))
+    planck_ratio = np.exp(np.clip(log_planck_ratio, -700.0, 700.0))
+    return np.nan_to_num(planck_ratio * bracket / bracket0, nan=0.0, posinf=1e300, neginf=0.0)
+
+
+def source_function(nu, nu0, alpha, shape, T=None, beta=None):
+    """Normalized source function S'(nu), S'(nu0)=1, in the given `shape`
+    ('powerlaw'/'ssa'/'thermal'/'logparabola' -- always passed explicitly
+    by the caller, e.g. a two-component model's own per-component
+    SPECTRAL_SHAPE/SPECTRAL_SHAPE_2, since the two components of a model
+    need not share one).
     'powerlaw': (nu/nu0)**alpha.
     'ssa': classic synchrotron self-absorbed spectrum (nu/nu0)**(5/2) *
     (1-e^-tau_nu)/(1-e^-tau_0), tau_0 fixed to 1 and tau_nu = tau_0*
     (nu/nu0)**(alpha-5/2) the frequency-dependent opacity -- the -5/2 offset
     is what makes alpha the actual optically-thin spectral index (nu >>
-    nu0): S'(nu) there is ~ (nu/nu0)**(5/2) * tau_nu ~ (nu/nu0)**alpha."""
+    nu0): S'(nu) there is ~ (nu/nu0)**(5/2) * tau_nu ~ (nu/nu0)**alpha.
+    'thermal': thermal free-free spectrum, see thermal_source -- `alpha`
+    is inert for this shape (its -0.1 optically-thin index is emergent
+    from `T`, not a free parameter); `T` [K] is required.
+    'logparabola': curved power law (nu/nu0)**(alpha+beta*ln(nu/nu0)) --
+    alpha is still the local spectral index at nu0 (as under 'powerlaw'),
+    and `beta` [dimensionless] is required; beta=0 reduces exactly to
+    'powerlaw'. beta<0 gives a spectrum that peaks near nu0 and falls off
+    on both sides (concave down in log-log); beta>0 diverges on both
+    sides instead (concave up) -- see MODELS/spec.params for typical
+    bounds. Unlike 'ssa'/'thermal', nu0 here is still the shared band edge
+    (see component_reference_nu), not a free turnover of its own."""
     ratio = nu / nu0
-    if SPECTRAL_SHAPE == 'ssa':
+    if shape == 'ssa':
         tau0 = 1.0
         tau_nu = tau0 * ratio ** (alpha - 2.5)
         # (1-e^-x) = -expm1(-x); tau0's constant denominator cancels the
         # sign, and expm1 keeps this well-behaved as tau_nu -> 0.
         return ratio ** 2.5 * np.expm1(-tau_nu) / np.expm1(-tau0)
+    if shape == 'thermal':
+        return thermal_source(ratio, nu0, T)
+    if shape == 'logparabola':
+        return ratio ** (alpha + beta * np.log(ratio))
     return ratio ** alpha
 
 
@@ -150,25 +258,27 @@ def spectral_weights(x, eps, alpha1, alpha2, nu_min=None):
     epsilon is component 1's flux fraction at that reference frequency -- a
     directly-set slider rather than something derived from per-component
     turnover frequencies. Each weight then evolves away from it via that
-    component's own source function S'(nu) (see
-    source_function/set_spectral_shape):
+    component's own source function S'(nu), in that component's own shape
+    (see source_function/set_spectral_shape -- the two components need not
+    share a shape):
         w1 = eps * S1'(nu),  w2 = (1-eps) * S2'(nu)
     w1+w2 is thus the (normalized) total Stokes I(nu) of the two-component
     system; see stokes_I().
 
-    Under the power-law shape both components always share one reference
-    frequency nu0 (`nu_min` [MHz] if given, else the *lowest* frequency
-    spanned by x -- the longest wavelength currently plotted); under 'ssa'
-    each component instead uses its own turnover frequency, set via
+    A component whose own shape is 'powerlaw' always uses the shared
+    reference frequency nu0 (`nu_min` [MHz] if given, else the *lowest*
+    frequency spanned by x -- the longest wavelength currently plotted);
+    one whose shape is 'ssa'/'thermal' instead uses its own turnover
+    frequency (and, for 'thermal', its own temperature), set via
     set_spectral_shape (see component_reference_nu). Pass an explicit
     `nu_min` to anchor the power-law case elsewhere (e.g. to loaded data's
     own nu_min so the Stokes I/Q/U display doesn't drift when the plotted
     wavelength range changes -- see MainWindow.data_nu_min)."""
     nu = C / x / 1e6  # MHz
-    nu0_1 = component_reference_nu(nu, nu_min, SPECTRAL_NU0)
-    nu0_2 = component_reference_nu(nu, nu_min, SPECTRAL_NU0_2)
-    w1 = eps * source_function(nu, nu0_1, alpha1)
-    w2 = (1.0 - eps) * source_function(nu, nu0_2, alpha2)
+    nu0_1 = component_reference_nu(nu, nu_min, SPECTRAL_NU0, SPECTRAL_SHAPE)
+    nu0_2 = component_reference_nu(nu, nu_min, SPECTRAL_NU0_2, SPECTRAL_SHAPE_2)
+    w1 = eps * source_function(nu, nu0_1, alpha1, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)
+    w2 = (1.0 - eps) * source_function(nu, nu0_2, alpha2, SPECTRAL_SHAPE_2, T=SPECTRAL_TEMP_2, beta=SPECTRAL_BETA_2)
     return w1, w2
 
 
@@ -236,18 +346,33 @@ def pol(fit):
     return 100 * np.sqrt(fit.real ** 2 + fit.imag ** 2)
 
 
+def two_component_ref_wl(nu, nu_min, shape1, shape2):
+    """The wavelength [m] the two-component branches of stokes_I/
+    stokes_components evaluate raw_ref at: the wavelength corresponding to
+    nu_min (lowest plotted frequency, or an explicit override) by default
+    -- except when component 1's own shape is 'thermal' (or, failing
+    that, component 2's), which anchors at that component's own turnover
+    nu0 instead (see stokes_I's docstring for why)."""
+    if shape1 == 'thermal':
+        nu_ref = component_reference_nu(nu, nu_min, SPECTRAL_NU0, shape1)
+    elif shape2 == 'thermal':
+        nu_ref = component_reference_nu(nu, nu_min, SPECTRAL_NU0_2, shape2)
+    else:
+        nu_ref = band_nu0(nu, nu_min)
+    return C / (nu_ref * 1e6)
+
+
 def stokes_I(wl, n_components, pars, nu_min=None):
     """Normalized Stokes I(nu) implied by a model's own trailing spectral
     params (the last 1 for a single-component model: alpha; the last 3
     for a two-component model: eps,alpha1,alpha2) -- no separate I_0
     needed, this is a *display/export* shape with amplitude 1 at nu_min
     (the lowest frequency spanned by wl, or an explicit override -- see
-    below), regardless of shape ('powerlaw'/'ssa'). For a single component
-    the spectral index has no effect on p=P/I, but it does shape the total
-    intensity spectrum itself, via S'(nu) (see
-    source_function/set_spectral_shape); for two components this is the
-    same w1+w2 total weight that already governs how the polarization
-    blends between them.
+    below) for 'powerlaw'/'ssa'. For a single component the spectral index
+    has no effect on p=P/I, but it does shape the total intensity spectrum
+    itself, via S'(nu) (see source_function/set_spectral_shape); for two
+    components this is the same w1+w2 total weight that already governs
+    how the polarization blends between them.
 
     Anchoring at nu_min rather than at each component's own physics-level
     reference frequency (nu0 for 'powerlaw', which usually *is* nu_min
@@ -262,6 +387,15 @@ def stokes_I(wl, n_components, pars, nu_min=None):
     spectral_weights/source_function) still fully reflects nu0 -- only
     where the curve reads "1" moves.
 
+    'thermal' is the one exception: it anchors at that component's own nu0
+    instead (see two_component_ref_wl for the two-component case), not
+    nu_min. A thermal source function is already physically normalized to
+    S'(nu0)=1 (see thermal_source); unlike 'ssa', its turnover isn't a
+    free knob explored far outside the plotted band, so there's no reason
+    to detach the display from that physical anchor -- doing so instead
+    lets the displayed I(nu) swing over many decades (the full
+    Rayleigh-Jeans rise between nu_min and nu0) for no physical reason.
+
     `nu_min` [MHz] defaults to the lowest frequency spanned by wl (the
     longest wavelength currently plotted); pass an explicit value (e.g. the
     loaded data's own nu_min) to anchor the normalization elsewhere."""
@@ -269,15 +403,18 @@ def stokes_I(wl, n_components, pars, nu_min=None):
     if nu_min is None:
         nu_min = np.min(nu)
     nu_min_arr = np.array([nu_min])
-    wl_ref = C / (nu_min * 1e6)  # wl [m] at nu_min, for the two-component branch below
 
     if n_components == 1:
         alpha = pars[-1]
         nu0 = reference_nu(nu, nu_min)
-        raw = source_function(nu, nu0, alpha)
-        raw_ref = source_function(nu_min_arr, nu0, alpha)[0]
+        raw = source_function(nu, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)
+        if SPECTRAL_SHAPE == 'thermal':
+            raw_ref = 1.0  # thermal_source is already S'(nu0)=1 by construction
+        else:
+            raw_ref = source_function(nu_min_arr, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)[0]
     else:
         eps, alpha1, alpha2 = pars[-3:]
+        wl_ref = two_component_ref_wl(nu, nu_min, SPECTRAL_SHAPE, SPECTRAL_SHAPE_2)
         w1, w2 = spectral_weights(wl, eps, alpha1, alpha2, nu_min=nu_min)
         raw = w1 + w2
         w1_ref, w2_ref = spectral_weights(np.array([wl_ref]), eps, alpha1, alpha2, nu_min=nu_min)
@@ -313,7 +450,7 @@ def stokes_components(wl, model, pars, nu_min=None):
     nu = C / wl / 1e6  # MHz
     if nu_min is None:
         nu_min = np.min(nu)
-    wl_ref = C / (nu_min * 1e6)  # wl [m] at nu_min, matching stokes_I's own anchor
+    wl_ref = two_component_ref_wl(nu, nu_min, SPECTRAL_SHAPE, SPECTRAL_SHAPE_2)  # matches stokes_I's own anchor
 
     w1, w2 = spectral_weights(wl, eps, alpha1, alpha2, nu_min=nu_min)
     w1_ref, w2_ref = spectral_weights(np.array([wl_ref]), eps, alpha1, alpha2, nu_min=nu_min)
@@ -503,51 +640,93 @@ register(comp2mixdep,
               r'+\frac{w_2}{w_1+w_2}p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
 
 
-# ── Equation-card display: prepend the chosen S'(nu) definition to a model's
-# own polarization equation, and -- for two-component models -- the
-# w1/w2/epsilon definition built from it, on its own line above. Built
+# ── Equation-card display: prepend the chosen S'(nu) definition(s) to a
+# model's own polarization equation, and -- for two-component models -- the
+# w1/w2/epsilon definition built from them, on its own line above. Built
 # dynamically (not baked into ModelSpec.equation at registration time) since
-# the shape ('powerlaw'/'ssa') is a runtime choice -- see
+# the shape(s) ('powerlaw'/'ssa') are a runtime choice -- see
 # app.MainWindow.on_spectral_shape_changed.
 #
 # 'powerlaw' always shares one nu0 between both components of a
-# two-component model (matches the Polvista paper); 'ssa' lets each component
+# two-component model (matches the Polvista paper); 'ssa' lets a component
 # turn over at its own nu_{0,i} (see set_spectral_shape/
-# component_reference_nu), so its two-component S' definition and epsilon
-# are written with an explicit per-component subscript instead. The
-# frequency-dependent opacity tau_nu isn't shown as its own term -- tau_0 is
-# fixed to 1, so it's inlined directly into S'(nu) instead of introducing it
-# as a separate symbol.
+# component_reference_nu). When both components share one shape, the
+# combined, unsubscripted-nu0 (powerlaw) or i-subscripted (ssa) templates
+# below are used, matching the paper; when they don't (one 'powerlaw', one
+# 'ssa'), full_equation instead builds each component's own S_i'(nu) line
+# separately (see _s_prime_component_latex). The frequency-dependent opacity
+# tau_nu isn't shown as its own term -- tau_0 is fixed to 1, so it's inlined
+# directly into S'(nu) instead of introducing it as a separate symbol.
 S_PRIME_POWERLAW = r"S'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha}"
 S_PRIME_SSA_ONE = (r"S'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{5/2}"
                     r"\left[\dfrac{1-e^{-(\nu/\nu_0)^{\alpha-5/2}}}{1-e^{-1}}\right]")
 S_PRIME_SSA_TWO = (r"S_i'(\nu)=\left(\dfrac{\nu}{\nu_{0,i}}\right)^{5/2}"
                     r"\left[\dfrac{1-e^{-(\nu/\nu_{0,i})^{\alpha_i-5/2}}}{1-e^{-1}}\right]\ \ (i=1,2)")
+S_PRIME_THERMAL_ONE = (r"S'(\nu)=\dfrac{B_\nu(T)\left[1-e^{-(\nu/\nu_0)^{-2.1}}\right]}"
+                        r"{B_{\nu_0}(T)\left(1-e^{-1}\right)}")
+S_PRIME_THERMAL_TWO = (r"S_i'(\nu)=\dfrac{B_\nu(T_i)\left[1-e^{-(\nu/\nu_{0,i})^{-2.1}}\right]}"
+                        r"{B_{\nu_{0,i}}(T_i)\left(1-e^{-1}\right)}\ \ (i=1,2)")
+# Log-parabola shares 'powerlaw''s own shared band nu_0 (no per-component
+# turnover), so -- like S_PRIME_POWERLAW -- one template serves both the
+# single- and two-component (shared-shape) cases; only the mixed-shape
+# per-component branch (_s_prime_component_latex) ever needs alpha_i/beta_i.
+S_PRIME_LOGPARABOLA = r"S'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha+\beta\ln(\nu/\nu_0)}"
 
 
-def s_prime_latex(n_components, shape):
-    """LaTeX (no surrounding '$') for the S'(nu) source-function definition
-    a given `shape` ('powerlaw'/'ssa') implies."""
+def _s_prime_component_latex(idx, shape):
+    """S_i'(nu) LaTeX for one two-component model's own component `idx`
+    (1 or 2) under its own `shape` -- used by s_prime_latex only when the
+    two components don't share one shape, so each needs its own explicit
+    line rather than the combined i-subscripted templates above."""
     if shape == 'ssa':
-        return S_PRIME_SSA_TWO if n_components == 2 else S_PRIME_SSA_ONE
-    return S_PRIME_POWERLAW
+        return (r"S_{%d}'(\nu)=\left(\dfrac{\nu}{\nu_{0,%d}}\right)^{5/2}"
+                 r"\left[\dfrac{1-e^{-(\nu/\nu_{0,%d})^{\alpha_{%d}-5/2}}}{1-e^{-1}}\right]"
+                 % (idx, idx, idx, idx))
+    if shape == 'thermal':
+        return (r"S_{%d}'(\nu)=\dfrac{B_\nu(T_{%d})\left[1-e^{-(\nu/\nu_{0,%d})^{-2.1}}\right]}"
+                 r"{B_{\nu_{0,%d}}(T_{%d})\left(1-e^{-1}\right)}" % (idx, idx, idx, idx, idx))
+    if shape == 'logparabola':
+        return (r"S_{%d}'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha_{%d}+\beta_{%d}\ln(\nu/\nu_0)}"
+                 % (idx, idx, idx))
+    return r"S_{%d}'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha_{%d}}" % (idx, idx)
 
 
-def weights_latex(shape):
+def s_prime_latex(n_components, shape1, shape2):
+    """LaTeX (no surrounding '$') for the S'(nu) source-function
+    definition(s) given `shape1`/`shape2`
+    ('powerlaw'/'ssa'/'thermal'/'logparabola') -- `shape2` is ignored for a
+    single-component model (n_components==1: `shape1` is that model's own,
+    only, shape)."""
+    templates = {'ssa': (S_PRIME_SSA_ONE, S_PRIME_SSA_TWO),
+                 'thermal': (S_PRIME_THERMAL_ONE, S_PRIME_THERMAL_TWO),
+                 'logparabola': (S_PRIME_LOGPARABOLA, S_PRIME_LOGPARABOLA)}
+    if n_components == 1:
+        one, _ = templates.get(shape1, (S_PRIME_POWERLAW, None))
+        return one
+    if shape1 == shape2:
+        _, two = templates.get(shape1, (None, S_PRIME_POWERLAW))
+        return two
+    return _s_prime_component_latex(1, shape1) + r"\ \ " + _s_prime_component_latex(2, shape2)
+
+
+def weights_latex(shape1, shape2):
     """LaTeX (no surrounding '$') for a two-component model's w1/w2/epsilon
     line: how S'(nu) combines into each component's weight w_i and the
-    epsilon that sets w1 vs w2 (Polvista paper Eq. 9-11)."""
-    if shape == 'ssa':
-        eps_def = r"\varepsilon=\dfrac{I_1(\nu_{0,1})}{I_1(\nu_{0,1})+I_2(\nu_{0,2})}"
-    else:
-        eps_def = r"\varepsilon=\dfrac{I_1(\nu_0)}{I_1(\nu_0)+I_2(\nu_0)}"
+    epsilon that sets w1 vs w2 (Polvista paper Eq. 9-11). Each component's
+    own reference frequency in the epsilon definition follows its own
+    shape -- nu_0 (shared) under 'powerlaw', nu_{0,i} (its own) under
+    'ssa'/'thermal' -- independently of the other component's."""
+    nu0_1 = r'\nu_{0,1}' if shape1 in ('ssa', 'thermal') else r'\nu_0'
+    nu0_2 = r'\nu_{0,2}' if shape2 in ('ssa', 'thermal') else r'\nu_0'
+    eps_def = r"\varepsilon=\dfrac{I_1(%s)}{I_1(%s)+I_2(%s)}" % (nu0_1, nu0_1, nu0_2)
     return r"w_1=\varepsilon\,S_1'(\nu),\ \ w_2=(1-\varepsilon)\,S_2'(\nu),\ \ " + eps_def
 
 
-def full_equation(spec, shape):
+def full_equation(spec, shape1, shape2):
     """The full (centered, possibly multi-line) equation-card LaTeX for
-    `spec` at the given spectral `shape`: its own P(lambda) equation, plus
-    the S'(nu) definition that shape implies.
+    `spec` at the given spectral shape(s): its own P(lambda) equation, plus
+    the S'(nu) definition(s) `shape1`/`shape2` imply. `shape2` is ignored
+    for a single-component model.
 
     Single-component model: one line, S'(nu) to the left of P(lambda)
     (S'(nu) shapes only the Stokes I spectrum there, not p=P/I itself, but
@@ -557,13 +736,13 @@ def full_equation(spec, shape):
     first, then S'(nu) to the left of P(lambda) on the line below (matching
     the single-component layout, since P(lambda) itself is written in
     terms of w1/w2 -- see each two-component model's own `equation`)."""
-    s_prime = s_prime_latex(spec.n_components, shape)
+    s_prime = s_prime_latex(spec.n_components, shape1, shape2)
     body = spec.equation.strip()
     inner = body[1:-1]  # strip the surrounding '$...$'
     line2 = f'${s_prime}\\qquad\\quad {inner}$'
     if spec.n_components == 1:
         return line2
-    line1 = f'${weights_latex(shape)}$'
+    line1 = f'${weights_latex(shape1, shape2)}$'
     return f'{line1}\n{line2}'
 
 # Model lookup by function name (e.g. 'burn', 'comp2intern'), the identifier
