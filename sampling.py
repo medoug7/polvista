@@ -415,27 +415,42 @@ class SamplingMixin:
         outdir_row.addWidget(self.sampling_outdir_button)
         sampling_layout.addLayout(outdir_row)
 
-        live_tip = ('Number of live points MultiNest maintains during nested sampling. '
-                    'More live points resolve the posterior (and multiple modes) more finely '
-                    'and give a more reliable evidence estimate, at the cost of more '
-                    'likelihood evaluations (slower).')
+        live_tip = ('Number of live points MultiNest maintains during nested sampling.\n'
+                    'More live points resolve the posterior (and multiple modes) more finely \n'
+                    'and give a more reliable evidence estimate, at the cost of more \n'
+                    'likelihood evaluations (slower)')
         live_row = QHBoxLayout()
-        live_label = QLabel('# of live points:')
+        # Plain text, like every other row's own label, with just the
+        # n_live symbol itself rendered as mathtext (a second QLabel,
+        # pixmap-only) tacked on at the end -- same split used for a
+        # slider's own name_label/unit_label pair (see ParamSlider),
+        # rather than rendering the whole "Number of live points" phrase
+        # as one mathtext image.
+        live_label = QLabel('Number of live points')
         live_label.setToolTip(live_tip)
         live_row.addWidget(live_label)
+        live_symbol = QLabel()
+        live_symbol.setPixmap(latex_pixmap(r'$n_\mathrm{live}$'))
+        live_symbol.setToolTip(live_tip)
+        live_row.addWidget(live_symbol)
         live_row.addStretch(1)
         self.sampling_n_live = QSpinBox()
         self.sampling_n_live.setRange(1, 10000)
-        self.sampling_n_live.setValue(400)
+        # Seeded from the current model's own preset (see
+        # rebuild_sampling_bounds, which keeps this in sync on every later
+        # model switch too) rather than one fixed default -- a 2-component
+        # model's extra params (and its exchange-symmetry double mode, see
+        # fitting.DEGENERATE_PAIR_MODELS) need more live points to resolve
+        # reliably than a single-component one.
+        self.sampling_n_live.setValue(MODELS[self.model_combo.currentData()].n_live_points)
         self.sampling_n_live.setToolTip(live_tip)
         live_row.addWidget(self.sampling_n_live)
         sampling_layout.addLayout(live_row)
 
-        eff_tip = ('Target acceptance efficiency (0-1) for MultiNest\'s ellipsoidal '
-                   'sampling. Lower values (~0.2-0.3, the recommended range for a '
-                   'reliable Bayesian evidence) sample more conservatively; higher '
-                   'values (up to ~0.8) run faster but are only recommended if you '
-                   'only care about the parameter estimate, not the evidence.')
+        eff_tip = ('Target acceptance efficiency (0-1) for MultiNest\'s ellipsoidal sampling.\n'
+                   'Lower values (~0.2-0.3, the recommended range for a reliable Bayesian evidence)\n '
+                   'sample more conservatively; higher values (up to ~0.8) run faster but are \n'
+                   'only recommended for quick the parameter estimates, not reliable evidences.')
         eff_row = QHBoxLayout()
         eff_label = QLabel('Sampling efficiency:')
         eff_label.setToolTip(eff_tip)
@@ -450,9 +465,9 @@ class SamplingMixin:
         eff_row.addWidget(self.sampling_efficiency)
         sampling_layout.addLayout(eff_row)
 
-        tol_tip = ('Stopping criterion: MultiNest halts once its estimate of the '
-                   'remaining (unsampled) evidence contribution falls below this '
-                   'tolerance. Smaller values sample longer but converge the '
+        tol_tip = ('Stopping criterion: MultiNest halts once its estimate of the\n'
+                   'remaining (unsampled) evidence contribution falls below this\n'
+                   'tolerance. Smaller values sample longer but converge the\n'
                    'evidence estimate more tightly.')
         tol_row = QHBoxLayout()
         tol_label = QLabel('Evidence tolerance:')
@@ -490,8 +505,8 @@ class SamplingMixin:
         load_samples_row = QHBoxLayout()
         self.sampling_load_button = QPushButton('Load samples')
         self.sampling_load_button.setToolTip(
-            "Load a previous MultiNest run's output, re-cluster its "
-            'modes, and show the winning family (parameters, posterior '
+            "Load a previous MultiNest run's output, re-cluster its\n"
+            'modes, and show the winning family (parameters, posterior\n'
             'overlay, corner plot) -- same as a fresh Fit! run.')
         self.sampling_load_button.clicked.connect(self.load_samples_action)
         load_samples_row.addWidget(self.sampling_load_button)
@@ -536,7 +551,15 @@ class SamplingMixin:
 
         phi and dphi share one "Log-uniform" checkbox, shown once above
         both rows rather than per-row, that switches them both between a
-        linear and log10-magnitude sampling range together."""
+        linear and log10-magnitude sampling range together.
+
+        Also resets the # of live points spin box to the new model's own
+        preset (see build_sampling_tab/models.ModelSpec.n_live_points),
+        same as the bounds rows themselves -- any manual override the user
+        had set for the *previous* model doesn't carry over, matching how
+        the bounds rows below are unconditionally rebuilt from scratch too
+        rather than trying to preserve a per-model customization across a
+        model switch."""
         if not hasattr(self, 'sampling_bounds_layout'):
             return  # HAS_PYMULTINEST is False -- no Sampling tab was built
 
@@ -549,6 +572,7 @@ class SamplingMixin:
 
         spec = MODELS[self.model_combo.currentData()]
         lo_bounds, hi_bounds = spec.bounds
+        self.sampling_n_live.setValue(spec.n_live_points)
 
         self.sampling_bounds_layout.takeAt(self.sampling_bounds_layout.count() - 1)
 

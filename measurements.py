@@ -14,7 +14,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QPointF
 from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPolygonF
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QGroupBox,
-    QScrollArea, QDoubleSpinBox, QSpinBox, QFileDialog, QMessageBox)
+    QScrollArea, QDoubleSpinBox, QSpinBox, QFileDialog, QMessageBox, QSizePolicy)
 
 from polvista.models import C, stokes_I
 from polvista.latex_stuff import latex_pixmap
@@ -418,19 +418,30 @@ class MeasurementsMixin:
         qu_row.addWidget(QLabel('%'))
         bands_layout.addLayout(qu_row)
 
+        # Clear/Generate on the left, sharing that half of the row evenly
+        # (Expanding size policy so they actually grow to fill it, not just
+        # sit at their natural size with dead space after them); Export on
+        # the right, pinned to the box's own right edge within the other
+        # half rather than stretched -- the two addLayout/addWidget calls
+        # below share stretch=1 each, splitting gen_row itself into equal
+        # left/right halves.
         gen_row = QHBoxLayout()
+        left_group = QHBoxLayout()
+        self.generate_button = QPushButton('Generate')
+        self.generate_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.generate_button.clicked.connect(self.generate_measurements)
+        left_group.addWidget(self.generate_button)
         self.clear_meas_button = QPushButton('Clear')
         self.clear_meas_button.setToolTip('Remove the currently plotted simulated measurement points.')
+        self.clear_meas_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.clear_meas_button.clicked.connect(self.clear_measurement_points)
-        gen_row.addWidget(self.clear_meas_button)
-        self.generate_button = QPushButton('Generate')
-        self.generate_button.clicked.connect(self.generate_measurements)
-        gen_row.addWidget(self.generate_button)
+        left_group.addWidget(self.clear_meas_button)
+        gen_row.addLayout(left_group, 1)
         self.export_meas_button = QPushButton('Export')
         self.export_meas_button.setToolTip('Save the currently plotted simulated measurement points to a CSV.')
         self.export_meas_button.setEnabled(False)  # only enabled once Generate has produced points
         self.export_meas_button.clicked.connect(self.export_measurements_action)
-        gen_row.addWidget(self.export_meas_button)
+        gen_row.addWidget(self.export_meas_button, 1, Qt.AlignRight)
         bands_layout.addLayout(gen_row)
 
         outer_layout.addWidget(bands_box)

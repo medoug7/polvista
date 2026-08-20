@@ -1,6 +1,6 @@
-# polvista
+# POLVISTA
 
-POLarization VISualization Tools for Astronomy is an interactive visualizer to help get some intuition on complex polarization prescriptions used to model observations of Active Galactic Nuclei (AGN) and other astronomical objects.
+POLarization VISualization Tools for Astronomy (POLVISTA) is an interactive visualizer to help get some intuition on complex polarization prescriptions used to model observations of Active Galactic Nuclei (AGN) and other astronomical objects.
 Pick a model, customize its parameter, and watch how the degree of polarization and electric vector position angle (EVPA) changes across the spectrum.
 
 
@@ -14,9 +14,8 @@ Polvista can also fit spectropolarimetric data with simple least-squares regress
 - Partial coverage, external and internal
 - Two-component blends: two external screens, two internal screens, or internal + external screens, each with independent spectral parameters!
 
-![Burn depolarization with equation card](assets/partialcover_stokes.png)
+![Main screen with the burn model](assets/polvista_main.png)
 
-![Two external-screen components](assets/2comp_polarization.png)
 
 
 ## Install

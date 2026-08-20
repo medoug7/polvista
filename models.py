@@ -350,12 +350,12 @@ def two_component_ref_wl(nu, nu_min, shape1, shape2):
     """The wavelength [m] the two-component branches of stokes_I/
     stokes_components evaluate raw_ref at: the wavelength corresponding to
     nu_min (lowest plotted frequency, or an explicit override) by default
-    -- except when component 1's own shape is 'thermal' (or, failing
-    that, component 2's), which anchors at that component's own turnover
-    nu0 instead (see stokes_I's docstring for why)."""
-    if shape1 == 'thermal':
+    -- except when component 1's own shape is 'ssa' or 'thermal' (or,
+    failing that, component 2's), which anchors at that component's own
+    turnover nu0 instead (see stokes_I's docstring for why)."""
+    if shape1 in ('ssa', 'thermal'):
         nu_ref = component_reference_nu(nu, nu_min, SPECTRAL_NU0, shape1)
-    elif shape2 == 'thermal':
+    elif shape2 in ('ssa', 'thermal'):
         nu_ref = component_reference_nu(nu, nu_min, SPECTRAL_NU0_2, shape2)
     else:
         nu_ref = band_nu0(nu, nu_min)
@@ -368,33 +368,28 @@ def stokes_I(wl, n_components, pars, nu_min=None):
     for a two-component model: eps,alpha1,alpha2) -- no separate I_0
     needed, this is a *display/export* shape with amplitude 1 at nu_min
     (the lowest frequency spanned by wl, or an explicit override -- see
-    below) for 'powerlaw'/'ssa'. For a single component the spectral index
-    has no effect on p=P/I, but it does shape the total intensity spectrum
-    itself, via S'(nu) (see source_function/set_spectral_shape); for two
-    components this is the same w1+w2 total weight that already governs
-    how the polarization blends between them.
+    below) for 'powerlaw'/'logparabola'. For a single component the
+    spectral index has no effect on p=P/I, but it does shape the total
+    intensity spectrum itself, via S'(nu) (see source_function/
+    set_spectral_shape); for two components this is the same w1+w2 total
+    weight that already governs how the polarization blends between them.
 
     Anchoring at nu_min rather than at each component's own physics-level
-    reference frequency (nu0 for 'powerlaw', which usually *is* nu_min
-    anyway; each component's own SSA turnover otherwise) is deliberate: it
-    keeps this normalization matched to the Load Data path's own I(nu_min)
-    =1 convention (see MainWindow.load_data_action) regardless of where an
-    SSA turnover has been placed -- an SSA nu0 can sit many decades outside
-    the plotted/loaded band by design (see app.NU0_BOUNDS_MULT), and
-    anchoring the display there instead would let the *displayed* I(nu)
-    swing to arbitrarily large or small values with no relation to what's
-    actually on screen or in the loaded data. The underlying shape (via
-    spectral_weights/source_function) still fully reflects nu0 -- only
-    where the curve reads "1" moves.
+    reference frequency (nu0, which for 'powerlaw'/'logparabola' usually
+    *is* nu_min anyway) is deliberate: it keeps this normalization matched
+    to the Load Data path's own I(nu_min)=1 convention (see
+    MainWindow.load_data_action).
 
-    'thermal' is the one exception: it anchors at that component's own nu0
-    instead (see two_component_ref_wl for the two-component case), not
-    nu_min. A thermal source function is already physically normalized to
-    S'(nu0)=1 (see thermal_source); unlike 'ssa', its turnover isn't a
-    free knob explored far outside the plotted band, so there's no reason
-    to detach the display from that physical anchor -- doing so instead
-    lets the displayed I(nu) swing over many decades (the full
-    Rayleigh-Jeans rise between nu_min and nu0) for no physical reason.
+    'ssa' and 'thermal' are the exception: each anchors at that
+    component's own turnover nu0 instead (see two_component_ref_wl for the
+    two-component case), not nu_min. Both source functions are already
+    physically normalized to S'(nu0)=1 by construction (see
+    thermal_source, and source_function's 'ssa' branch at ratio=1), so
+    this is a genuine physical anchor rather than an arbitrary one -- and
+    it means dragging that component's own turnover slider rescales the
+    displayed curve, since nu0 is exactly where it now reads 1. (Only
+    'powerlaw'/'logparabola' need the nu_min fallback: they have no
+    turnover of their own to anchor at.)
 
     `nu_min` [MHz] defaults to the lowest frequency spanned by wl (the
     longest wavelength currently plotted); pass an explicit value (e.g. the
@@ -408,8 +403,8 @@ def stokes_I(wl, n_components, pars, nu_min=None):
         alpha = pars[-1]
         nu0 = reference_nu(nu, nu_min)
         raw = source_function(nu, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)
-        if SPECTRAL_SHAPE == 'thermal':
-            raw_ref = 1.0  # thermal_source is already S'(nu0)=1 by construction
+        if SPECTRAL_SHAPE in ('ssa', 'thermal'):
+            raw_ref = 1.0  # source_function is already S'(nu0)=1 by construction for both
         else:
             raw_ref = source_function(nu_min_arr, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)[0]
     else:
@@ -422,15 +417,20 @@ def stokes_I(wl, n_components, pars, nu_min=None):
     return raw / raw_ref
 
 
-def stokes_QU(wl, model, n_components, pars, nu_min=None):
+def stokes_QU(wl, model, n_components, pars, nu_min=None, I=None):
     """Physical (I_0=1-normalized) Stokes Q(nu), U(nu): model() already
     returns the fractional complex polarization P/I, so multiplying back
     by the model's own Stokes I(nu) recovers genuine Q, U (not just Q/I,
     U/I) -- e.g. for a single component with p constant in nu, Q and U
     simply trace I(nu)'s power-law shape, modulated by cos/sin(2*EVPA).
-    `nu_min` [MHz] is forwarded to stokes_I() -- see there."""
+    `nu_min` [MHz] is forwarded to stokes_I() -- see there.
+
+    `I`, if given, is that same stokes_I(wl, n_components, pars, nu_min)
+    already computed by the caller -- passing it in skips recomputing it
+    here. A caller that doesn't already have it can just omit it."""
     fit = model(wl, pars)
-    I = stokes_I(wl, n_components, pars, nu_min=nu_min)
+    if I is None:
+        I = stokes_I(wl, n_components, pars, nu_min=nu_min)
     return fit.real * I, fit.imag * I
 
 
@@ -480,6 +480,20 @@ class ModelSpec:
     bounds: tuple                   # (lower_list, upper_list)
     n_components: int = 1
     equation: str = ''              # mathtext for the complex polarization P(lambda)
+    # Suggested MultiNest live-point count for the Sampling tab (see
+    # sampling.SamplingMixin.build_sampling_tab/rebuild_sampling_bounds) --
+    # more params (and especially the 2nd mode a two-component model's own
+    # exchange symmetry introduces, see fitting.DEGENERATE_PAIR_MODELS) need
+    # more live points to resolve the posterior reliably. Values mirror
+    # ~/Downloads/pipe/qu_fit.py's own per-model ModelSpec.n_live_points
+    # (its reference implementation this app's own QU-fitting/MultiNest
+    # pipeline was distilled from -- see fitting.py's module docstring),
+    # for whichever of its models this one matches; partial2 has no
+    # counterpart there (qu_fit.py has no internal-screen-with-partial-
+    # coverage model) so it just reuses partial's own value -- same
+    # single-component, 5-param, partial-coverage structure, only an
+    # internal rather than external screen.
+    n_live_points: int = 1000
 
     @property
     def param_names(self):
@@ -498,15 +512,23 @@ def register(func, **kwargs):
 
 def spectral_params():
     """The 3 trailing params every two-component model appends: epsilon
-    (component 1's flux fraction I1/(I1+I2) at nu_min, the lowest
-    frequency/longest wavelength currently plotted) and each component's
-    own power-law spectral index, used to weight that component's
-    contribution to the total by (nu/nu_min)**alpha. alpha1=alpha2=0
-    reduces to a plain eps/(1-eps) blend at every wavelength (see
-    spectral_combine)."""
+    (component 1's own weight w1 at component 1's own reference frequency
+    -- nu_min, the lowest frequency/longest wavelength currently plotted,
+    unless component 1's own shape is 'ssa'/'thermal', in which case it's
+    that component's own turnover nu0 instead; see
+    component_reference_nu/spectral_weights) and each component's own
+    power-law spectral index, used to weight that component's contribution
+    to the total by (nu/nu0)**alpha. alpha1=alpha2=0 reduces to a plain
+    eps/(1-eps) blend at every wavelength (see spectral_combine). Note
+    epsilon only equals I1/(I1+I2) *at that same reference frequency* when
+    component 2 also happens to equal 1 there -- true by default (both
+    components sharing the band-edge nu_min under 'powerlaw'/
+    'logparabola'), but not guaranteed once either component uses its own
+    independent turnover."""
     return [Param('epsilon', r'$\varepsilon$', 'eps',
-                  "Component 1's fraction of total intensity I1/(I1+I2) at the "
-                  "lowest plotted frequency; sets which component dominates"),
+                  "Component 1's own weight at its own reference frequency "
+                  "(the lowest plotted frequency, or its own turnover under "
+                  "SSA/thermal); sets which component dominates"),
             Param('alpha1', r'$\alpha_1$', 'alpha',
                   "Spectral index of component 1's intensity: I1(nu) ∝ nu^alpha1."),
             Param('alpha2', r'$\alpha_2$', 'alpha',
@@ -537,7 +559,7 @@ register(burn,
             Param('dphi', r'$\sigma_{\phi}$', 'dphi', 'Faraday depth dispersion across the external turbulent screen; drives depolarization at long wavelengths.')] + spectral_param_single(),
     bounds=([0, -np.pi / 2, -5e6, 1e2] + SPECTRAL_BOUNDS_LO_SINGLE,
             [0.7, np.pi / 2, 5e6, 1e6] + SPECTRAL_BOUNDS_HI_SINGLE),
-    n_components=1,
+    n_components=1, n_live_points=500,
     equation=r'$P(\lambda)=p_0\,e^{-2\sigma_\phi^2\lambda^4}\,e^{\,2i(\chi_0+\phi\lambda^2)}$')
 
 register(tribble,
@@ -549,7 +571,7 @@ register(tribble,
             Param('s', r'$s$', 'scale', 'Beam-to-turbulent-cell size ratio: how well the turbulent screen is resolved (larger s = better resolved, less depolarization).')] + spectral_param_single(),
     bounds=([0, -np.pi / 2, -5e6, 0, 0] + SPECTRAL_BOUNDS_LO_SINGLE,
             [0.7, np.pi / 2, 5e6, 5e6, 10] + SPECTRAL_BOUNDS_HI_SINGLE),
-    n_components=1,
+    n_components=1, n_live_points=700,
     equation=r'$P(\lambda)=p_0\left[\dfrac{1-e^{-s^2/2-4\sigma_\phi^2\lambda^4}}{1+8\sigma_\phi^2\lambda^4/s^2}+e^{-s^2/2-4\sigma_\phi^2\lambda^4}\right]^{1/2}\!e^{\,2i(\chi_0+\phi\lambda^2)}$')
 
 register(partial,
@@ -561,7 +583,7 @@ register(partial,
             Param('f', r'$f$', 'scale', 'Covering fraction of the depolarizing screen; the remaining (1-f) of the emission passes through unchanged.')] + spectral_param_single(),
     bounds=([0, -np.pi / 2, -5e6, 0, 0] + SPECTRAL_BOUNDS_LO_SINGLE,
             [0.7, np.pi / 2, 5e6, 5e6, 1] + SPECTRAL_BOUNDS_HI_SINGLE),
-    n_components=1,
+    n_components=1, n_live_points=700,
     equation=r'$P(\lambda)=p_0\left[f\,e^{-2\sigma_\phi^2\lambda^4}e^{\,2i(\chi_0+\phi\lambda^2)}+(1-f)\,e^{2i\chi_0}\right]$')
 
 
@@ -573,7 +595,7 @@ register(intern,
             Param('dphi', r'$\sigma_{\phi}$', 'dphi', 'Faraday depth dispersion across the internal, emission-mixed screen; drives depolarization at long wavelengths.')] + spectral_param_single(),
     bounds=([0.0, -np.pi / 2, -5e6, 0] + SPECTRAL_BOUNDS_LO_SINGLE,
             [0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
-    n_components=1,
+    n_components=1, n_live_points=1000,
     equation=r'$P(\lambda)=p_0\,e^{2i\chi_0}\,\left[\frac{1-e^{-\left(2\sigma_\phi^2\lambda^4-2i\phi\lambda^2\right)}}{2\sigma_\phi^2\lambda^4-2i\phi\lambda^2}\right]$')
 
 register(partial2,
@@ -585,7 +607,7 @@ register(partial2,
             Param('f', 'f', 'scale', 'Covering fraction of the depolarizing internal screen; the remaining (1-f) of the emission passes through unchanged.')] + spectral_param_single(),
     bounds=([0, -np.pi / 2, -5e6, 0, 0] + SPECTRAL_BOUNDS_LO_SINGLE,
             [0.7, np.pi / 2, 5e6, 5e6, 1] + SPECTRAL_BOUNDS_HI_SINGLE),
-    n_components=1,
+    n_components=1, n_live_points=1200,  # no qu_fit.py counterpart -- reuses partial's own value (see ModelSpec.n_live_points)
     equation=r'$P(\lambda)=p_0\,e^{2i\chi_0}\left\{f\left[\frac{1-e^{-\left(2\sigma_\phi^2\lambda^4-2i\phi\lambda^2\right)}}{2\sigma_\phi^2\lambda^4-2i\phi\lambda^2}\right]+(1-f)\right\}$')
 
 
@@ -601,7 +623,7 @@ register(comp2RMdep,
             Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its external screen.")] + spectral_params(),
     bounds=([0, -np.pi / 2, -5e6, 1, 0, -np.pi / 2, -5e6, 1] + SPECTRAL_BOUNDS_LO,
             [0.7, np.pi / 2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI),
-    n_components=2,
+    n_components=2, n_live_points=2500,
     equation=(r'$P(\lambda)=\frac{w_1}{w_1+w_2}p_1e^{-\sigma_{\phi,1}^2\lambda^4}e^{\,2i(\chi_1+\phi_1\lambda^2)}'
               r'+\frac{w_2}{w_1+w_2}p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
 
@@ -618,7 +640,7 @@ register(comp2intern,
             Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its internal screen.")] + spectral_params(),
     bounds=([0, -np.pi / 2, -5e6, 1, 0, -np.pi / 2, -5e6, 1] + SPECTRAL_BOUNDS_LO,
             [0.7, np.pi / 2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI),
-    n_components=2,
+    n_components=2, n_live_points=2500,
     equation=(r'$P(\lambda)=\frac{w_1}{w_1+w_2}p_1\,e^{2i\chi_1}\left[\frac{1-e^{-\left(2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2\right)}}{2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2}\right]'
     	      r'+\frac{w_2}{w_1+w_2}p_2\,e^{2i\chi_2}\left[\frac{1-e^{-\left(2\sigma_{\phi,2}^2\lambda^4-2i\phi_2\lambda^2\right)}}{2\sigma_{\phi,2}^2\lambda^4-2i\phi_2\lambda^2}\right]$'))
 
@@ -635,7 +657,7 @@ register(comp2mixdep,
             Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its external screen.")] + spectral_params(),
     bounds=([0, -np.pi/2, -5e6, 1, 0, -np.pi/2, -5e6, 1] + SPECTRAL_BOUNDS_LO,
             [0.7, np.pi/2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI),
-    n_components=2,
+    n_components=2, n_live_points=2500,
     equation=(r'$P(\lambda)=\frac{w_1}{w_1+w_2}p_1e^{2i\chi_1}\left[\frac{1-e^{-\left(2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2\right)}}{2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2}\right]'
               r'+\frac{w_2}{w_1+w_2}p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
 

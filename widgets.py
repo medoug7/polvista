@@ -19,6 +19,16 @@ from polvista.measurements import RAINBOW_HUE_MAX
 
 SLIDER_STEPS = 10000  # integer resolution backing each QSlider
 
+# Max number of segments used for the Polar Q,U view's rainbow-colored
+# trajectory line (see StokesPlot.update_plot). matplotlib's LineCollection
+# allocates one fresh Path object per segment on every set_segments() call
+# (profiling: dominates redraw time, ~1000 Path() allocations/frame at the
+# default n_points=1000, ~70% of a slider-drag frame in Polar mode) -- capped
+# independently of n_points (which can run up to 3000) since a color gradient
+# doesn't need anywhere near that many steps to look smooth, unlike the
+# underlying curve's own point density.
+QU_POLAR_MAX_SEGMENTS = 500
+
 # Physical unit shown next to each slider's readout, keyed by Param.kind.
 UNITS = {'p': '%', 'X': '°', 'phi': 'rad/m²', 'dphi': 'rad/m²', 'scale': '', 'alpha': '', 'eps': '',
          'nu0': 'GHz', 'temp': 'K'}
@@ -112,6 +122,18 @@ class ModelPlot(FigureCanvas):
         # points) so the two overlays never clobber each other.
         self.meas_bands = None
         self.meas_artists = []
+        # draw_reference() removes and recreates every errorbar artist from
+        # scratch (there's no cheaper set_data()-style update for errorbar's
+        # multi-artist output) -- expensive enough to matter when it ran on
+        # every slider-driven update_plot() call regardless of whether
+        # ref_data/meas_bands themselves had changed since the last draw.
+        # Only set_reference_data/clear_reference_data/set_measurement_data/
+        # clear_measurement_data actually change what needs drawing, so they
+        # mark this dirty and update_plot() only calls draw_reference() when
+        # it's set (axis limits, which do need refreshing every frame to
+        # track a data-loaded curve, are computed straight from ref_data/
+        # meas_bands in update_plot() itself -- independent of the artists).
+        self._ref_dirty = True
 
         # Posterior-sample "spaghetti" overlay (see set_posterior_samples) --
         # a fixed pool of faint Line2D artists, created only when the
@@ -127,17 +149,21 @@ class ModelPlot(FigureCanvas):
     # how to load data
     def set_reference_data(self, w2, p, p_err, evpa, evpa_err):
         self.ref_data = (np.asarray(w2), np.asarray(p), p_err, np.asarray(evpa), evpa_err)
+        self._ref_dirty = True
 
     def clear_reference_data(self):
         self.ref_data = None
+        self._ref_dirty = True
 
     def set_measurement_data(self, bands):
         """`bands` is a list of per-band dicts (see measurements.py's
         generate_measurements), or None to clear."""
         self.meas_bands = bands
+        self._ref_dirty = True
 
     def clear_measurement_data(self):
         self.meas_bands = None
+        self._ref_dirty = True
 
     # how data is plotted
     def draw_reference(self):
@@ -242,7 +268,9 @@ class ModelPlot(FigureCanvas):
             mid = 0.5 * (x_lo + x_hi)
             x_lo, x_hi = mid - 1.0, mid + 1.0
         self.ax_x.set_ylim(x_lo, x_hi)
-        self.draw_reference()
+        if self._ref_dirty:
+            self.draw_reference()
+            self._ref_dirty = False
         self.draw_idle()
 
     def resizeEvent(self, event):
@@ -334,6 +362,12 @@ class StokesPlot(FigureCanvas):
         self.meas_bands = None
         self.meas_artists_I = []
         self.meas_artists_QU = []
+        # See ModelPlot's own _ref_dirty -- same "only rebuild the errorbar
+        # artists when ref_data/meas_bands actually changed" gating for
+        # update_plot()'s own trailing draw_reference() call. build_qu_mode
+        # (mode switches) still always redraws unconditionally -- ax_QU.clear()
+        # there already discards ref_artists_QU, so it must repopulate them.
+        self._ref_dirty = True
 
         # See ModelPlot.set_posterior_samples -- same pattern here. The
         # right-hand pool (sample_lines_Q/U for Spectra, sample_lines_QU
@@ -400,6 +434,7 @@ class StokesPlot(FigureCanvas):
             self.sample_lines_U = [self.ax_QU.plot([], [], color='orange', alpha=0.08, lw=0.6, zorder=1)[0]
                                     for _ in range(n_samples)]
         self.draw_reference()
+        self._ref_dirty = False
 
     def set_posterior_samples(self, samples, model_func):
         for ln in self.sample_lines_I:
@@ -416,17 +451,21 @@ class StokesPlot(FigureCanvas):
 
     def set_reference_data(self, nu_ghz, I, I_err, Q, Q_err, U, U_err):
         self.ref_data = (np.asarray(nu_ghz), np.asarray(I), I_err, np.asarray(Q), Q_err, np.asarray(U), U_err)
+        self._ref_dirty = True
 
     def clear_reference_data(self):
         self.ref_data = None
+        self._ref_dirty = True
 
     def set_measurement_data(self, bands):
         """`bands` is a list of per-band dicts (see measurements.py's
         generate_measurements), or None to clear."""
         self.meas_bands = bands
+        self._ref_dirty = True
 
     def clear_measurement_data(self):
         self.meas_bands = None
+        self._ref_dirty = True
 
     # draw data
     def draw_reference(self):
@@ -482,7 +521,7 @@ class StokesPlot(FigureCanvas):
             self.build_qu_mode()
 
         I = stokes_I(wl_ext, n_components, pars, nu_min=nu_min)
-        Q, U = stokes_QU(wl_ext, model_func, n_components, pars, nu_min=nu_min)
+        Q, U = stokes_QU(wl_ext, model_func, n_components, pars, nu_min=nu_min, I=I)
         nu_ghz = C / wl_ext / 1e9
 
         order = np.argsort(nu_ghz)
@@ -531,10 +570,11 @@ class StokesPlot(FigureCanvas):
             # lambda^2 axis). Descending w2 <=> ascending nu, so the grid
             # walks low nu (red) -> high nu (violet) just like band_colors().
             w2_max, w2_min = wl_ext.max() ** 2, wl_ext.min() ** 2
-            w2_grid = np.linspace(w2_max, w2_min, len(wl_ext))
+            n_qu = min(len(wl_ext), QU_POLAR_MAX_SEGMENTS)
+            w2_grid = np.linspace(w2_max, w2_min, n_qu)
             wl_qu = np.sqrt(w2_grid)
             I_qu = stokes_I(wl_qu, n_components, pars, nu_min=nu_min)
-            Q_qu, U_qu = stokes_QU(wl_qu, model_func, n_components, pars, nu_min=nu_min)
+            Q_qu, U_qu = stokes_QU(wl_qu, model_func, n_components, pars, nu_min=nu_min, I=I_qu)
             q_s, u_s = Q_qu / I_qu, U_qu / I_qu
             points = np.column_stack([q_s, u_s]).reshape(-1, 1, 2)
             segments = np.concatenate([points[:-1], points[1:]], axis=1)
@@ -557,7 +597,7 @@ class StokesPlot(FigureCanvas):
             for i, ln_QU in enumerate(self.sample_lines_QU):
                 if show_samples:
                     s_I = stokes_I(wl_qu, n_components, self.posterior_samples[i], nu_min=nu_min)
-                    s_Q, s_U = stokes_QU(wl_qu, model_func, n_components, self.posterior_samples[i], nu_min=nu_min)
+                    s_Q, s_U = stokes_QU(wl_qu, model_func, n_components, self.posterior_samples[i], nu_min=nu_min, I=s_I)
                     ln_QU.set_data(s_Q / s_I, s_U / s_I)
                 else:
                     ln_QU.set_data([], [])
@@ -664,7 +704,9 @@ class StokesPlot(FigureCanvas):
             self.ax_QU.set_xlim(xlo, xhi)
             self.ax_QU.set_ylim(-1.3 * qu_max, 1.3 * qu_max)
 
-        self.draw_reference()
+        if self._ref_dirty:
+            self.draw_reference()
+            self._ref_dirty = False
         self.draw_idle()
 
     def resizeEvent(self, event):
