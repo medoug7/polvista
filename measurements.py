@@ -209,6 +209,11 @@ MEERKAT_L = (1.21, 0.86, 4)     # L band:   856-1711 MHz
 MEERKAT_S = (2.47, 1.75, 4)     # S band:   1750-3499 MHz
 MEERKAT_ALL_BANDS = [MEERKAT_UHF, MEERKAT_L, MEERKAT_S]
 
+# LOFAR -- LBA and HBA band, https://www.aanda.org/articles/aa/full_html/2013/08/aa20873-12/aa20873-12.html
+LOFAR_LBA = (0.05, 0.08, 4)   # 10 - 90 MHz
+LOFAR_HBA = (0.18, 0.12, 4)     # 120 - 240 MHz
+LOFAR_ALL_BANDS = [LOFAR_LBA, LOFAR_HBA]
+
 # SDSS-like optical filters (g, r, i, z) -- SPARC4's own 4 simultaneous
 # channels, per its instrument papers -- using the same round-number
 # Fukugita et al. 1996 band edges as app.WAVELENGTH_PRESETS; center is
@@ -236,7 +241,14 @@ HAWC_ALL_BANDS = [HAWC_A, HAWC_C, HAWC_D, HAWC_E]
 # (40-50 GHz) overlap 40-50 GHz -- Band 1 is dropped and VLA_Q kept for
 # that stretch, per the rest of ALMA (Bands 2-10, from 67 GHz up) never
 # overlapping VLA's own top end.
-FULL_RADIO_BANDS = VLA_ALL_BANDS + [ALMA_BAND2, ALMA_BAND3, ALMA_BAND4,
+FULL_GHZ_BANDS = VLA_ALL_BANDS + [ALMA_BAND2, ALMA_BAND3, ALMA_BAND4,
+                                     ALMA_BAND5, ALMA_BAND6, ALMA_BAND7,
+                                     ALMA_BAND8, ALMA_BAND9, ALMA_BAND10]
+
+FULL_MHZ_BANDS = LOFAR_ALL_BANDS + MEERKAT_ALL_BANDS
+
+
+FULL_RADIO_BANDS = FULL_MHZ_BANDS + VLA_ALL_BANDS + [ALMA_BAND2, ALMA_BAND3, ALMA_BAND4,
                                      ALMA_BAND5, ALMA_BAND6, ALMA_BAND7,
                                      ALMA_BAND8, ALMA_BAND9, ALMA_BAND10]
 
@@ -253,8 +265,11 @@ DEFAULT_BANDS_BY_PRESET = {
     'VLA high (0.6 - 2 cm / 15 - 50 GHz)': VLA_HIGH_BANDS,
     'VLA low (2 - 30 cm / 1 - 15 GHz)': VLA_LOW_BANDS,
     'Full VLA (0.6 - 30 cm / 1 - 50 GHz)': VLA_ALL_BANDS,
+    'Full GHz (0.25mm - 30 cm / 1 - 1200 GHz)': FULL_GHZ_BANDS,
     'Full MeerKat (8.6 - 70 cm / 500 - 3500 MHz)': MEERKAT_ALL_BANDS,
-    'Full radio (0.25mm - 70 cm / 500 MHz - 1200 GHz)': FULL_RADIO_BANDS,
+    'Full LOFAR (1.25 - 30 m / 10 - 240 MHz)': LOFAR_ALL_BANDS,
+    'Full MHz (8.6 cm - 30 m / 10 - 3500 GHz)': FULL_MHZ_BANDS,
+    'Full radio (0.25mm - 30 m / 500 MHz - 1200 GHz)': FULL_RADIO_BANDS,
     'Full SPARC4 optical (400 - 1000 nm / 300 - 750 THz)': SDSS_ALL_BANDS,
     'Full HAWC+ FIR (40 - 250 um / 1.2 - 7.5 THz)': HAWC_ALL_BANDS,
 }
