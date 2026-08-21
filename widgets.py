@@ -39,6 +39,12 @@ WIDEST_UNIT = max(UNITS.values(), key=len)
 
 NUMBER_RE = re.compile(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?')
 
+# Sentinel for ModelPlot/StokesPlot's own posterior-sample redraw cache (see
+# their update_plot methods) -- distinct from any real cache key (a tuple, or
+# None when there are no samples to show) so the very first update_plot call
+# always (re)populates the sample lines rather than matching by accident.
+_SAMPLES_CACHE_UNSET = object()
+
 
 class ValueLineEdit(QLineEdit):
     """A QLineEdit that selects all its text on focus, so clicking a
@@ -86,6 +92,35 @@ def apply_fixed_margins(fig, canvas, extra_adjust=None):
     fig.subplots_adjust(left=left_px / w, right=1 - right_px / w,
                         bottom=bottom_px / h, top=1 - top_px / h,
                         **(extra_adjust or {}),)
+
+
+def _finite_bounds(arr, fallback):
+    """(min, max) of the finite entries of `arr`, or `fallback` (an
+    explicit (lo, hi) pair) if `arr` has none.
+
+    A custom model (models.build_custom_model) can divide by one of its
+    own user-defined constants -- if that constant's bounds/slider let it
+    reach 0 (or any other pathological input), the model's output goes to
+    inf/nan. ModelPlot/StokesPlot.update_plot below take a seed min/max
+    straight off such an array before widening it with reference/
+    measurement data (already real, finite numbers) to compute each axis's
+    set_xlim/set_ylim -- an unfiltered np.min/np.max would carry that
+    inf/nan straight into those, and set_xlim/set_ylim raise ValueError:
+    Axis limits cannot be NaN or Inf the moment they see it. Only the
+    initial seed needs this filter; every later min()/max() combines
+    already-finite scalars, so nothing downstream can reintroduce inf/nan.
+
+    A curve that's non-finite everywhere (e.g. the offending constant sits
+    at exactly 0) falls back to `fallback` instead -- the line itself
+    still isn't drawn (matplotlib silently skips inf/nan points), so this
+    only decides the degenerate axis range in that case, matching how the
+    existing zero-signal fallbacks (e.g. `max(p_max, 1e-6)`, the EVPA
+    panel's own <2 deg minimum span) already handle an all-zero curve."""
+    arr = np.asarray(arr)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return fallback
+    return float(finite.min()), float(finite.max())
 
 
 class ModelPlot(FigureCanvas):
@@ -145,6 +180,19 @@ class ModelPlot(FigureCanvas):
         self.posterior_model = None    # the model func these samples belong to
         self.sample_lines_p = []
         self.sample_lines_x = []
+        # The sample lines only ever depend on wl_ext and the (fixed, until
+        # the next set_posterior_samples) posterior_samples/posterior_model,
+        # never on whichever slider actually triggered this update_plot() --
+        # a parameter-slider drag redraws the main curve every tick but
+        # can't change these at all. _samples_cache_key tracks the inputs
+        # they were last computed from so update_plot() can skip redoing
+        # that work (up to N_POSTERIOR_DRAWS full model evaluations) on
+        # every such tick; _samples_version (bumped on every
+        # set_posterior_samples call) invalidates it instead of comparing
+        # posterior_samples by identity, which an old, already-replaced
+        # array could in principle alias via id() reuse.
+        self._samples_cache_key = _SAMPLES_CACHE_UNSET
+        self._samples_version = 0
 
     # how to load data
     def set_reference_data(self, w2, p, p_err, evpa, evpa_err):
@@ -201,6 +249,7 @@ class ModelPlot(FigureCanvas):
         self.sample_lines_p, self.sample_lines_x = [], []
         self.posterior_samples = samples
         self.posterior_model = model_func
+        self._samples_version += 1
         if samples is not None:
             for _ in range(len(samples)):
                 ln_p, = self.ax_p.plot([], [], color='tab:blue', alpha=0.12, lw=0.7, zorder=1)
@@ -221,14 +270,17 @@ class ModelPlot(FigureCanvas):
         # without discarding them, so they silently reappear if the user
         # switches back, rather than needing an explicit clear.
         show_samples = self.posterior_samples is not None and self.posterior_model is model_func
-        for i, (ln_p, ln_x) in enumerate(zip(self.sample_lines_p, self.sample_lines_x)):
-            if show_samples:
-                s_fit = model_func(wl_ext, self.posterior_samples[i])
-                ln_p.set_data(w2, pol(s_fit))
-                ln_x.set_data(w2, evpa(s_fit))
-            else:
-                ln_p.set_data([], [])
-                ln_x.set_data([], [])
+        samples_key = (wl_ext.tobytes(), self._samples_version, model_func) if show_samples else None
+        if samples_key != self._samples_cache_key:
+            self._samples_cache_key = samples_key
+            for i, (ln_p, ln_x) in enumerate(zip(self.sample_lines_p, self.sample_lines_x)):
+                if show_samples:
+                    s_fit = model_func(wl_ext, self.posterior_samples[i])
+                    ln_p.set_data(w2, pol(s_fit))
+                    ln_x.set_data(w2, evpa(s_fit))
+                else:
+                    ln_p.set_data([], [])
+                    ln_x.set_data([], [])
 
         xscale = 'log' if log_xscale else 'linear'
         if xscale != self.xscale:
@@ -236,8 +288,9 @@ class ModelPlot(FigureCanvas):
             self.ax_x.set_xscale(xscale)
             self.xscale = xscale
         xlo, xhi = np.min(w2) * 0.9, np.max(w2) * 1.05
-        p_max = max(np.max(p), 1e-6)
-        x_lo, x_hi = float(np.min(X)), float(np.max(X))
+        _, p_seed_max = _finite_bounds(p, fallback=(0.0, 1e-6))
+        p_max = max(p_seed_max, 1e-6)
+        x_lo, x_hi = _finite_bounds(X, fallback=(0.0, 0.0))
         # Widen the autoscale to also cover any reference data loaded via
         # the Load Data... button, so it isn't silently clipped out of view.
         if self.ref_data is not None:
@@ -381,6 +434,19 @@ class StokesPlot(FigureCanvas):
         self.sample_lines_QU = []
         self.line_Q = self.line_U = self.line_QU = None
         self.line_Q1 = self.line_U1 = self.line_Q2 = self.line_U2 = None
+        # See ModelPlot's own _samples_cache_key/_samples_version -- same
+        # "skip recomputing sample lines a parameter-slider drag can't
+        # possibly have changed" gating, split into the wl_ext-gridded
+        # sample_lines_I/Q/U (used in both modes/Spectra mode respectively)
+        # and the wl_qu-resampled sample_lines_QU (Polar mode only, see
+        # update_plot), since those two groups are evaluated on different
+        # wavelength grids. build_qu_mode always resets both -- a mode
+        # switch or a changed sample count tears down and recreates
+        # whichever pool(s) it touches, which need repopulating regardless
+        # of whether wl_ext/samples themselves changed.
+        self._samples_cache_key = _SAMPLES_CACHE_UNSET
+        self._samples_polar_cache_key = _SAMPLES_CACHE_UNSET
+        self._samples_version = 0
         self.build_qu_mode()
 
     def build_qu_mode(self):
@@ -390,6 +456,11 @@ class StokesPlot(FigureCanvas):
         once at init, on every mode-dropdown switch, and whenever the
         posterior-sample count changes (set_posterior_samples) -- all rare
         enough that a full clear()+rebuild is fine."""
+        # Freshly (re)created sample line pools always need repopulating on
+        # the next update_plot(), regardless of whether wl_ext/samples
+        # themselves changed since the last one.
+        self._samples_cache_key = _SAMPLES_CACHE_UNSET
+        self._samples_polar_cache_key = _SAMPLES_CACHE_UNSET
         self.ax_QU.clear()
         self.ax_QU.grid(True)
         # Mirror the y-axis onto the right spine (like ModelPlot.ax_x) so
@@ -442,6 +513,7 @@ class StokesPlot(FigureCanvas):
         self.sample_lines_I = []
         self.posterior_samples = samples
         self.posterior_model = model_func
+        self._samples_version += 1
         if samples is not None:
             for _ in range(len(samples)):
                 ln_I, = self.ax_I.plot([], [], color='black', alpha=0.08, lw=0.6, zorder=1)
@@ -554,12 +626,22 @@ class StokesPlot(FigureCanvas):
             self.line_I2.set_data([], [])
 
         show_samples = self.posterior_samples is not None and self.posterior_model is model_func
-        for i, ln_I in enumerate(self.sample_lines_I):
-            if show_samples:
-                s_I = stokes_I(wl_ext, n_components, self.posterior_samples[i], nu_min=nu_min)[order]
-                ln_I.set_data(nu_s, s_I)
-            else:
-                ln_I.set_data([], [])
+        # sample_lines_I (always) and sample_lines_Q/U (Spectra mode only,
+        # below) share these same inputs -- see ModelPlot's own
+        # _samples_cache_key for why this is worth skipping on a parameter-
+        # slider drag. Updated once here (rather than separately at each
+        # loop) so both stay gated by the same comparison.
+        samples_key = (wl_ext.tobytes(), n_components, nu_min, self._samples_version, model_func) \
+            if show_samples else None
+        samples_changed = samples_key != self._samples_cache_key
+        self._samples_cache_key = samples_key
+        if samples_changed:
+            for i, ln_I in enumerate(self.sample_lines_I):
+                if show_samples:
+                    s_I = stokes_I(wl_ext, n_components, self.posterior_samples[i], nu_min=nu_min)[order]
+                    ln_I.set_data(nu_s, s_I)
+                else:
+                    ln_I.set_data([], [])
 
         if self.mode == 'Polar':
             # Resample evenly in lambda^2 -- not in lambda/log-lambda like
@@ -594,13 +676,20 @@ class StokesPlot(FigureCanvas):
             span = log_w2[0] - log_w2[-1] if len(log_w2) else 0.0
             t = (log_w2[0] - log_w2) / span if span > 0 else np.zeros_like(log_w2)
             self.line_QU.set_array(t[:-1])
-            for i, ln_QU in enumerate(self.sample_lines_QU):
-                if show_samples:
-                    s_I = stokes_I(wl_qu, n_components, self.posterior_samples[i], nu_min=nu_min)
-                    s_Q, s_U = stokes_QU(wl_qu, model_func, n_components, self.posterior_samples[i], nu_min=nu_min, I=s_I)
-                    ln_QU.set_data(s_Q / s_I, s_U / s_I)
-                else:
-                    ln_QU.set_data([], [])
+            # Own cache key -- evaluated on wl_qu, not wl_ext, so it can't
+            # share samples_key/samples_changed above.
+            polar_key = (wl_qu.tobytes(), n_components, nu_min, self._samples_version, model_func) \
+                if show_samples else None
+            polar_changed = polar_key != self._samples_polar_cache_key
+            self._samples_polar_cache_key = polar_key
+            if polar_changed:
+                for i, ln_QU in enumerate(self.sample_lines_QU):
+                    if show_samples:
+                        s_I = stokes_I(wl_qu, n_components, self.posterior_samples[i], nu_min=nu_min)
+                        s_Q, s_U = stokes_QU(wl_qu, model_func, n_components, self.posterior_samples[i], nu_min=nu_min, I=s_I)
+                        ln_QU.set_data(s_Q / s_I, s_U / s_I)
+                    else:
+                        ln_QU.set_data([], [])
         else:
             self.line_Q.set_data(nu_s, Q_s)
             self.line_U.set_data(nu_s, U_s)
@@ -614,30 +703,34 @@ class StokesPlot(FigureCanvas):
                 self.line_U1.set_data([], [])
                 self.line_Q2.set_data([], [])
                 self.line_U2.set_data([], [])
-            for i, (ln_Q, ln_U) in enumerate(zip(self.sample_lines_Q, self.sample_lines_U)):
-                if show_samples:
-                    s_Q, s_U = (a[order] for a in stokes_QU(
-                        wl_ext, model_func, n_components, self.posterior_samples[i], nu_min=nu_min))
-                    ln_Q.set_data(nu_s, s_Q)
-                    ln_U.set_data(nu_s, s_U)
-                else:
-                    ln_Q.set_data([], [])
-                    ln_U.set_data([], [])
+            if samples_changed:
+                for i, (ln_Q, ln_U) in enumerate(zip(self.sample_lines_Q, self.sample_lines_U)):
+                    if show_samples:
+                        s_Q, s_U = (a[order] for a in stokes_QU(
+                            wl_ext, model_func, n_components, self.posterior_samples[i], nu_min=nu_min))
+                        ln_Q.set_data(nu_s, s_Q)
+                        ln_U.set_data(nu_s, s_U)
+                    else:
+                        ln_Q.set_data([], [])
+                        ln_U.set_data([], [])
 
         xlo, xhi = nu_s.min() * 0.9, nu_s.max() * 1.05
-        i_min = max(I_s.min(), 1e-6)
-        i_max = max(I_s.max(), 1e-6)
+        i_seed_min, i_seed_max = _finite_bounds(I_s, fallback=(1e-6, 1e-6))
+        i_min = max(i_seed_min, 1e-6)
+        i_max = max(i_seed_max, 1e-6)
         # Total-only Q/U extent -- what the Polar view's own limits are
         # based on (see below): it only ever draws the total curve, so
         # widening it to also cover the per-component curves (Spectra-only
         # artists) would make its square limits depend on lines it never
         # shows. q_min_spectra/q_max_spectra etc. are the Spectra view's
         # own (component-widened) counterpart.
-        q_min, q_max = float(Q_s.min()), float(Q_s.max())
-        u_min, u_max = float(U_s.min()), float(U_s.max())
+        q_min, q_max = _finite_bounds(Q_s, fallback=(0.0, 0.0))
+        u_min, u_max = _finite_bounds(U_s, fallback=(0.0, 0.0))
         if two_comp:
-            i_min = min(i_min, max(I1_s.min(), 1e-6), max(I2_s.min(), 1e-6))
-            i_max = max(i_max, I1_s.max(), I2_s.max())
+            i1_seed_min, i1_seed_max = _finite_bounds(I1_s, fallback=(1e-6, 1e-6))
+            i2_seed_min, i2_seed_max = _finite_bounds(I2_s, fallback=(1e-6, 1e-6))
+            i_min = min(i_min, max(i1_seed_min, 1e-6), max(i2_seed_min, 1e-6))
+            i_max = max(i_max, i1_seed_max, i2_seed_max)
         # Widen the autoscale to also cover any reference data loaded via
         # the Load Data... button, so it isn't silently clipped out of view.
         if self.ref_data is not None:
@@ -661,10 +754,14 @@ class StokesPlot(FigureCanvas):
         q_min_spectra, q_max_spectra = q_min, q_max
         u_min_spectra, u_max_spectra = u_min, u_max
         if two_comp:
-            q_min_spectra = min(q_min_spectra, Q1_s.min(), Q2_s.min())
-            q_max_spectra = max(q_max_spectra, Q1_s.max(), Q2_s.max())
-            u_min_spectra = min(u_min_spectra, U1_s.min(), U2_s.min())
-            u_max_spectra = max(u_max_spectra, U1_s.max(), U2_s.max())
+            q1_seed_min, q1_seed_max = _finite_bounds(Q1_s, fallback=(0.0, 0.0))
+            q2_seed_min, q2_seed_max = _finite_bounds(Q2_s, fallback=(0.0, 0.0))
+            u1_seed_min, u1_seed_max = _finite_bounds(U1_s, fallback=(0.0, 0.0))
+            u2_seed_min, u2_seed_max = _finite_bounds(U2_s, fallback=(0.0, 0.0))
+            q_min_spectra = min(q_min_spectra, q1_seed_min, q2_seed_min)
+            q_max_spectra = max(q_max_spectra, q1_seed_max, q2_seed_max)
+            u_min_spectra = min(u_min_spectra, u1_seed_min, u2_seed_min)
+            u_max_spectra = max(u_max_spectra, u1_seed_max, u2_seed_max)
 
         self.ax_I.set_xlim(xlo, xhi)
         self.ax_I.set_ylim(0.7 * i_min, 1.3 * i_max)
@@ -677,8 +774,8 @@ class StokesPlot(FigureCanvas):
             # error margin, matching q_min/q_max's own ref_data widening
             # above) -- the Polar view never draws the per-component
             # curves, so they don't belong in its own limits.
-            frac_q_min, frac_q_max = float(q_s.min()), float(q_s.max())
-            frac_u_min, frac_u_max = float(u_s.min()), float(u_s.max())
+            frac_q_min, frac_q_max = _finite_bounds(q_s, fallback=(0.0, 0.0))
+            frac_u_min, frac_u_max = _finite_bounds(u_s, fallback=(0.0, 0.0))
             if self.ref_data is not None:
                 ref_I, ref_Q, ref_U = self.ref_data[1], self.ref_data[3], self.ref_data[5]
                 ref_q, ref_u, _, _ = stokes_to_frac_qu(ref_I, ref_Q, ref_U)

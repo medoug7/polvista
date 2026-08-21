@@ -56,7 +56,7 @@ import json
 
 import numpy as np
 import matplotlib as mpl
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QLocale, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QSlider, QComboBox,
     QVBoxLayout, QHBoxLayout, QGroupBox, QScrollArea, QDoubleSpinBox,
@@ -67,7 +67,9 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 
 from polvista.models import (
     MODELS, MODELS_BY_NAME, C, Param, stokes_I, stokes_QU, evpa, pol,
-    set_spectral_shape, full_equation)
+    set_spectral_shape, full_equation, build_custom_model, CUSTOM_MODEL_DEFS,
+    CustomModelError)
+from polvista.custom_model_dialog import CustomModelDialog
 from polvista.fitting import (
     qu_fit, estimate_alpha, estimate_ssa_shape, estimate_shape_2comp, fit_statistics,
     multinest_fit, load_previous_run)
@@ -107,6 +109,36 @@ mpl.rcParams['font.family'] = 'STIXGeneral'
 mpl.rcParams['font.size'] = 16
 ##############################################
 
+
+# model_combo's "Custom model..." entry -- a distinct sentinel object (not a
+# real model function) so on_model_combo_changed can tell it apart from
+# MODELS_BY_NAME/MODELS' own keys and open the builder dialog instead of
+# treating it as a model to plot; see open_custom_model_dialog.
+CUSTOM_MODEL_SENTINEL = object()
+
+# A QSlider's own SLIDER_STEPS resolution means almost every pixel of a drag
+# fires a fresh valueChanged -- each wired (via request_update_plot, not
+# update_plot directly) to a full model evaluation + matplotlib redraw, which
+# for a custom model (up to a CUSTOM_Z_N_MAX-point LOS quadrature) can't
+# possibly keep up with that event rate. PLOT_THROTTLE_MS caps how often
+# request_update_plot actually redraws: the first event in a burst still
+# redraws immediately (no perceived lag for a single discrete change, e.g. a
+# spin box click), and any further events arriving before the timer elapses
+# just mark the plot dirty and get coalesced into one redraw when it fires --
+# so a fast drag can't queue up more model evaluations than the eye could
+# ever perceive anyway. ~30 Hz is comfortably smooth to the eye while leaving
+# custom models room to keep up.
+PLOT_THROTTLE_MS = 33
+
+# wl_ext's own point count (self.n_points) to use instead, only while a
+# parameter slider is actively being dragged (see on_slider_drag_started/
+# _ended) -- a custom model's own LOS quadrature cost scales with both its
+# resolved z-grid *and* the number of wavelengths it's evaluated at, so
+# capping the latter while the former is being recomputed on every throttled
+# tick keeps a drag responsive even at a high n_points setting. The drag's
+# final tick (sliderReleased) always forces one full-resolution redraw
+# regardless, so the plotted curve never settles at this reduced grid.
+DRAG_N_POINTS_CAP = 150
 
 # Log-decade ranges for the signed Faraday-depth (phi) and turbulent term (dphi)
 # sliders -- wide enough to explore the models' full behavior without
@@ -446,6 +478,14 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.posterior_model = None
         self.corner_tab = None
 
+        # See PLOT_THROTTLE_MS/request_update_plot and DRAG_N_POINTS_CAP/
+        # on_slider_drag_started for what these back.
+        self._dragging = False
+        self._plot_pending = False
+        self._plot_timer = QTimer(self)
+        self._plot_timer.setSingleShot(True)
+        self._plot_timer.timeout.connect(self._flush_update_plot)
+
         # Every QMainWindow needs one "central widget"
         # QHBoxLayout arranges its children left-to-right, 
         # so this splits the window into the left
@@ -492,7 +532,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.n_points.setValue(1000)
         # Redraw the plots any time one of these three number boxes changes.
         for w in (self.wl_min, self.wl_max, self.n_points):
-            w.valueChanged.connect(self.update_plot)
+            w.valueChanged.connect(self.request_update_plot)
         wl_row.addWidget(QLabel('min'))
         wl_row.addWidget(self.wl_min)
         wl_row.addWidget(QLabel('max'))
@@ -503,7 +543,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
 
         self.log_xscale = QCheckBox('log x-scale')
         self.log_xscale.setChecked(True)
-        self.log_xscale.stateChanged.connect(self.update_plot)
+        self.log_xscale.stateChanged.connect(self.request_update_plot)
         wl_box_layout.addWidget(self.log_xscale)
 
         left_layout.addWidget(wl_box)
@@ -514,10 +554,16 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.model_combo = QComboBox()
         for func, spec in MODELS.items():
             self.model_combo.addItem(spec.label, func)
+        # "Custom model..." always stays the last row (see
+        # open_custom_model_dialog, which inserts newly-built custom models
+        # just above it) -- picking it doesn't select a model itself, it
+        # opens the builder dialog instead (see on_model_combo_changed).
+        self.model_combo.addItem('Custom model...', CUSTOM_MODEL_SENTINEL)
+        self._last_model_index = 0
         # Qt's signal/slot mechanism: connect() wires the combo box's
         # "selection changed" signal to a method that runs whenever the
         # user picks a different model.
-        self.model_combo.currentIndexChanged.connect(self.rebuild_sliders)
+        self.model_combo.currentIndexChanged.connect(self.on_model_combo_changed)
         left_layout.addWidget(self.model_combo)
 
         # spectral weighting parameters -- more relevant for two-component models
@@ -705,6 +751,20 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.eq_scroll.setWidget(self.eq_label)
         right_layout.addWidget(self.eq_scroll)
 
+        # Shown only for a custom model (see models.build_custom_model) whose
+        # current phi(z)/wavelength-range combination outran the LOS
+        # quadrature's resolution cap -- i.e. the plotted p/EVPA/Stokes
+        # curves for it can't be trusted at these parameter values (see
+        # update_plot, which toggles this after every redraw).
+        self.custom_resolution_warning = QLabel(
+            '⚠ Faraday depth too high for the current wavelength range at this '
+            'resolution -- this curve may not be numerically accurate.')
+        self.custom_resolution_warning.setWordWrap(True)
+        self.custom_resolution_warning.setStyleSheet(
+            'background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; padding: 4px;')
+        self.custom_resolution_warning.setVisible(False)
+        right_layout.addWidget(self.custom_resolution_warning)
+
         # ModelPlot/StokesPlot are matplotlib FigureCanvas subclasses, so
         # they behave like any other QWidget; NavigationToolbar is
         # matplotlib's standard pan/zoom/save toolbar wired to that canvas.
@@ -728,7 +788,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         stokes_top_row.addWidget(QLabel('Q, U view:'))
         self.stokes_mode_combo = QComboBox()
         self.stokes_mode_combo.addItems(['Polar', 'Spectra'])
-        self.stokes_mode_combo.currentIndexChanged.connect(self.update_plot)
+        self.stokes_mode_combo.currentIndexChanged.connect(self.request_update_plot)
         stokes_top_row.addWidget(self.stokes_mode_combo)
         stokes_layout.addLayout(stokes_top_row)
 
@@ -747,6 +807,89 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.build_menu()
         self.rebuild_sliders()
 
+    def on_model_combo_changed(self, index):
+        """model_combo's own slot: opens the custom-model builder when its
+        sentinel "Custom model..." row is picked (always the last row, see
+        _build_ui) instead of treating it as a model switch; otherwise
+        this is a real model switch, so track it as the row to revert to
+        next time the sentinel is picked (see open_custom_model_dialog) and
+        rebuild the sliders as before."""
+        if self.model_combo.itemData(index) is CUSTOM_MODEL_SENTINEL:
+            self.open_custom_model_dialog(revert_index=self._last_model_index)
+            return
+        self._last_model_index = index
+        self.rebuild_sliders()
+
+    def build_custom_model_menu_action(self):
+        """Models menu's "Build Custom Model..." entry -- same dialog as
+        the dropdown's sentinel row, just with nothing to revert if the
+        user cancels (the combo box selection isn't touched by opening it)."""
+        self.open_custom_model_dialog()
+
+    def open_custom_model_dialog(self, revert_index=None):
+        """Open the "Build Custom Model" window (models.build_custom_model
+        does the actual parsing/registration). If the user completes it,
+        the new model is inserted into model_combo just above the "Custom
+        model..." sentinel row and selected. If they cancel and this was
+        opened via the dropdown's own sentinel row (`revert_index` given),
+        the combo box reverts to whatever was selected before, so the
+        sentinel row is never left showing as the "current" selection.
+
+        blockSignals wraps every combo-box mutation below: inserting a row
+        *before* the sentinel's own position shifts the sentinel one slot
+        over, and since currentIndex still numerically points at that same
+        (now-shifted) slot until setCurrentIndex actually runs, an
+        unblocked insertItem alone fires a transient currentIndexChanged
+        still pointing at the sentinel -- which on_model_combo_changed
+        would treat as "the sentinel got picked again" and reopen this same
+        dialog right back up. Blocking means rebuild_sliders has to be
+        called explicitly afterward instead (same pattern already used by
+        load_model_action, for the same reason)."""
+        dialog = CustomModelDialog(self)
+        if dialog.exec_() and dialog.model_func is not None:
+            func = dialog.model_func
+            spec = MODELS[func]
+            insert_at = self.model_combo.count() - 1  # just above the sentinel
+            self.model_combo.blockSignals(True)
+            self.model_combo.insertItem(insert_at, spec.label, func)
+            self.model_combo.setCurrentIndex(insert_at)
+            self.model_combo.blockSignals(False)
+            self._last_model_index = insert_at
+            self.rebuild_sliders()
+        elif revert_index is not None:
+            self.model_combo.blockSignals(True)
+            self.model_combo.setCurrentIndex(revert_index)
+            self.model_combo.blockSignals(False)
+            self._last_model_index = revert_index
+            self.rebuild_sliders()
+
+    def edit_custom_model_menu_action(self):
+        """Models menu's "Edit Custom Model..." entry -- only ever enabled
+        (see rebuild_sliders) while the currently selected model is a
+        custom one. Reopens the builder dialog pre-filled from its own
+        saved definition (see models.CUSTOM_MODEL_DEFS); on success, the
+        edited model *replaces* the original in place (same combo row,
+        same func.__name__ -- see CustomModelDialog's own edit_func param
+        and build_custom_model's `name`) rather than adding a second entry,
+        since build_custom_model always returns a fresh function object
+        even when reusing the same name."""
+        func = self.model_combo.currentData()
+        existing_def = CUSTOM_MODEL_DEFS.get(func)
+        if existing_def is None:
+            return
+        dialog = CustomModelDialog(self, existing_def=existing_def, edit_func=func)
+        if not (dialog.exec_() and dialog.model_func is not None):
+            return
+        new_func = dialog.model_func
+        idx = self.model_combo.findData(func)
+        if idx >= 0:
+            self.model_combo.setItemData(idx, new_func)
+            self.model_combo.setItemText(idx, MODELS[new_func].label)
+        if new_func is not func:
+            CUSTOM_MODEL_DEFS.pop(func, None)
+            MODELS.pop(func, None)
+        self.rebuild_sliders()
+
     def rebuild_sliders(self, *_):
         for sl in self.sliders:
             sl.setParent(None)
@@ -755,6 +898,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         func = self.model_combo.currentData()
         spec = MODELS[func]
         lo_bounds, hi_bounds = spec.bounds
+        self.edit_custom_model_action.setEnabled(func in CUSTOM_MODEL_DEFS)
 
         # remove the trailing stretch, re-add sliders, then put stretch back
         self.param_layout.takeAt(self.param_layout.count() - 1)
@@ -776,7 +920,9 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             self.spectral_layout.addWidget(self.shape_header_single)
         for i, param in enumerate(spec.params):
             sl = ParamSlider(param, lo_bounds[i], hi_bounds[i])
-            sl.valueChanged.connect(self.update_plot)
+            sl.valueChanged.connect(self.request_update_plot)
+            sl.slider.sliderPressed.connect(self.on_slider_drag_started)
+            sl.slider.sliderReleased.connect(self.on_slider_drag_ended)
             # self.sliders keeps the *original* spec.params order regardless of
             # which box a slider is displayed in -- update_plot() reads this
             # list positionally, matching the model function's param order.
@@ -1050,10 +1196,11 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # linspace over a wide range leaves the low end (which is where a
         # log-x plot devotes most of its width) covered by only a handful of
         # points, producing visibly faceted/jagged curves there.
+        n_points = min(self.n_points.value(), DRAG_N_POINTS_CAP) if self._dragging else self.n_points.value()
         if self.log_xscale.isChecked():
-            wl_ext = np.logspace(np.log10(wl_min_mm), np.log10(wl_max_mm), self.n_points.value()) * 1e-3
+            wl_ext = np.logspace(np.log10(wl_min_mm), np.log10(wl_max_mm), n_points) * 1e-3
         else:
-            wl_ext = np.linspace(wl_min_mm, wl_max_mm, self.n_points.value()) * 1e-3
+            wl_ext = np.linspace(wl_min_mm, wl_max_mm, n_points) * 1e-3
         return func, spec, pars, wl_ext
 
     def update_plot(self, *_):
@@ -1067,6 +1214,48 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.stokes_canvas.update_plot(wl_ext, func, spec.n_components, pars,
                                         log_xscale=log_xscale, nu_min=self.data_nu_min,
                                         mode=self.stokes_mode_combo.currentText())
+        # Both canvases above already called func(wl_ext, pars) at least
+        # once, which (for a custom model -- see models.build_custom_model)
+        # refreshes its own last_call_underresolved flag for these exact
+        # wl_ext/pars; non-custom models never set the attribute at all.
+        self.custom_resolution_warning.setVisible(
+            getattr(func, 'last_call_underresolved', False))
+
+    def request_update_plot(self, *_):
+        """Throttled entry point for update_plot -- see PLOT_THROTTLE_MS.
+        Connected wherever update_plot used to be wired directly to a
+        signal that can fire many times per second (parameter sliders,
+        wavelength-range spin boxes, log-x/Stokes-mode toggles); explicit
+        one-shot callers (Reset model, Load data, a finished fit, ...) still
+        call update_plot() directly, since those aren't bursty and want
+        their redraw immediately."""
+        if self._plot_timer.isActive():
+            self._plot_pending = True
+            return
+        self.update_plot()
+        self._plot_timer.start(PLOT_THROTTLE_MS)
+
+    def _flush_update_plot(self):
+        """PLOT_THROTTLE_MS timer callback -- redraws once more, and keeps
+        the timer running, only if a request_update_plot call actually
+        arrived (and was coalesced) during the throttle window; otherwise
+        the burst has ended and there's nothing left to flush."""
+        if self._plot_pending:
+            self._plot_pending = False
+            self.update_plot()
+            self._plot_timer.start(PLOT_THROTTLE_MS)
+
+    def on_slider_drag_started(self):
+        """See DRAG_N_POINTS_CAP -- every ParamSlider wired to it (the
+        model's own parameter sliders, the ones actually worth capping)
+        connects both this and on_slider_drag_ended to its own QSlider's
+        sliderPressed/sliderReleased."""
+        self._dragging = True
+
+    def on_slider_drag_ended(self):
+        self._dragging = False
+        self._plot_pending = False  # this call's own full-res redraw supersedes any coalesced one
+        self.update_plot()  # one final full-resolution redraw once the drag settles
 
     # ── Menu bar ───────────────────────────────────────────────────────────
     def build_menu(self):
@@ -1098,6 +1287,18 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         save_equation_action = QAction('Save Equation...', self)
         save_equation_action.triggered.connect(self.save_equation_action)
         export_menu.addAction(save_equation_action)
+
+        models_menu = menubar.addMenu('&Models')
+        build_custom_action = QAction('Build Custom Model...', self)
+        build_custom_action.triggered.connect(self.build_custom_model_menu_action)
+        models_menu.addAction(build_custom_action)
+        # Enabled only while the currently selected model is a custom one --
+        # kept in sync by rebuild_sliders (every model switch, including
+        # this action's own edit replacing the current row in place).
+        self.edit_custom_model_action = QAction('Edit Custom Model...', self)
+        self.edit_custom_model_action.setEnabled(False)
+        self.edit_custom_model_action.triggered.connect(self.edit_custom_model_menu_action)
+        models_menu.addAction(self.edit_custom_model_action)
 
         help_menu = menubar.addMenu('&Help')
         complex_pol_action = QAction('Complex polarization', self)
@@ -1165,6 +1366,12 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         the ordinary least-squares path otherwise. `self.sampling_tab`
         only exists when HAS_PYMULTINEST is True, so the short-circuit
         `and` below matters -- it's never evaluated otherwise."""
+        func, _, _, _ = self.current_state()
+        if getattr(func, 'is_custom', False):
+            QMessageBox.information(
+                self, 'Fit', "Custom models aren't supported for QU-fitting/Sampling yet -- "
+                              "only the Visualization and Measurements tabs.")
+            return
         if HAS_PYMULTINEST and self.left_tabs.currentWidget() is self.sampling_tab:
             self.run_multinest_fit()
         else:
@@ -1355,6 +1562,11 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             data['beta'] = self.beta_slider_1.value()
         if spec.n_components == 2 and shape2 == 'logparabola':
             data['beta_2'] = self.beta_slider_2.value()
+        if func in CUSTOM_MODEL_DEFS:
+            # eps(z)/phi(z)/bounds needed to rebuild+re-register this exact
+            # model in a fresh session, where func.__name__ won't already be
+            # in MODELS_BY_NAME -- see load_model_action.
+            data['custom_definition'] = CUSTOM_MODEL_DEFS[func]
         try:
             with open(path, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -1429,7 +1641,30 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         try:
             with open(path) as f:
                 data = json.load(f)
-            func = MODELS_BY_NAME[data['model']]
+            model_name = data['model']
+            if model_name not in MODELS_BY_NAME and 'custom_definition' in data:
+                # This session has never seen this custom model (see
+                # save_model_action) -- rebuild and register it under the
+                # same name it was saved with, then insert it into the
+                # dropdown just like open_custom_model_dialog does for a
+                # freshly-built one.
+                cd = data['custom_definition']
+                # j_lo/j_hi/p_lo/p_hi replaced the old single-sided z1/z2
+                # bounds -- a file saved before that change only has
+                # z1/z2, so fall back to the closest equivalent under the
+                # new scheme (z1 was always emiss's upper bound with an
+                # implicit 0 lower bound; z2 was always phi''s lower bound
+                # with an implicit 1 upper bound) rather than silently
+                # reverting to the new all-purpose (0, 1) defaults.
+                func = build_custom_model(
+                    cd['label'], cd['emiss_expr'], cd['phi_expr'],
+                    {n: tuple(v) for n, v in cd['param_specs'].items()},
+                    j_lo=cd.get('j_lo', 0.0), j_hi=cd.get('j_hi', cd.get('z1', 1.0)),
+                    p_lo=cd.get('p_lo', cd.get('z2', 0.0)), p_hi=cd.get('p_hi', 1.0),
+                    title=cd.get('title'), name=model_name)
+                insert_at = self.model_combo.count() - 1  # just above the sentinel
+                self.model_combo.insertItem(insert_at, MODELS[func].label, func)
+            func = MODELS_BY_NAME[model_name]
             params = data['parameters']
             shape1 = data.get('spectral_shape', 'powerlaw')
             shape2 = data.get('spectral_shape_2', shape1)
@@ -1439,7 +1674,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             temp_2_k = data.get('temp_2_k', temp_k)
             beta = data.get('beta')
             beta_2 = data.get('beta_2', beta)
-        except (OSError, ValueError, KeyError) as e:
+        except (OSError, ValueError, KeyError, CustomModelError) as e:
             QMessageBox.warning(self, 'Load Model', f'Could not load model file:\n{e}')
             return
 
@@ -1639,6 +1874,20 @@ def main():
     # etc.) and blocks until the window is closed, at which point it
     # returns an exit code that sys.exit() passes back to the OS.
     app = QApplication(sys.argv)
+    # Every numeric spin box in this app (wavelength range, noise levels,
+    # MultiNest efficiency/tolerance, the custom-model builder's
+    # preview-lambda, ...) -- and, via the same QDoubleValidator mechanism,
+    # its j_lo/j_hi/p_lo/p_hi bound boxes -- expects '.' as the decimal
+    # point, matching how saved model/measurement files and the expression
+    # fields already treat it -- but QDoubleSpinBox/QDoubleValidator's
+    # built-in text validation otherwise follows QLocale::system() by
+    # default, which on a system whose locale uses ',' (e.g. pt_BR)
+    # silently rejects '.' keystrokes instead of accepting them. Setting
+    # the whole application's default locale once here (any QLocale-aware
+    # widget not given its own explicit setLocale() falls back to this)
+    # fixes every one of them at once, present and future, instead of
+    # having to set it widget-by-widget at each call site.
+    QLocale.setDefault(QLocale(QLocale.C))
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())

@@ -31,7 +31,7 @@ SCREEN_DPI = 96  # Qt's nominal logical DPI for point-sized widgets/fonts
 
 
 @functools.lru_cache(maxsize=128)
-def latex_pixmap(latex, fontsize=13, facecolor=None, pad_inches=0.02, multialignment='left'):
+def latex_pixmap(latex, fontsize=13, facecolor=None, pad_inches=0.02, multialignment='left', dpi=LATEX_DPI):
     """Rasterize a mathtext string (e.g. r'$\\phi_1$') to a QPixmap, using
     matplotlib's built-in mathtext renderer (same STIX font as the plots) so
     slider/equation labels don't need a real LaTeX install or Qt-side math
@@ -41,12 +41,19 @@ def latex_pixmap(latex, fontsize=13, facecolor=None, pad_inches=0.02, multialign
     (embedded '\\n') `latex` string -- it controls how the shorter lines are
     aligned relative to the widest one (e.g. the equation card's stacked
     spectral-definition + P(lambda) lines, centered relative to each other).
+    `dpi` defaults to the module's baseline LATEX_DPI, but a caller that
+    knows it's rendering for a specific screen (e.g. a HiDPI display, where
+    LATEX_DPI/SCREEN_DPI alone under-supplies pixels) can pass a higher
+    value -- see `pixmap.setDevicePixelRatio(dpi / SCREEN_DPI)` below,
+    which is what actually makes the extra raster pixels legible rather
+    than just enlarging the on-screen image.
 
     Mathtext parsing of a complex nested expression is genuinely slow (tens
-    of ms), so this is memorized -- every (model, slider) label string is
-    static for the app's lifetime, so re-rendering it on every model switch
-    is pure waste. Safe to cache: QPixmap is copy-on-write and a cached one
-    can be handed to multiple QLabels without them affecting each other."""
+    of ms), so this is memorized -- every (model, slider, dpi) label string
+    is static for the app's lifetime, so re-rendering it on every model
+    switch is pure waste. Safe to cache: QPixmap is copy-on-write and a
+    cached one can be handed to multiple QLabels without them affecting
+    each other."""
     fig = Figure()
     if facecolor is None:
         fig.patch.set_alpha(0.0)
@@ -62,7 +69,7 @@ def latex_pixmap(latex, fontsize=13, facecolor=None, pad_inches=0.02, multialign
     fig.set_size_inches(width_in, height_in)
 
     buf = io.BytesIO()
-    savefig_kwargs = dict(format='png', dpi=LATEX_DPI, bbox_inches='tight', pad_inches=pad_inches)
+    savefig_kwargs = dict(format='png', dpi=dpi, bbox_inches='tight', pad_inches=pad_inches)
     if facecolor is None:
         savefig_kwargs['transparent'] = True
     else:
@@ -71,7 +78,7 @@ def latex_pixmap(latex, fontsize=13, facecolor=None, pad_inches=0.02, multialign
     buf.seek(0)
     pixmap = QPixmap()
     pixmap.loadFromData(buf.getvalue(), 'PNG')
-    pixmap.setDevicePixelRatio(LATEX_DPI / SCREEN_DPI)
+    pixmap.setDevicePixelRatio(dpi / SCREEN_DPI)
     return pixmap
 
 

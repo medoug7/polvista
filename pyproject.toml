@@ -15,6 +15,7 @@ dependencies = [
     "matplotlib",
     "scipy",
     "PyQt5",
+    "sympy",
 ]
 
 [project.optional-dependencies]

@@ -1,7 +1,11 @@
 """Faraday-depolarization models and their metadata.
 
 """
+import re
+from collections import OrderedDict
 import numpy as np
+import sympy
+from sympy.parsing.sympy_parser import parse_expr, standard_transformations
 from dataclasses import dataclass
 from typing import Callable
 
@@ -504,10 +508,19 @@ class ModelSpec:
 
 
 MODELS = {}
+# Model lookup by function name (e.g. 'burn', 'comp2intern'), the identifier
+# saved/loaded in "Save Model"/"Load Model" JSON files and MultiNest's own
+# polvista metadata sidecar (see app.py's save_model_action/load_model_action
+# and sampling.py's load_samples_action) -- MODELS itself is keyed by the
+# function object, which isn't serializable. Populated by register() itself
+# (below) so a custom model built at runtime (see build_custom_model) shows
+# up here too, not just the ones registered at import time.
+MODELS_BY_NAME = {}
 
 
 def register(func, **kwargs):
     MODELS[func] = ModelSpec(func=func, **kwargs)
+    MODELS_BY_NAME[func.__name__] = func
 
 
 def spectral_params():
@@ -757,20 +770,789 @@ def full_equation(spec, shape1, shape2):
     Two-component model: the w1/w2/epsilon definition on its own line
     first, then S'(nu) to the left of P(lambda) on the line below (matching
     the single-component layout, since P(lambda) itself is written in
-    terms of w1/w2 -- see each two-component model's own `equation`)."""
-    s_prime = s_prime_latex(spec.n_components, shape1, shape2)
-    body = spec.equation.strip()
-    inner = body[1:-1]  # strip the surrounding '$...$'
-    line2 = f'${s_prime}\\qquad\\quad {inner}$'
-    if spec.n_components == 1:
-        return line2
-    line1 = f'${weights_latex(shape1, shape2)}$'
-    return f'{line1}\n{line2}'
+    terms of w1/w2 -- see each two-component model's own `equation`).
 
-# Model lookup by function name (e.g. 'burn', 'comp2intern'), the identifier
-# saved/loaded in "Save Model"/"Load Model" JSON files and MultiNest's own
-# polvista metadata sidecar (see app.py's save_model_action/load_model_action
-# and sampling.py's load_samples_action) -- MODELS itself is keyed by the
-# function object, which isn't serializable.
-MODELS_BY_NAME = {func.__name__: func for func in MODELS}
+    A custom model's own `equation` (see build_custom_model) can itself
+    already be more than one line -- e.g. its own phi(z)=... definition
+    above the main P(lambda) integral -- in which case every line but the
+    last is shown as-is, unchanged, and only the *last* line combines with
+    S'(nu) (exactly like a plain single-line equation would on its own)."""
+    s_prime = s_prime_latex(spec.n_components, shape1, shape2)
+    lines = spec.equation.strip().split('\n')
+    inner = lines[-1].strip()[1:-1]  # strip that line's own surrounding '$...$'
+    main_line = f'${s_prime}\\qquad\\quad {inner}$'
+    extra_lines = lines[:-1]  # e.g. a custom model's own phi(z)=... line, if any
+    if spec.n_components == 1:
+        return '\n'.join(extra_lines + [main_line])
+    line1 = f'${weights_latex(shape1, shape2)}$'
+    return '\n'.join([line1] + extra_lines + [main_line])
+
+
+# ── Custom user-defined models ────────────────────────────────────────────────
+# Lets a user build a new single-component model at runtime straight from the
+# general Sokoloff et al. 1998 (eq. 1) / Burn 1966 line-of-sight integral
+#     P(lambda) = p_0 * e^{2i*chi_0} * integral_0^1 emiss(z) * e^{2i*phi(z)*lambda^2} dz
+# instead of picking one of the closed-form models above. emiss(z) is the
+# emissivity profile -- rendered as j_lambda(z) in the builder dialog's own
+# UI (not to be confused with the unrelated epsilon/eps already used
+# elsewhere for a two-component model's own spectral blend weight, see
+# spectral_weights/spectral_params) -- both given as plain-text math
+# expressions of the line-of-sight coordinate z (normalized to the fixed
+# domain [0,1] -- 0 = the source, 1 = the observer, i.e. z runs the way
+# light actually travels) and of whatever new named constants the user's
+# own expressions introduce.
+#
+# p_0 (fractional polarization amplitude) and chi_0 sit *outside* both
+# expressions and both integrals entirely, applied as closed-form factors on
+# the finished result -- standard params every custom model gets
+# automatically, with fixed built-in-model-matching bounds
+# (CUSTOM_P0_BOUNDS below). phi_0 is instead a Faraday-depth *scale*: it
+# multiplies phi'(z)'s own accumulated integral (see phi(z) below), so a
+# user can type a bare, unscaled shape for phi'(z) -- e.g. '1' for a
+# uniform density, or 'z' for one that grows linearly -- and set the actual
+# rad/m^2 magnitude of the rotation with phi_0's own slider, exactly the
+# same role p_0 plays for emiss(z)'s own amplitude. Neither name is typed
+# into emiss(z)/phi'(z) at all -- see RESERVED_CUSTOM_NAMES -- a typical
+# simple screen (emiss left blank, i.e. the constant 1) already has all
+# three sliders doing something without either field ever mentioning them.
+#
+# phi(z) itself -- the Faraday depth actually accumulated by a photon
+# emitted at position z, the thing that actually appears in the integral
+# above -- is *not* what the builder dialog's phi'(z) field holds. What
+# the user types there is phi'(z), an unscaled Faraday-depth *density*
+# shape (proportional to n_e*B_parallel, same role as a rotation measure per
+# unit length, just missing phi_0's own overall scale). A photon emitted at
+# z travels *forward* toward the observer (z=1), so it's only rotated by
+# material *ahead* of it on that remaining path, not by anything behind it
+# -- phi(z) is accordingly the phi_0-scaled remaining-path integral,
+#     phi(z) = phi_0 * integral_{z}^{1} phi'(z') dz'
+# built by custom_func via a cumulative trapezoid (_cumtrapz0, run forward
+# from z=0 and then subtracted from its own total to turn that prefix sum
+# into the suffix one actually needed, then scaled by phi_0) over the same
+# LOS quadrature grid used for the P(lambda) integral itself (which spans
+# the full [0,1], not just the emitting region, precisely so there's
+# something to integrate over past it -- see custom_func), not read off
+# phi'(z) directly. Because phi_0 scales a genuinely z-dependent quantity
+# rather than adding a z-independent constant (unlike chi_0), it can't be
+# factored all the way outside the outer P(lambda) integral -- it has to
+# modulate phi(z) itself, inside that integral.
+#
+# emiss(z) need not be real: 'i' parses as the imaginary unit (see
+# _SYMPY_GLOBAL_DICT), so a profile like 'p0*exp(2*i*chi_z*z)' encodes an
+# intrinsic EVPA that itself varies with position, not just an intensity
+# envelope -- phi'(z) (and so phi(z)) stays physically real regardless,
+# since phi(z) is only ever used as the angle argument of
+# exp(2i*phi(z)*lambda^2).
+#
+# The emitting and rotating regions need not span the whole [0,1] path, or
+# even overlap: emiss(z) is only ever evaluated (and integrated) over z in
+# [j_lo, j_hi] -- zero outside it -- and phi'(z) is forced to zero outside
+# [p_lo, p_hi], so phi(z) only picks up whatever of the remaining path lies
+# within that window. j_lo/j_hi/p_lo/p_hi (each in [0,1], independently set
+# via the builder dialog's own bound boxes -- default j_lo=p_lo=0,
+# j_hi=p_hi=1, i.e. the full path -- see build_custom_model) are *not*
+# free parameters of the model, just a structural choice baked in at
+# Define-time. This is what actually distinguishes internal from external
+# Faraday rotation here (see the module discussion this was built from):
+# p_lo<=j_hi puts a genuinely co-spatial (internal, differentially-
+# rotating) stretch in the middle of the emitting region, so different
+# emission depths pick up different amounts of rotation before reaching
+# the observer -- true Burn-slab depolarization; p_lo>=j_hi makes every
+# emission point's remaining path pass through the *entire* rotating
+# region (since it all lies beyond where emission stops), so phi(z)
+# collapses to one shared number: a pure external screen, switched on only
+# *after* all emission has stopped, rotating everything by the same amount
+# regardless of where within the source it originated. Both fields left
+# blank (each treated as the constant 1 -- see parse_custom_expr) at the
+# default j_lo=p_lo=0/j_hi=p_hi=1 is accordingly already a full-path
+# internal screen with a uniform emissivity, phi(z)=phi_0*(1-z) (phi_0 = 0
+# by default, i.e. no rotation at all until the user's own slider sets its
+# magnitude); push p_lo up past j_hi to turn the same phi'(z)=1 into an
+# external one instead (phi(z)=phi_0*(p_hi-p_lo), the same number for
+# every z<=j_hi).
+#
+# emiss(z)/phi'(z) can also depend on frequency/wavelength directly, not just
+# position: 'nu' (frequency, MHz) and 'lambda' (wavelength, m) are both
+# reserved symbols available in either expression, alongside z -- e.g.
+# emiss='(nu/1000)**(-0.7)' folds a spectral index straight into the
+# emissivity profile itself, on top of (or instead of) the Spectrum box's
+# own overall alpha (which still applies uniformly to the total Stokes I on
+# top of whatever P(lambda) this integral produces).
+Z_SYMBOL = sympy.Symbol('z', real=True)
+NU_SYMBOL = sympy.Symbol('nu', positive=True)      # MHz, matches spectral_weights' own convention
+LAMBDA_SYMBOL = sympy.Symbol('lambda', positive=True)  # m, matches x/wl elsewhere in this module
+
+# 'p0'/'phi0' are reserved names -- unlike a name the user introduces
+# themselves (which needs a Kind picked and bounds set in the builder
+# dialog's own table before the model can be defined), these two are
+# *standard* params every custom model gets automatically (see the module
+# comment above and custom_func below), the same way X_0/chi_0 always has --
+# so typing 'p0' or 'phi0' into either expression field is blocked (see
+# RESERVED_CUSTOM_NAMES) rather than silently creating an unrelated
+# same-named constant that shadows them.
+CUSTOM_P0_BOUNDS = (0.0, 0.7)      # matches every built-in model's own p_0 bounds
+CUSTOM_PHI0_BOUNDS = (-5.0e6, 5.0e6)  # matches every built-in model's own phi bounds
+
+# 'lambda' is a Python keyword (anonymous-function syntax) -- sympy's parser
+# tokenizes/eval()s through Python's own grammar, so the bare word 'lambda'
+# in a typed expression is a syntax error before sympy ever sees it. Rewrite
+# the standalone token (not a substring of another identifier, e.g.
+# 'lambda0' -- \b won't match inside it) to this parser-safe placeholder
+# before parsing; local_dict below still maps it straight to a genuine
+# sympy Symbol literally named 'lambda' (Symbol('lambda') is just a string
+# label -- sympy itself has no problem with it), so error messages/LaTeX
+# output downstream still show 'lambda' to the user, and the original typed
+# text (kept verbatim everywhere else, e.g. saved model files) is untouched.
+_LAMBDA_TOKEN = '__polvista_lambda__'
+_LAMBDA_TOKEN_RE = re.compile(r'\blambda\b')
+
+CUSTOM_Z_N_MIN, CUSTOM_Z_N_MAX = 200, 20000  # quadrature grid size clamp, see _custom_quad_n
+CUSTOM_Z_SAMPLES_PER_CYCLE = 16  # trapz accuracy target, see _custom_quad_n
+CUSTOM_Z_PROBE_N = 64  # coarse probe-grid size, see _custom_quad_n
+
+# app.py's own update_plot() redraws both plot tabs from the same
+# (wl_ext, pars) on every slider drag -- ModelPlot calls custom_func(wl_ext,
+# pars) directly, and StokesPlot's stokes_QU() calls it again with the exact
+# same arguments to recover Q/U from P -- and repeats that per posterior-
+# sample line (see sampling.N_POSTERIOR_DRAWS) in both tabs. None of that
+# redundancy is visible to custom_func's callers, so it's deduplicated here
+# instead: a small content-keyed cache (x's bytes + params, not object
+# identity -- wl_ext is a fresh array every redraw, so identity would never
+# hit) sized to comfortably hold one redraw's worth of distinct (x, params)
+# pairs -- main curve + every posterior sample, in both the wl_ext-gridded
+# and (Polar Stokes mode's own resampled) wl_qu-gridded calls -- without
+# evicting entries still needed later in the same redraw.
+CUSTOM_FUNC_CACHE_MAX = 128
+
+
+def _custom_quad_n(depth_probe, lam2_max):
+    """(n, underresolved): how many LOS quadrature points custom_func needs
+    for this call's wavelength range, given the accumulated Faraday depth
+    phi(z) (*not* the user-typed density phi'(z) -- see build_custom_model's
+    own module comment -- already integrated by the caller, via
+    _cumtrapz0) evaluated on a coarse probe grid
+    spanning the model's own [0, z1] (see build_custom_model), and whether
+    that need exceeds CUSTOM_Z_N_MAX (in which case `n` is clamped to it
+    and the returned integral should be treated as unreliable -- see
+    custom_func's own last_call_underresolved).
+
+    e^{2i*phi(z)*lambda^2} oscillates across [0,z1] roughly
+    ptp(phi(z))*2*lam2_max/(2*pi) times at the longest wavelength in `x`
+    (lam2_max = max(x**2)); trapz needs several samples per cycle to avoid
+    aliasing (CUSTOM_Z_SAMPLES_PER_CYCLE), clamped to
+    [CUSTOM_Z_N_MIN, CUSTOM_Z_N_MAX] so a pathologically large phi(z)/lambda
+    combination costs more time rather than an unboundedly expensive grid
+    size inside a tight likelihood loop -- at the cost of the integral
+    itself becoming unreliable past that point (flagged via `underresolved`
+    rather than silently returned as if it were still accurate).
+
+    This only tracks oscillation from the *phi(z)*lambda^2 term, using
+    phi(z)'s min-to-max spread on the probe grid -- a phi(z) that itself
+    wiggles faster than that probe can resolve (rather than just being
+    large) is a pathological case outside what any fixed-size quadrature
+    here can guarantee; keep phi'(z) itself smooth/monotonic-ish.
+
+    depth_probe can be non-finite (e.g. phi'(z) divides by a user-defined
+    constant whose bounds let it reach 0) -- np.ptp of an array containing
+    inf is itself inf or nan (inf-inf is an indeterminate form), which
+    would otherwise reach `int(np.clip(nan, ...))` below and raise
+    ValueError: cannot convert float NaN to integer. Treat that the same
+    as "needs more resolution than we'll ever give it": clamp to the max
+    grid size and flag underresolved, same as genuinely needing more
+    points than CUSTOM_Z_N_MAX -- the integral is unreliable either way,
+    and custom_func/app.py's own warning label already say so instead of
+    silently trusting it."""
+    phase_span = float(np.ptp(depth_probe)) * 2.0 * lam2_max
+    n_cycles = phase_span / (2.0 * np.pi)
+    raw_n = n_cycles * CUSTOM_Z_SAMPLES_PER_CYCLE
+    if not np.isfinite(raw_n):
+        return CUSTOM_Z_N_MAX, True
+    n = int(np.clip(raw_n, CUSTOM_Z_N_MIN, CUSTOM_Z_N_MAX))
+    return n, raw_n > CUSTOM_Z_N_MAX
+
+
+def _lambdify_zw(expr, const_names):
+    """A vectorized numpy callable fn(z, nu, lam, *consts) for `expr`
+    (already parsed, see parse_custom_expr) -- shared by build_custom_model's
+    own registered model function and preview_los_profiles's dialog-facing
+    preview. `nu`/`lam` are accepted even when `expr` doesn't actually
+    reference them (a plain function of z, or of neither) -- lambdify is
+    fine generating an unused parameter, and it lets every caller pass a
+    consistent (z, nu, lam, *consts) signature regardless of which of the
+    three a given emiss(z)/phi'(z) actually depends on."""
+    return sympy.lambdify((Z_SYMBOL, NU_SYMBOL, LAMBDA_SYMBOL, *sympy.symbols(const_names)),
+                           expr, modules='numpy')
+
+
+def _eval_zw(fn, z, nu, lam, consts):
+    """fn(z, nu, lam, *consts), cast to a complex array or scalar -- shape
+    is left to the caller's own broadcasting (z/nu/lam are already
+    consistently broadcastable column/row arrays or plain scalars; a
+    subsequent numpy op against a same-shaped or scalar result broadcasts
+    fine either way, so there's nothing to force-reshape here). The
+    dtype=complex cast guards against an expression that lambdifies to a
+    bare Python float (one referencing none of z/nu/lam at all, e.g. a
+    bare numeric literal) so every caller gets a consistent array type
+    back regardless of what the user's own expression happens to produce.
+
+    emiss(z) may now be genuinely complex -- 'i' parses as the imaginary
+    unit (see _SYMPY_GLOBAL_DICT), letting a profile like
+    'exp(2*i*chi_z*z)' encode a position-dependent intrinsic EVPA -- so
+    this no longer collapses to the real part itself. phi'(z) (the Faraday
+    depth *density* -- see build_custom_model's own module comment) is
+    still physically real: callers that evaluate phi_fn take `.real` on
+    the result themselves (see custom_func/preview_los_profiles) rather
+    than that being baked in here.
+
+    `consts` is cast to np.float64 (not left as plain Python floats) before
+    the call -- if a user-defined constant is used as a denominator
+    somewhere that doesn't otherwise involve z/nu/lambda (e.g. emiss(z) =
+    'p0/w', which is w on its own once lambdified), and its bounds let it
+    reach 0, lambdify's generated code does that division between whatever
+    types it's handed. Plain Python floats raise ZeroDivisionError there;
+    np.float64 instead follows normal IEEE-754 semantics and quietly
+    produces inf, which downstream code (the caller's own .real, the LOS
+    integral, and ultimately widgets.py's axis-limit math, see
+    _finite_bounds) is already set up to tolerate without crashing."""
+    consts = [np.float64(c) for c in consts]
+    return np.asarray(fn(z, nu, lam, *consts), dtype=complex)
+
+
+def _cumtrapz0(y, z):
+    """Cumulative trapezoidal integral of real-valued `y` along its first
+    axis against the 1-D grid `z`, with a leading 0 (same convention as
+    scipy.integrate.cumulative_trapezoid(y, z, axis=0, initial=0.0), which
+    this replaces) -- `y` can be 1-D (custom_func's own coarse probe pass)
+    or 2-D, i.e. one column per wavelength (its full-resolution pass; see
+    custom_func/preview_los_profiles, the only callers).
+
+    Unlike np.trapz -- used for the *other* LOS integral here, P(lambda)'s
+    own outer one -- this can't just return one number: phi(z) has to
+    supply a different running value at *every* z along that outer
+    integral's own integrand (see build_custom_model's own module comment
+    for why), not a single total. That running-sum is exactly what a
+    cumulative trapezoid computes, so there's no `np.trapz`-shaped
+    shortcut for it -- only a choice of how to compute it. This is a plain
+    np.cumsum over each segment's own trapezoid area instead of calling
+    scipy's own generic-axis cumulative_trapezoid, which pays for
+    dispatch/argument-checking on every call that a fixed axis-0-only
+    version here doesn't need to -- custom_func calls this twice per plot
+    redraw or fit likelihood evaluation (the probe pass, then the resolved
+    one, which can run up to CUSTOM_Z_N_MAX points), so that overhead is
+    paid often enough to be worth trimming."""
+    dz = np.diff(z)
+    segments = dz * (y[:-1] + y[1:]) * 0.5 if y.ndim == 1 else dz[:, None] * (y[:-1] + y[1:]) * 0.5
+    out = np.empty_like(y, dtype=np.result_type(y, dz))
+    out[0] = 0.0
+    np.cumsum(segments, axis=0, out=out[1:])
+    return out
+
+
+def _custom_P_raw(emiss_fn, phi_fn, consts, phi0_val, x, j_lo, j_hi, p_lo, p_hi, n):
+    """P_raw(x) = integral_0^1 emiss(z) * e^{2i*phi(z)*lambda^2} dz, with
+    phi(z) = phi0_val * phi'(z)'s own remaining-path integral (see
+    build_custom_model's own module comment) -- the LOS integral
+    custom_func actually needs, minus p0/chi0's own closed-form factors
+    (applied by the caller once this returns), evaluated on an n-point z
+    grid. Pulled out of custom_func as its own function purely to keep that
+    already-long resolution/masking logic readable -- `x` there is only
+    ever the subset of wavelengths custom_func has already determined are
+    worth resolving (see its own `resolvable` mask), at whatever quadrature
+    size `n` _custom_quad_n decided that subset needs."""
+    z = np.linspace(0.0, 1.0, n)[:, None]       # (n_grid, 1) -- full LOS
+    lam = x[None, :]                            # (1, n_lambda)
+    nu = (C / x / 1e6)[None, :]                 # (1, n_lambda) MHz
+    # emiss_zw is left complex -- j_lambda(z) may use 'i' for a
+    # position-dependent intrinsic EVPA (e.g. 'exp(2*i*chi_z*z)'), and that
+    # phase needs to survive into the integral below. phi'(z) is still
+    # forced real: it's a physical Faraday-depth density, used only (once
+    # integrated into phi(z)) as the (real) angle argument of
+    # exp(1j*phase), not itself complex.
+    emiss_zw = _eval_zw(emiss_fn, z, nu, lam, consts)
+    emiss_zw = np.where((z >= j_lo) & (z <= j_hi), emiss_zw, 0.0)
+    phi_prime_zw = _eval_zw(phi_fn, z, nu, lam, consts).real
+    phi_prime_zw = np.where((z >= p_lo) & (z <= p_hi), phi_prime_zw, 0.0)
+    # phi(z), the actual Faraday depth accumulated over the *remaining*
+    # path to the observer -- _cumtrapz0 along the z axis (axis 0)
+    # integrates each wavelength's own column independently, using the
+    # same z grid for all of them (phi'(z) can depend on nu/lambda too, so
+    # each column's integrand can differ), then total-minus-prefix turns
+    # that prefix (source-side) integral into the suffix (observer-side)
+    # one this model actually needs, and phi0_val scales that suffix
+    # integral into the actual Faraday depth (see build_custom_model's own
+    # module comment for why phi0 has to modulate phi(z) itself, inside
+    # this integral, rather than factoring out of it the way chi0 does).
+    prefix_zw = _cumtrapz0(phi_prime_zw, z[:, 0])
+    phi_zw = phi0_val * (prefix_zw[-1:, :] - prefix_zw)
+    phase = 2.0 * phi_zw * lam ** 2              # (n_grid, n_lambda) via broadcasting
+    integrand = emiss_zw * np.exp(1j * phase)
+    return np.trapz(integrand, z[:, 0], axis=0)
+
+
+def preview_los_profiles(emiss_expr, phi_expr, const_names, const_values,
+                          nu_mhz, lambda_m, j_lo, j_hi, p_lo, p_hi, n=300):
+    """(z, emiss_z, phi_prime_z, phi_z) arrays over z in [0,1] for the
+    custom-model builder dialog's own preview plot, already masked to
+    emiss(z)=0 outside [j_lo,j_hi] and phi'(z)=0 outside [p_lo,p_hi]
+    exactly like the registered model itself (see build_custom_model) --
+    `emiss_expr`/`phi_expr` already parsed (see parse_custom_expr),
+    `const_values` a plain list of numbers in the same order as
+    `const_names` (e.g. each constant's current preview value; p0/phi0
+    never appear here -- they're standard params applied as closed-form
+    scale factors, see build_custom_model, so this preview -- like
+    `emiss_z` below, always shown p0-unscaled too -- traces phi'(z)'s own
+    *unscaled* shape rather than the true physical depth, exactly the
+    magnitude phi0's own slider back in the dialog/app is for setting),
+    `nu_mhz`/`lambda_m` the single frequency/wavelength (consistent with
+    each other -- nu_mhz = C/lambda_m/1e6) to preview emiss(z)/phi'(z) at
+    if either references 'nu'/'lambda'. `emiss_z` may be complex (see
+    _eval_zw -- a profile using 'i' for a position-dependent intrinsic
+    EVPA); `phi_prime_z` (`phi_expr` evaluated pointwise -- the
+    Faraday-depth *density* the user actually types) and `phi_z` (its
+    unscaled accumulated integral -- see build_custom_model's own module
+    comment) are always real. `phi_z` is the *remaining*-path integral,
+    integral_{z}^{1} phi_prime_z' dz' (not the path already traveled): a
+    photon emitted at z travels forward toward the observer at z=1 through
+    whatever rotates ahead of it, not through what's behind it -- see
+    custom_func's own matching prefix/total-minus-prefix construction for
+    why. Not used by the registered model itself -- that's custom_func,
+    built (with its own adaptive-resolution quadrature grid, not this
+    fixed n=300 preview one, and phi0-scaled where this isn't) by
+    build_custom_model below."""
+    z = np.linspace(0.0, 1.0, n)
+    emiss_fn = _lambdify_zw(emiss_expr, const_names)
+    phi_fn = _lambdify_zw(phi_expr, const_names)
+    emiss_z = np.broadcast_to(_eval_zw(emiss_fn, z, nu_mhz, lambda_m, const_values), z.shape)
+    phi_prime_z = np.broadcast_to(_eval_zw(phi_fn, z, nu_mhz, lambda_m, const_values).real, z.shape)
+    emiss_z = np.where((z >= j_lo) & (z <= j_hi), emiss_z, 0.0)
+    phi_prime_z = np.where((z >= p_lo) & (z <= p_hi), phi_prime_z, 0.0)
+    prefix_z = _cumtrapz0(phi_prime_z, z)
+    phi_z = prefix_z[-1] - prefix_z
+    return z, emiss_z, phi_prime_z, phi_z
+
+
+# The custom-model builder dialog's "Kind" dropdown for a discovered
+# constant maps straight onto these five existing Param.kind values -- a
+# custom constant marked this way gets exactly the same slider behavior
+# (log-scale depth, log-scale dispersion, degree-display angle,
+# percent-display fraction, or a plain linear number) as a built-in
+# model's own p_0/X_0/phi/dphi param, for free, via app.ParamSlider.
+# eps/alpha/nu0/temp still aren't offered here -- a custom model always
+# gets one alpha automatically (spectral_param_single) and has no second
+# component to blend or turnover of its own.
+CUSTOM_PARAM_KINDS = ('p', 'X', 'phi', 'dphi', 'scale')
+
+# Names build_custom_model's own always-present params use (X_0, p0, phi0,
+# alpha -- see spectral_param_single) or that would collide with the
+# reserved line-of-sight coordinate; a user's emiss(z)/phi'(z) can't reuse
+# these as one of their own constants (see discover_custom_params).
+RESERVED_CUSTOM_NAMES = {'z', 'X_0', 'p0', 'phi0', 'alpha'}
+
+# Restricted eval() namespace for sympy's expression parser (see
+# parse_custom_expr) -- only these names (plus the reserved z, and whatever
+# new symbols the user's own expression introduces) are recognized;
+# '__builtins__' is explicitly emptied so a stray "__import__(...)" or
+# similar in a typed expression can't reach real Python builtins through
+# eval()'s implicit globals injection (parse_expr parses via eval() under
+# the hood -- sympy's own docs flag this as unsafe on untrusted input
+# without a locked-down namespace like this one).
+_SYMPY_ALLOWED_NAMES = ('sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2',
+                         'sinh', 'cosh', 'tanh', 'exp', 'log', 'sqrt', 'Abs',
+                         'pi', 'E', 'Heaviside', 'Piecewise', 'Min', 'Max',
+                         'erf', 'floor', 'ceiling', 'sign')
+_SYMPY_GLOBAL_DICT = {name: getattr(sympy, name) for name in _SYMPY_ALLOWED_NAMES}
+# Lowercase 'i' (not sympy's own 'I') is the imaginary unit here, matching
+# the equation card's own e^{2i*chi_0} notation -- lets emiss(z) (see the
+# module comment above) be genuinely complex, e.g. 'p0*exp(2*i*chi_z*z)'
+# for a position-dependent intrinsic EVPA, not just a real-valued profile.
+# auto_symbol (see _SYMPY_TRANSFORMATIONS below) only auto-wraps a bare
+# name into a new Symbol when it isn't already in this global_dict, so
+# putting it here (rather than leaving it to fall through) is what keeps a
+# typed 'i' from silently becoming a spurious free constant that
+# discover_custom_params would then demand bounds for.
+_SYMPY_GLOBAL_DICT['i'] = sympy.I
+# standard_transformations' auto_symbol/auto_number rewrite bare names/number
+# literals in the typed text into Symbol(...)/Integer(...)/Float(...)/
+# Rational(...) calls in the code actually eval()'d -- these have to be in
+# the namespace too, or every user-typed constant name fails to parse (not
+# just an intentionally-blocked one).
+for _n in ('Symbol', 'Integer', 'Float', 'Rational'):
+    _SYMPY_GLOBAL_DICT[_n] = getattr(sympy, _n)
+_SYMPY_GLOBAL_DICT['__builtins__'] = {}
+# Deliberately *not* adding implicit_multiplication_application on top of
+# standard_transformations: it splits any name ending in digits into
+# symbol*number (e.g. 'p0' -> Symbol('p')*0, 'phi0' -> Symbol('phi')*0)
+# instead of treating it as one identifier -- exactly the naming convention
+# physics constants here use (p0, phi0, dphi0, ...). Users just need an
+# explicit '*' for multiplication (e.g. 'p0*exp(-z)'), which is also less
+# ambiguous than implicit multiplication in general.
+_SYMPY_TRANSFORMATIONS = standard_transformations
+
+CUSTOM_MODEL_DEFS = {}  # func -> its own build_custom_model() kwargs -- see app.py save/load
+
+
+class CustomModelError(Exception):
+    """Raised for anything wrong with a user-typed custom-model definition
+    (bad syntax, a reserved name reused as a constant, missing bounds) --
+    caught by the builder dialog and shown to the user instead of
+    propagating."""
+
+
+def parse_custom_expr(text, what):
+    """Parse one user-typed math expression (`text`, e.g.
+    'exp(-((z-0.5)/w)**2)') into a sympy expression, using only the
+    restricted namespace in _SYMPY_GLOBAL_DICT plus the reserved
+    line-of-sight/frequency/wavelength symbols z/nu/lambda -- `what`
+    ('j_lambda(z)' or "phi'(z)") is just for the error message. A
+    blank/whitespace-only `text` is treated as the constant 1 (e.g.
+    leaving phi'(z) empty for a purely internal, non-rotating emitting
+    region).
+
+    Raises CustomModelError on anything that doesn't parse, including a
+    reference to a function polvista doesn't recognize. sympy's own parser
+    raises a plain NameError for that specific case -- auto_symbol
+    rewrites an unrecognized 'name(...)' call into 'Function(\"name\")(...)',
+    and 'Function' itself isn't in the restricted namespace -- which would
+    otherwise propagate uncaught past every caller here and crash the
+    whole app instead of surfacing as an on-screen warning."""
+    text = text.strip() if text else ''
+    if not text:
+        text = '1'
+    processed = _LAMBDA_TOKEN_RE.sub(_LAMBDA_TOKEN, text)
+    local_dict = {'z': Z_SYMBOL, 'nu': NU_SYMBOL, _LAMBDA_TOKEN: LAMBDA_SYMBOL}
+    try:
+        return parse_expr(processed, local_dict=local_dict, global_dict=dict(_SYMPY_GLOBAL_DICT),
+                           transformations=_SYMPY_TRANSFORMATIONS)
+    except (SyntaxError, TypeError, ValueError, AttributeError) as e:
+        raise CustomModelError(f"Couldn't parse {what} = '{text}': {e}") from e
+    except NameError as e:
+        allowed = ', '.join(sorted(_SYMPY_ALLOWED_NAMES))
+        raise CustomModelError(
+            f"Couldn't parse {what} = '{text}': uses a function polvista doesn't recognize. "
+            f"Supported functions are: {allowed}.") from e
+
+
+def discover_custom_params(emiss_expr, phi_expr):
+    """Every free symbol used by `emiss_expr` and/or `phi_expr` other than
+    the reserved z/nu/lambda -- these become the custom model's own new
+    *discovered* parameters (needing a Kind and bounds picked in the
+    builder dialog's own table), in sorted (deterministic) order. Raises
+    CustomModelError if either expression reuses a name reserved by the
+    model's own always-present params (see RESERVED_CUSTOM_NAMES -- p0/
+    phi0 included, since those are standard params applied automatically,
+    not ones either expression ever references by name; see
+    build_custom_model) as one of its own constants."""
+    symbols = (emiss_expr.free_symbols | phi_expr.free_symbols) - {Z_SYMBOL, NU_SYMBOL, LAMBDA_SYMBOL}
+    names = sorted(s.name for s in symbols)
+    bad = [n for n in names if n in RESERVED_CUSTOM_NAMES]
+    if bad:
+        raise CustomModelError(
+            f"'{bad[0]}' is a reserved name (z is the line-of-sight coordinate; "
+            "X_0/p0/phi0/alpha are already the model's own EVPA/polarization-amplitude/"
+            "Faraday-depth/spectral-index sliders, applied automatically -- p0/phi0 aren't "
+            "referenced by name in either expression) -- pick another constant name.")
+    return names
+
+
+def _slugify(label):
+    """A valid-enough Python identifier for func.__name__/MODELS_BY_NAME,
+    derived from a user-typed label -- e.g. 'My Screen!' -> 'custom_my_screen'."""
+    slug = re.sub(r'[^0-9a-zA-Z]+', '_', label.strip()).strip('_').lower()
+    if not slug or slug[0].isdigit():
+        slug = f'model_{slug}' if slug else 'model'
+    return f'custom_{slug}'
+
+
+def unique_custom_name(base):
+    """`base` (see _slugify) if it isn't already a registered model's
+    func.__name__, otherwise base with '_2', '_3', ... appended until it
+    is -- MODELS_BY_NAME is keyed by name, so two custom models can't
+    share one."""
+    if base not in MODELS_BY_NAME:
+        return base
+    i = 2
+    while f'{base}_{i}' in MODELS_BY_NAME:
+        i += 1
+    return f'{base}_{i}'
+
+
+def _custom_param_latex(name):
+    """Best-effort LaTeX for a user-typed constant name -- sympy.latex()
+    already subscripts a trailing digit run (e.g. 'phi0' -> '\\phi_{0}') for
+    any name it recognizes as a greek letter spelled out in full, and just
+    italicizes anything else."""
+    return f'${sympy.latex(sympy.Symbol(name))}$'
+
+
+def custom_model_equation_lines(emiss_expr, phi_expr, j_lo, j_hi, p_lo, p_hi):
+    """(phi_line, p_line) -- the two standalone equation-card LaTeX strings
+    for a custom model built from `emiss_expr`/`phi_expr` (already parsed,
+    see parse_custom_expr) at the given j_lo/j_hi/p_lo/p_hi: phi(z)'s own
+    integral form (its integrand is phi_expr's own text -- phi'(z), the
+    Faraday-depth density the user actually types, see
+    build_custom_model's own module comment -- with z renamed to the dummy
+    integration variable z' for display only), and P(lambda) with the
+    emissivity substituted concretely (its own form is the whole point of
+    a custom model, so it's shown explicitly rather than hidden behind a
+    placeholder symbol) but phi(z) referenced only by name -- its own
+    concrete form is given by the other line, so restating it again here
+    would be redundant.
+
+    P(lambda)'s own integral runs over [j_lo,j_hi] (emiss=0 outside it, so
+    integrating past there would add nothing); phi(z)'s own integral
+    instead runs from max(z, p_lo) up to p_hi -- a photon emitted at z is
+    only rotated by material *ahead* of it on its way out, not behind it,
+    and phi'(z) itself is 0 outside [p_lo,p_hi] anyway (see
+    build_custom_model's own masking) -- evaluated fresh at every point
+    along the outer P(lambda) integral (see custom_func's own
+    prefix/total-minus-prefix construction), not a single number, except
+    when p_lo>=j_hi (a pure external screen): then max(z,p_lo)=p_lo for
+    every emission point z<=j_hi, so every one of them integrates the
+    exact same range and phi(z) collapses to one shared total.
+
+    Used both for build_custom_model's own registered spec.equation (via
+    custom_model_equation_latex below) and by the builder dialog's own
+    side-by-side equation cards (which have no built model yet to read
+    spec.equation off of -- just the two parsed expressions and the
+    current bound-box values).
+
+    p_0 and phi_0 (see build_custom_model's own module comment) are shown
+    as closed-form factors -- p_0 multiplying the whole P(lambda) integral,
+    phi_0 multiplying phi'(z)'s own integral in the phi(z) line above --
+    matching how custom_func actually applies them, not as symbols inside
+    emiss_expr/phi_expr (which never reference them at all).
+
+    matplotlib mathtext (not a full TeX engine, see latex_stuff.py)
+    doesn't support \\displaystyle -- plain \\int renders fine, just
+    inline-sized."""
+    z_prime = sympy.Symbol("z'", real=True)
+    phi_line = (r"$\phi(z)=\phi_0 \int_{\max(z,\,%s)}^{%s} %s\,dz'$"
+                % (f'{p_lo:.3g}', f'{p_hi:.3g}', sympy.latex(phi_expr.subs(Z_SYMBOL, z_prime))))
+    p_line = (r'$P(\lambda)=p_0\,e^{\,2i\chi_0}\int_{%s}^{%s} %s\,e^{\,2i\phi(z)\lambda^2}\,dz$'
+              % (f'{j_lo:.3g}', f'{j_hi:.3g}', sympy.latex(emiss_expr)))
+    return phi_line, p_line
+
+
+def custom_model_equation_latex(emiss_expr, phi_expr, j_lo, j_hi, p_lo, p_hi):
+    """The combined two-line (phi(z) above P(lambda)) equation-card LaTeX
+    for build_custom_model's own registered spec.equation -- see
+    custom_model_equation_lines for what each line means; this just joins
+    them for callers (app.py's own main equation card) that display a
+    model's whole equation as one stacked image rather than the builder
+    dialog's own side-by-side pair."""
+    phi_line, p_line = custom_model_equation_lines(emiss_expr, phi_expr, j_lo, j_hi, p_lo, p_hi)
+    return f'{phi_line}\n{p_line}'
+
+
+def build_custom_model(label, emiss_str, phi_str, param_specs,
+                        j_lo=0.0, j_hi=1.0, p_lo=0.0, p_hi=1.0, title=None, name=None):
+    """Parse `emiss_str`/`phi_str` (plain-text emiss(z)/phi'(z) expressions
+    -- `phi_str` is the Faraday-depth *density*, not the depth itself, see
+    the module comment above), build the resulting model function, register
+    it into MODELS/MODELS_BY_NAME under a unique name, and return that
+    function.
+
+    The returned model's params are always p0 (fractional polarization
+    amplitude), X_0 (chi_0, EVPA), phi0 (the scale phi'(z)'s own integral is
+    multiplied by to get phi(z) -- see CUSTOM_P0_BOUNDS/CUSTOM_PHI0_BOUNDS
+    for their fixed bounds -- same p_0/X_0/phi order every closed-form model
+    above uses), then whatever other constants `emiss_str`/`phi_str`
+    themselves introduce, in that order. p0/phi0 need no entry in
+    `param_specs`, and are never typed into either expression at all (see
+    RESERVED_CUSTOM_NAMES) -- custom_func below applies p0 as a closed-form
+    factor multiplying the whole result, while phi0 multiplies phi'(z)'s own
+    accumulated integral before it ever reaches the phase term (see the
+    module comment above for why that can't be pulled outside the integral
+    the way p0/chi0 can).
+
+    `param_specs` is a {constant_name: (kind, lo, hi)} dict covering every
+    *other* free symbol `emiss_str`/`phi_str` introduce, i.e. excluding the
+    reserved z/nu/lambda/p0/phi0 (see discover_custom_params) -- `kind` one of
+    CUSTOM_PARAM_KINDS (picked via the builder dialog's own "Kind" dropdown;
+    see its module docstring), `lo`/`hi` already in that kind's own physical
+    units (radians for 'X', a 0-1 fraction for 'p', rad/m^2 for 'phi', as-is
+    for 'scale' -- i.e. the same units app.ParamSlider expects in
+    spec.bounds for that kind, not necessarily what the dialog displayed to
+    the user). Plain ValueError if any constant is missing or its kind
+    isn't recognized (a caller bug, not a user-input problem -- the builder
+    dialog always derives param_specs from discover_custom_params's own
+    output first, restricted to a valid Kind dropdown selection).
+
+    `j_lo`/`j_hi`/`p_lo`/`p_hi` (each in [0,1]) fix emiss(z)=0 outside
+    [j_lo,j_hi] and phi'(z)=0 outside [p_lo,p_hi] -- a structural choice
+    baked into custom_func at Define-time, not a parameter of the returned
+    model (see the module comment above for what they actually encode
+    physically). `name`, if given, is used as-is for func.__name__
+    (re-registering a model loaded from a saved 'custom_definition' block
+    under the name it already had, rather than slugifying `label` fresh
+    every time -- see app.py's load_model_action); otherwise one is
+    derived from `label` via unique_custom_name. `title` defaults to
+    `label`.
+
+    Raises CustomModelError for anything wrong with the expressions
+    themselves (bad syntax, reserved names)."""
+    emiss_expr = parse_custom_expr(emiss_str, 'j_lambda(z)')
+    phi_expr = parse_custom_expr(phi_str, "phi'(z)")
+    const_names = discover_custom_params(emiss_expr, phi_expr)
+    missing = [n for n in const_names if n not in param_specs]
+    if missing:
+        raise ValueError(f'No bounds given for: {", ".join(missing)}')
+    bad_kind = [n for n in const_names if param_specs[n][0] not in CUSTOM_PARAM_KINDS]
+    if bad_kind:
+        raise ValueError(f'Unrecognized kind for: {", ".join(bad_kind)}')
+    for bound_name, bound_val in (('j_lo', j_lo), ('j_hi', j_hi), ('p_lo', p_lo), ('p_hi', p_hi)):
+        if not (0.0 <= bound_val <= 1.0):
+            raise ValueError(f'{bound_name} must be in [0,1], got {bound_val}')
+
+    emiss_fn = _lambdify_zw(emiss_expr, const_names)
+    phi_fn = _lambdify_zw(phi_expr, const_names)
+    n_const = len(const_names)
+    # A photon emitted at position z travels *forward* (toward the
+    # observer at z=1) through whatever Faraday-rotating material lies
+    # ahead of it, so the depth it actually picks up is the phi0-scaled
+    # *remaining*-path integral, phi(z) = phi0 * integral_{z}^{1} phi'(z')
+    # dz' (phi' already masked to 0 outside [p_lo,p_hi], so this is exactly
+    # phi0 * integral_{p_lo}^{p_hi} once z<=p_lo -- i.e. a single number,
+    # the same for every emission point, exactly when the whole rotating
+    # region lies beyond the emitting one: a pure external screen,
+    # p_lo>=j_hi). That "beyond j_hi" contribution can matter even though
+    # emiss(z) is 0 there, so the quadrature grid has to span the full
+    # [0,1] LOS (not just [j_lo,j_hi]) for the phi(z) accounting to be
+    # right -- emiss_zw is masked to [j_lo,j_hi] explicitly below instead
+    # of the grid doing it implicitly by never reaching outside that range.
+    z_probe = np.linspace(0.0, 1.0, CUSTOM_Z_PROBE_N)
+
+    def custom_func(x, params):
+        """params: p0, X_0, phi0, then this model's own constants (in
+        const_names order), then the trailing spectral alpha -- see
+        build_custom_model. p0/phi0 never reach emiss_fn/phi_fn at all
+        (they're not symbols either expression can reference -- see
+        RESERVED_CUSTOM_NAMES). p0 is applied here as a closed-form factor
+        on the finished integral; phi0 instead scales phi'(z)'s own
+        accumulated integral before it enters the phase term (see the
+        module comment above). Sets custom_func.last_call_underresolved on
+        every call (see _custom_quad_n) -- app.py checks this after each
+        plot redraw to warn the user when a wavelength this call *did*
+        return a computed value for can't be trusted (see below for the
+        ones it doesn't even try).
+
+        (x, params)-keyed cache (see CUSTOM_FUNC_CACHE_MAX) -- checked/
+        filled around the actual computation below, transparently to every
+        caller."""
+        cache_key = (x.tobytes(), tuple(np.asarray(params, dtype=np.float64)))
+        cached = _cache.get(cache_key)
+        if cached is not None:
+            _cache.move_to_end(cache_key)
+            result, custom_func.last_call_underresolved = cached
+            return result
+
+        def cache_and_return(result):
+            _cache[cache_key] = (result, custom_func.last_call_underresolved)
+            _cache.move_to_end(cache_key)
+            if len(_cache) > CUSTOM_FUNC_CACHE_MAX:
+                _cache.popitem(last=False)
+            return result
+
+        p0_val = params[0]
+        chi0 = params[1]
+        phi0_val = params[2]
+        consts = params[3:3 + n_const]
+        if x.size:
+            lam_at_max = float(x[np.argmax(x ** 2)])
+            nu_at_max = C / lam_at_max / 1e6
+        else:
+            lam_at_max = nu_at_max = 0.0
+        # phi_fn is phi'(z), the unscaled Faraday-depth *density* shape the
+        # user actually typed (see build_custom_model's own module comment)
+        # -- the depth itself, phi(z) = phi0 * integral_{z}^{1} phi'(z') dz',
+        # is accumulated here via a cumulative trapezoid (run forward, then
+        # subtracted from its own total to get the remaining-path/suffix
+        # integral, then scaled by phi0_val), not read off phi_fn directly.
+        # phi0_val has to be folded in *before* this feeds the resolution
+        # estimate below: unlike the old (wrong) additive design, it now
+        # sets the actual magnitude of the phase oscillation phi(z) drives,
+        # so leaving it out here would silently under-resolve (or
+        # over-resolve) the integral for any phi0 far from +-1.
+        phi_prime_probe = np.broadcast_to(
+            _eval_zw(phi_fn, z_probe, nu_at_max, lam_at_max, consts).real, z_probe.shape)
+        phi_prime_probe = np.where((z_probe >= p_lo) & (z_probe <= p_hi), phi_prime_probe, 0.0)
+        prefix_probe = _cumtrapz0(phi_prime_probe, z_probe)
+        depth_probe = phi0_val * (prefix_probe[-1] - prefix_probe)
+        ptp_depth = float(np.ptp(depth_probe))
+
+        result = np.full(x.shape, np.nan, dtype=complex)
+        # A wavelength needing more oscillation cycles across the LOS than
+        # CUSTOM_Z_N_MAX/CUSTOM_Z_SAMPLES_PER_CYCLE can ever resolve isn't
+        # just slow -- any value computed for it would be aliased noise,
+        # already flagged unreliable by _custom_quad_n's own
+        # `underresolved` (see below). Since more oscillation cycles is
+        # exactly *why* a wavelength depolarizes here in the first place
+        # (differential rotation between emission depths, or dispersion,
+        # cancelling itself out through the LOS integral), a wavelength
+        # that can never be resolved is -- by the same physics -- already
+        # deep in that cancellation regime and effectively unpolarized.
+        # Truncating the array to those still-resolvable up front (a plain
+        # cutoff on x**2 itself, not on any oscillatory numerical estimate
+        # that could alias) is what actually keeps every call bounded by
+        # CUSTOM_Z_N_MAX regardless of how wide a wavelength range or how
+        # large a phi0 gets selected -- unlike trying to mask by a coarse
+        # numerical |P| estimate instead, which (verified while building
+        # this) can itself alias at exactly these extreme oscillation
+        # counts and wrongly let a deeply-depolarized wavelength "survive",
+        # right back to forcing everyone else's resolution up to match it.
+        if ptp_depth > 0.0:
+            lam2_afford = (CUSTOM_Z_N_MAX / CUSTOM_Z_SAMPLES_PER_CYCLE) * np.pi / ptp_depth
+            resolvable = x ** 2 <= lam2_afford
+        else:
+            resolvable = np.ones(x.shape, dtype=bool)  # phi(z) is 0 everywhere -- nothing ever oscillates
+        if not np.any(resolvable):
+            custom_func.last_call_underresolved = False
+            return cache_and_return(result)
+        x_res = x[resolvable]
+
+        n, underresolved = _custom_quad_n(depth_probe, float(np.max(x_res ** 2)))
+        custom_func.last_call_underresolved = underresolved
+
+        P_raw_res = _custom_P_raw(emiss_fn, phi_fn, consts, phi0_val, x_res,
+                                   j_lo, j_hi, p_lo, p_hi, n)
+        # p0 applied outside both integrals as a plain multiplicative
+        # amplitude, matching chi0's own e^{2i*chi0} factor -- phi0 is
+        # already folded into P_raw_res above (see _custom_P_raw), so
+        # there's no separate e^{2i*phi0*lambda^2} term left to apply here
+        # (unlike the old, additive design, where phi0 was uniform enough
+        # to factor straight out of the integral instead).
+        result[resolvable] = p0_val * P_raw_res * np.exp(2j * chi0)
+        return cache_and_return(result)
+
+    _cache = OrderedDict()  # see CUSTOM_FUNC_CACHE_MAX; one cache per custom model, not shared
+    custom_func.last_call_underresolved = False
+    custom_func.is_custom = True  # app.py's Fit!/Sampling guards key off this
+
+    func_name = name if name is not None else unique_custom_name(_slugify(label))
+    custom_func.__name__ = func_name
+    custom_func.__qualname__ = func_name
+
+    title = title or label
+    params = ([Param('p0', r'$p_0$', 'p', 'Intrinsic fractional polarization amplitude.'),
+               Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (overall constant phase).'),
+               Param('phi0', r'$\phi_0$', 'phi', "Sets phi(z)'s own overall scale: phi(z) = phi0 * integral of phi'(z).")]
+              + [Param(n, _custom_param_latex(n), param_specs[n][0], f"User-defined constant '{n}'.")
+                 for n in const_names]
+              + spectral_param_single())
+    lo = ([CUSTOM_P0_BOUNDS[0], -np.pi / 2, CUSTOM_PHI0_BOUNDS[0]]
+          + [param_specs[n][1] for n in const_names] + SPECTRAL_BOUNDS_LO_SINGLE)
+    hi = ([CUSTOM_P0_BOUNDS[1], np.pi / 2, CUSTOM_PHI0_BOUNDS[1]]
+          + [param_specs[n][2] for n in const_names] + SPECTRAL_BOUNDS_HI_SINGLE)
+    equation = custom_model_equation_latex(emiss_expr, phi_expr, j_lo, j_hi, p_lo, p_hi)
+
+    register(custom_func, label=label, title=title, params=params, bounds=(lo, hi),
+             n_components=1, n_live_points=1000, equation=equation)
+
+    CUSTOM_MODEL_DEFS[custom_func] = {
+        'label': label, 'title': title, 'emiss_expr': emiss_str, 'phi_expr': phi_str,
+        'param_specs': {n: list(param_specs[n]) for n in const_names},
+        'j_lo': j_lo, 'j_hi': j_hi, 'p_lo': p_lo, 'p_hi': p_hi,
+    }
+    return custom_func
+
 
