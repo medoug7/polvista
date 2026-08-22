@@ -1,22 +1,24 @@
-"""CustomModelDialog -- the "Build Custom Model" window (see app.py's Models
-menu action / "Custom model..." dropdown entry). Lets a user type j_lambda(z)
-(the emissivity) and phi'(z) (the Faraday-depth *density* -- see models.
+"""CustomModel -- the "Build Custom Model" window (see app.py's Models
+menu action / "Custom model..." dropdown entry). Lets a user type j_p(z)
+(the polarized emissivity envelope -- may reference the standard p0/chi0
+sliders directly, see models.build_custom_model's own module comment) and
+phi'(z) (the Faraday-depth *density*, may reference phi0 -- see models.
 build_custom_model's own module comment for why this isn't phi(z) itself)
-expressions for the general Sokoloff et al. 1998 (eq. 1) / Burn 1966
-line-of-sight integral (see models.build_custom_model), discover the new
-constants those expressions introduce, pick each one's Kind (which
-auto-sets its bounds to that kind's own usual range -- see KIND_DEFS) and a
-preview value to evaluate it at, preview j_lambda(z)/phi'(z)/phi(z) over the
-line of sight, and register the result as a new selectable model.
-j_lambda(z)'s own frequency dependence beyond whatever it references directly
-(the 'nu'/'lambda' symbols, see the intro text below) isn't set here --
-that's the main window's existing Spectrum box (Power-law/SSA/Thermal/
-Log-parabola + alpha), applied on top exactly as it is for every other
-single-component model, once the custom model is selected there."""
+expressions for the general, normalized Sokoloff et al. 1998 (eq. 1) /
+Burn 1966 line-of-sight integral (see models.build_custom_model), discover
+the new constants those expressions introduce (beyond p0/chi0/phi0), pick
+each one's Kind (which auto-sets its bounds to that kind's own usual range
+-- see KIND_DEFS) and a preview value to evaluate it at, preview
+j_p(z)/phi'(z)/phi(z) over the line of sight, and register the result
+as a new selectable model. j_p(z)'s own frequency dependence beyond
+whatever it references directly (the 'nu'/'lambda' symbols, see the intro
+text below) isn't set here -- that's the main window's existing Spectrum
+box (Power-law/SSA/Thermal/Log-parabola + alpha), applied on top exactly
+as it is for every other single-component model, once the custom model is
+selected there."""
 import functools
 import numpy as np
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QDoubleValidator
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QLabel,
     QPushButton, QComboBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
@@ -26,11 +28,26 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from polvista.models import (
-    C, build_custom_model, custom_model_equation_lines, discover_custom_params,
-    parse_custom_expr, preview_los_profiles, CustomModelError)
+    C, build_custom_model, custom_model_equation_lines, custom_preview_n, discover_custom_params,
+    parse_custom_expr, preview_los_profiles, preview_custom_bounds, CustomModelError,
+    CUSTOM_EMISS_DEFAULT, CUSTOM_PHI_DEFAULT)
 from polvista.latex_stuff import LATEX_DPI, fit_equation_pixmap, latex_pixmap, pixmap_to_img_tag
 
 DEFAULT_PREVIEW_LAMBDA_MM = 3.0  # fallback when parent has no wl_min/wl_max to derive one from
+
+# p0/chi0/phi0's own preview values -- j_p(z)/phi'(z) can now reference
+# these three standard sliders directly (see models.py's own module comment
+# above build_custom_model), but the builder dialog itself has no slider
+# for them (those only exist once a model is actually registered and
+# selected in the main window) -- so the j_p(z)/j(z)/phi'(z)/phi(z) preview
+# plot (see refresh_preview) needs *some* fixed value to evaluate them at.
+# Matches KIND_DEFS's own 'Fraction'/'Angle'/'Depth' preview_disp defaults
+# (physical units: a 0-1 fraction, radians, rad/m^2) -- the same preview
+# magnitudes p0/chi0/phi0 would get if they were ever offered as one of
+# those Kinds themselves.
+CUSTOM_P0_PREVIEW = 0.10
+CUSTOM_CHI0_PREVIEW = 0.0
+CUSTOM_PHI0_PREVIEW = 300.0
 
 # COL_* -- the constants table's own column layout, shared by every method
 # below that reads/writes a row.
@@ -54,10 +71,6 @@ KIND_DEFS = {
                    bounds_disp=(-90.0, 90.0), preview_disp=0.0),
     'Depth': dict(model_kind='phi', to_phys=lambda d: d, to_disp=lambda p: p,
                    bounds_disp=(-5.0e6, 5.0e6), preview_disp=300.0),
-    # Same log-scale slider app.ParamSlider gives a built-in model's own
-    # dphi (sigma_phi -- Faraday depth *dispersion* across a turbulent/
-    # blended screen, see models.py's burn/tribble/partial): always >= 0,
-    # unlike 'Depth', so bounds_disp has no negative side to mirror.
     'Dispersion': dict(model_kind='dphi', to_phys=lambda d: d, to_disp=lambda p: p,
                         bounds_disp=(0.0, 5.0e6), preview_disp=300.0),
     'Number': dict(model_kind='scale', to_phys=lambda d: d, to_disp=lambda p: p,
@@ -88,13 +101,13 @@ def _intro_math(latex, dpi, fontsize=13):
 
 def _intro_html(dpi):
     """Rich-text HTML for the dialog's intro QTextBrowser (see
-    CustomModelDialog.__init__) -- same wording as the plain-text version
+    CustomModel.__init__) -- same wording as the plain-text version
     this replaced, but every equation/variable name is a real
     mathtext-rendered image instead of an approximating unicode character,
     matching how ParamSlider labels the model's own parameters elsewhere in
     the app.
 
-    `dpi` (see CustomModelDialog.__init__, which derives it from the
+    `dpi` (see CustomModel.__init__, which derives it from the
     dialog's actual screen) is the same guarantee-crisp-on-any-display
     trick TexViewerDialog uses for the Help-menu tutorials (its own
     `target_math_dpi`) -- scale the render resolution to the real screen's
@@ -105,71 +118,106 @@ def _intro_html(dpi):
     # expression part (SyntaxError on Python < 3.12), so these can't just
     # be inlined as m(r'...') calls in the f-strings below.
     m = functools.partial(_intro_math, dpi=dpi)
-    equation = m(r'$P(\lambda)=p_0\,e^{\,2i\chi_0}\int_0^1 j_\lambda(z)\,'
-                 r'e^{\,2i\,\phi(z)\,\lambda^2}\,dz$', fontsize=14)
-    depth_formula = m(r"$\phi(z)=\phi_0 \int_{\max(z,\,\mathrm{lower})}^{\mathrm{upper}}\phi'(z')\,dz'$",
+    equation1 = m(r'$P(\lambda)= \frac{1}{J}\int_{-1}^{1} j_p(z)\,dz$', fontsize=18)
+    equation2 = m(r'$J=\int_{-1}^{1} j(z)\,dz$', fontsize=16)
+
+    depth_formula = m(r"$\phi(z)=\int_{\max(z, \mathrm{lower})}^{\mathrm{upper}}\phi'(z') dz'$",
                        fontsize=14)
-    z_range, z_source, z_observer = m(r'$z\in[0,1]$'), m(r'$z=0$'), m(r'$z=1$')
-    j_lambda, z = m(r'$j_\lambda(z)$'), m(r'$z$')
+
+    z_range, z_source, z_observer = m(r'$z\in[-1,1]$'), m(r'$z=-1$'), m(r'$z=1$')
+    j_p, j_plain, z = m(r'$j_p(z)$'), m(r'$j(z)$'), m(r'$z$')
+    phase_factor = m(r'$e^{2i\phi(z)\lambda^2}$')
     phi_prime = m(r"$\phi'(z)$")
     nu, lam = m(r'$\nu$'), m(r'$\lambda$')
     p0, phi0, w, chi0 = m(r'$p_0$'), m(r'$\phi_0$'), m(r'$w$'), m(r'$\chi_0$')
     i_unit = m(r'$i$')
     evpa_example = m(r'$e^{2i\chi(z)}$')
+    delta_example = m(r'$\delta(z-z_0)$')
+    gaussian_example = m(r'$\mathcal{G}(z;\,z_0,\,\sigma_z)$')
     return (
-        '<p>Define a model from the general Faraday-rotation line-of-sight integral:</p>'
-        f'<p align="center">{equation}</p>'
+        '<p>Define a model from the general, normalized Faraday-rotation line-of-sight '
+        'integral:</p>'
+        f'<p align="center">{equation1}&nbsp;&nbsp;&nbsp;&nbsp;{equation2}</p>'
         f'<p>over a normalized line of sight {z_range} running the way light travels: '
-        f'{z_source} at the source, {z_observer} at the observer. {p0} and {chi0} sit outside '
-        f'both integrals entirely, as their own always-present sliders -- never typed into either '
-        f'field below -- so a typical simple screen needs neither field to mention them at all.</p>'
-        f'<p>{j_lambda} is the emissivity profile (zero outside its own lower/upper bound, set '
-        f'below) -- real for a plain intensity profile, or complex (e.g. {evpa_example}) to give '
-        f'the source a position-dependent intrinsic EVPA.</p>'
-        f'<p>{phi_prime} is an unscaled Faraday-depth <i>density</i> shape (zero outside its own '
-        f'lower/upper bound, set below), not the depth itself -- the actual Faraday depth is its '
-        f'accumulated integral, scaled by {phi0}\'s own always-present slider, {depth_formula} -- '
-        f'so a typical screen can leave {phi_prime} as a bare shape (e.g. \'1\' or \'z\') and set '
-        f'the actual rad/m² magnitude with {phi0} instead of typing it into the field.</p>'
+        f'{z_source} at the source, {z_observer} at the observer.</p>'
+        f'<p>{j_p} is the <i>polarized</i> emissivity: typed below as its own amplitude/EVPA/'
+        f'shape (default \'p0 * exp(2 * i * chi0)\'), multiplying the always-present {phase_factor} '
+        f'phase factor shown to its right (not itself editable) -- zero outside its own '
+        f'lower/upper bound, set below. {p0} (fractional polarization amplitude) and {chi0} (EVPA) '
+        f'are, like every other constant here, their own always-present sliders -- but now typed '
+        f'directly into this field rather than applied automatically, so a screen that needs '
+        f'neither to vary with position can simply leave that default as-is. The field may be '
+        f'complex beyond just {chi0} too (e.g. {evpa_example}), giving the source its own '
+        f'position-dependent intrinsic EVPA.</p>'
+        f'<p>{j_plain} -- the plain, unpolarized emissivity implied by the same shape -- is that '
+        f'field with {p0} forced to 1 and the magnitude taken of whatever is left ({chi0}\'s own '
+        f'phase, or any other position-dependent phase the shape might carry, has magnitude 1 '
+        f'either way and so cannot survive that). {equation2} is its own integral, normalizing '
+        f'{equation1}\'s result so it depends only on {j_p}\'s own <i>shape</i>, not the arbitrary '
+        f'bounds it happens to be integrated over.</p>'
+        f'<p>{phi_prime} is a Faraday-depth <i>density</i> shape (zero outside its own lower/upper '
+        f'bound, set below), not the depth itself -- the actual Faraday depth is its accumulated '
+        f'integral, {depth_formula}. {phi0} (Faraday-depth scale) is, like {p0}/{chi0}, its own '
+        f'always-present slider -- typed directly into this field too (default \'phi0\') -- so a '
+        f'typical screen can leave {phi_prime} as \'phi0\' or scale a bare shape (e.g. \'phi0*z\') '
+        f'to set the actual rad/m² magnitude.</p>'
         f'<p>Where the two ranges overlap, different emission depths pick up '
         f'different amounts of rotation before reaching the observer -- internal, differential '
         f'Faraday rotation.</p>'
-        f'<p>Where {phi_prime}\'s own range lies entirely beyond {j_lambda}\'s, '
+        f'<p>Where {phi_prime}\'s own range lies entirely beyond {j_p}\'s, '
         f'every emission point instead sees the exact same total rotation -- a pure external '
         f'screen.</p>'
+        f'<p>Each lower/upper bound field is usually just a plain number (every default here), '
+        f'but may instead be an expression referencing a new constant (e.g. {w} again, so the '
+        f'emitting region\'s own extent tracks a width that also shapes {j_p}) -- that constant '
+        f'then gets a Kind/bounds/slider below exactly like one used directly in {j_p}/{phi_prime} '
+        f'themselves.</p>'
         f'<p>Use {z}, {nu} (frequency, MHz), {lam} (wavelength, m), {i_unit} (the imaginary '
         f'unit), and any new constant name (e.g. {w}) with explicit \'*\' for products -- those '
         f'do need a Kind and bounds picked below. Leaving either field above blank means the '
-        f'constant 1.</p>'
+        f'constant 1. delta(arg) (e.g. {delta_example}, for a thin/concentrated feature) is also '
+        f'available -- realized internally as a very narrow, fixed-width Gaussian rather than a '
+        f'literal point mass, since the latter can\'t be evaluated on any numerical grid. '
+        f'gaussian(z0, sigma_z) (e.g. {gaussian_example}) is the same idea with a width you '
+        f'choose yourself -- either a plain number, or a new constant name (with its own Kind/'
+        f'bounds, so it becomes a live slider) -- both z0 and sigma_z can be either.</p>'
     )
 
 
 def _math_field_label(latex, dpi, fontsize=13):
     """QLabel showing `latex` as a rendered mathtext image -- same
     latex_pixmap pipeline (and the same per-screen `dpi`, see
-    CustomModelDialog.__init__) as the intro text's inline math and
+    CustomModel.__init__) as the intro text's inline math and
     ParamSlider's own parameter-name labels elsewhere in the app -- used
-    for the j_lambda(z)/phi'(z) row labels below instead of plain
+    for the j_p(z)/phi'(z) row labels below instead of plain
     approximating text."""
     label = QLabel()
     label.setPixmap(latex_pixmap(latex, fontsize=fontsize, facecolor=None, dpi=dpi))
     return label
 
 
-def _bound_edit(default):
-    """A plain QLineEdit (not a QDoubleSpinBox -- no up/down buttons) for
-    one z1/z2-style integration-bound value, restricted to [0,1] at 3
-    decimal places by its QDoubleValidator. `default` is both the initial
-    text and (via _bound_value) the fallback used while the box is
-    transiently empty/invalid mid-edit."""
-    edit = QLineEdit(f'{default:.3f}')
-    edit.setValidator(QDoubleValidator(0.0, 1.0, 3, edit))
-    edit.setFixedWidth(60)
-    edit.setAlignment(Qt.AlignRight)
-    return edit
+def _bound_edit(default_text):
+    """A plain QLineEdit for one j_lo/j_hi/p_lo/p_hi integration-bound
+    field -- a free-form math expression (see parse_custom_expr), exactly
+    like emiss_edit/phi_edit, not restricted to a bare float any more. A
+    plain number (e.g. '-1', still every default here) behaves exactly as
+    it always did; an expression referencing a *new* constant (e.g.
+    '3*w') is what promotes that constant into a discovered param with its
+    own slider -- see models.discover_custom_params. `default_text` is
+    just the field's initial text."""
+    return QLineEdit(default_text)
 
 
-class CustomModelDialog(QDialog):
+def _bound_text(value):
+    """Text for a j_lo/j_hi/p_lo/p_hi bound box's own existing_def value
+    (see CustomModel.__init__) -- `value` verbatim if it's already a
+    string expression (every model built since bounds could be
+    expressions), or `f'{value:.2f}'` if it's still a bare float (a
+    'custom_definition' saved before that -- see models.CUSTOM_MODEL_DEFS)."""
+    return value if isinstance(value, str) else f'{value:.2f}'
+
+
+class CustomModel(QDialog):
     """On accept (Define/Update Model), self.model_func holds the newly
     built and registered model function (see models.build_custom_model);
     None if the dialog was cancelled. `existing_def`, if given, pre-fills
@@ -238,29 +286,46 @@ class CustomModelDialog(QDialog):
         self.label_edit = QLineEdit()
         self.label_edit.setPlaceholderText('e.g. My screen')
 
-        emiss_bound_tip = ('j_λ(z) is forced to 0 outside [lower, upper] -- the emitting region '
-                            'is confined to that range.')
+        emiss_bound_tip = ('j_p(z) is forced to 0 outside [lower, upper] -- the emitting region '
+                            'is confined to that range. Usually a plain number, but may be an '
+                            "expression (e.g. '3*w') referencing a new constant, which then gets "
+                            'its own Kind/bounds/slider below once Parsed, same as one used '
+                            'directly in j_p(z)/φ\'(z).')
         self.emiss_edit = QLineEdit()
-        self.emiss_edit.setPlaceholderText('e.g. exp(-((z-0.5)/w)**2)')
-        self.j_lo_edit = _bound_edit(0.0)
-        self.j_hi_edit = _bound_edit(1.0)
+        self.emiss_edit.setText(CUSTOM_EMISS_DEFAULT)
+        #self.emiss_edit.setPlaceholderText('e.g. p0*exp(2*i*chi0)*exp(-((z-0.5)/w)**2)')
+        self.j_lo_edit = _bound_edit('-1')
+        self.j_hi_edit = _bound_edit('1')
         for edit in (self.j_lo_edit, self.j_hi_edit):
+            edit.setFixedWidth(70)
             edit.setToolTip(emiss_bound_tip)
             edit.editingFinished.connect(self.refresh_preview)
+        # The e^{2i*phi(z)*lambda^2} phase factor is never itself part of
+        # j_p(z)'s editable text -- it's a fixed, always-present multiplier
+        # shown here purely for context (see models.py's own module comment
+        # above build_custom_model) -- only the amplitude/EVPA/shape to its
+        # left is user-editable.
+        emiss_phase_label = _math_field_label(r'$\cdot\ e^{2i\phi(z)\lambda^2}$', intro_dpi)
         emiss_row = QHBoxLayout()
         emiss_row.addWidget(self.emiss_edit, stretch=1)
+        emiss_row.addWidget(emiss_phase_label)
         emiss_row.addWidget(QLabel('for'))
         emiss_row.addWidget(self.j_lo_edit)
         emiss_row.addWidget(QLabel('≤ z ≤'))
         emiss_row.addWidget(self.j_hi_edit)
 
         phi_bound_tip = ("φ'(z) is forced to 0 outside [lower, upper], so the accumulated "
-                          'Faraday depth φ(z) only picks up rotation from within that range.')
+                          'Faraday depth φ(z) only picks up rotation from within that range. '
+                          "Usually a plain number, but may be an expression (e.g. '3*w') "
+                          'referencing a new constant, which then gets its own Kind/bounds/'
+                          'slider below once Parsed, same as one used directly in j_p(z)/φ\'(z).')
         self.phi_edit = QLineEdit()
-        self.phi_edit.setPlaceholderText('e.g. w*z')
-        self.p_lo_edit = _bound_edit(0.0)
-        self.p_hi_edit = _bound_edit(1.0)
+        self.phi_edit.setText(CUSTOM_PHI_DEFAULT)
+        self.phi_edit.setPlaceholderText('e.g. phi0*z')
+        self.p_lo_edit = _bound_edit('-1')
+        self.p_hi_edit = _bound_edit('1')
         for edit in (self.p_lo_edit, self.p_hi_edit):
+            edit.setFixedWidth(70)
             edit.setToolTip(phi_bound_tip)
             edit.editingFinished.connect(self.refresh_preview)
         phi_row = QHBoxLayout()
@@ -271,14 +336,15 @@ class CustomModelDialog(QDialog):
         phi_row.addWidget(self.p_hi_edit)
 
         form.addRow('Model name:', self.label_edit)
-        form.addRow(_math_field_label(r'$j_\lambda(z)=$', intro_dpi), emiss_row)
-        form.addRow(_math_field_label(r"$\phi'(z)=$", intro_dpi), phi_row)
+        form.addRow(_math_field_label(r'$j_p(z)\ =$', intro_dpi), emiss_row)
+        form.addRow(_math_field_label(r"$\phi'(z)\ =$", intro_dpi), phi_row)
         layout.addLayout(form)
 
         parse_row = QHBoxLayout()
         self.parse_button = QPushButton('Parse')
         self.parse_button.setToolTip(
-            "Discover the constants used in j_λ(z)/φ'(z), (re)build the table below "
+            "Discover the constants used in j_p(z)/φ'(z) and the four bound boxes (other than "
+            "the standard p0/chi0/phi0 sliders), (re)build the table below "
             '(keeping any existing row\'s Kind/bounds/preview value for a name that survives), '
             'and refresh the preview plots.')
         self.parse_button.clicked.connect(self.on_parse)
@@ -320,16 +386,16 @@ class CustomModelDialog(QDialog):
             ['Constant', 'Kind', 'Lower bound', 'Upper bound', 'Preview value'])
         self.table.horizontalHeader().setSectionResizeMode(COL_NAME, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(COL_KIND, QHeaderView.ResizeToContents)
-        self.table.setToolTip(
-            'Kind auto-fills Lower/Upper bound and Preview value with that kind\'s usual range -- '
-            'all three stay editable afterward. Preview value (only, not the bounds) is what the '
-            "j_λ(z)/φ'(z)/φ(z) plots to the right are evaluated at.")
+        #self.table.setToolTip(
+        #    'Kind auto-fills Lower/Upper bound and Preview value with that kind\'s usual range -- '
+        #    'all three stay editable afterward. Preview value (only, not the bounds) is what the '
+        #    "j_p(z)/φ'(z)/φ(z) plots to the right are evaluated at.")
         self.table.itemChanged.connect(self.on_item_changed)
         table_col.addWidget(self.table)
         content_row.addLayout(table_col, stretch=1)
 
         preview_col = QVBoxLayout()
-        preview_col.addWidget(QLabel('j_λ(z), φ\'(z)/φ(z) preview (at each constant’s Preview value):'))
+        preview_col.addWidget(QLabel('j_p(z), φ\'(z)/φ(z) preview (at each constant’s Preview value):'))
         preview_lambda_row = QHBoxLayout()
         preview_lambda_row.addWidget(QLabel('Preview λ [mm]:'))
         self.preview_lambda_spin = QDoubleSpinBox()
@@ -337,7 +403,7 @@ class CustomModelDialog(QDialog):
         self.preview_lambda_spin.setDecimals(4)
         self.preview_lambda_spin.setValue(self._default_preview_lambda_mm(parent))
         self.preview_lambda_spin.setToolTip(
-            "Wavelength j_λ(z)/phi'(z) are evaluated at for this preview, if either references "
+            "Wavelength j_p(z)/phi'(z) are evaluated at for this preview, if either references "
             "'nu' or 'lambda' -- irrelevant otherwise.")
         self.preview_lambda_spin.valueChanged.connect(self.refresh_preview)
         preview_lambda_row.addWidget(self.preview_lambda_spin)
@@ -376,26 +442,32 @@ class CustomModelDialog(QDialog):
             self.label_edit.setText(existing_def.get('label', ''))
             self.emiss_edit.setText(existing_def.get('emiss_expr', ''))
             self.phi_edit.setText(existing_def.get('phi_expr', ''))
-            # Parse first (populates the constants table to match j_λ(z)/
-            # phi''s own text) *then* set the bound boxes -- QLineEdit's
-            # setText() (unlike a spinbox's setValue()) doesn't itself fire
-            # editingFinished, so nothing below re-runs the preview until
-            # the explicit refresh_preview() at the end of this block; that
-            # still needs the table already populated with every constant
-            # j_λ(z)/phi'(z) actually reference, or it can't even build the
-            # preview's lambdified callables.
-            self.on_parse()
             # j_lo/j_hi/p_lo/p_hi replaced the old single-sided z1/z2
             # bounds -- fall back to the closest equivalent (z1 was always
             # emiss's upper bound with an implicit 0 lower bound; z2 was
             # always phi''s lower bound with an implicit 1 upper bound) for
             # a definition saved before that change, rather than silently
             # reverting a truncated model to the new all-purpose (0, 1)
-            # defaults.
-            self.j_lo_edit.setText(f"{existing_def.get('j_lo', 0.0):.3f}")
-            self.j_hi_edit.setText(f"{existing_def.get('j_hi', existing_def.get('z1', 1.0)):.3f}")
-            self.p_lo_edit.setText(f"{existing_def.get('p_lo', existing_def.get('z2', 0.0)):.3f}")
-            self.p_hi_edit.setText(f"{existing_def.get('p_hi', 1.0):.3f}")
+            # defaults. _bound_text handles either a fresh string
+            # expression or a legacy bare float the same way a saved file
+            # from before bounds could be expressions would still have.
+            self.j_lo_edit.setText(_bound_text(existing_def.get('j_lo', -1.0)))
+            self.j_hi_edit.setText(_bound_text(existing_def.get('j_hi', existing_def.get('z1', 1.0))))
+            self.p_lo_edit.setText(_bound_text(existing_def.get('p_lo', existing_def.get('z2', -1.0))))
+            self.p_hi_edit.setText(_bound_text(existing_def.get('p_hi', 1.0)))
+            # Parse *after* every field (including the four bound boxes
+            # above) is set, not before -- on_parse now has to discover
+            # constants out of the bound expressions too (see
+            # models.discover_custom_params), so it needs their saved text
+            # in place first, not still showing the fresh-dialog default.
+            # QLineEdit's setText() (unlike a spinbox's setValue()) doesn't
+            # itself fire editingFinished, so nothing above re-runs the
+            # preview until the explicit refresh_preview() at the end of
+            # this block; that still needs the table already populated
+            # with every constant j_p(z)/phi'(z)/the four bounds actually
+            # reference, or it can't even build the preview's lambdified
+            # callables.
+            self.on_parse()
             specs = existing_def.get('param_specs', {})
             for row in range(self.table.rowCount()):
                 name = self.table.item(row, COL_NAME).text()
@@ -428,7 +500,7 @@ class CustomModelDialog(QDialog):
     @staticmethod
     def _default_preview_lambda_mm(parent):
         """The geometric mean of the main window's own currently-plotted
-        wavelength range [mm] (a physically relevant default if j_λ(z)/
+        wavelength range [mm] (a physically relevant default if j_p(z)/
         phi'(z) reference 'nu'/'lambda' at all), or DEFAULT_PREVIEW_LAMBDA_MM
         if `parent` isn't a MainWindow with that range available (e.g. a
         standalone test)."""
@@ -437,21 +509,15 @@ class CustomModelDialog(QDialog):
         except AttributeError:
             return DEFAULT_PREVIEW_LAMBDA_MM
 
-    @staticmethod
-    def _bound_value(edit, fallback):
-        """float(edit.text()), or `fallback` if the box is transiently
-        empty/invalid mid-edit (its QDoubleValidator allows an
-        'Intermediate' state, e.g. an empty string, while the user is
-        still typing)."""
-        try:
-            return float(edit.text())
-        except ValueError:
-            return fallback
-
-    def _bounds(self):
-        """(j_lo, j_hi, p_lo, p_hi) parsed from the four bound boxes."""
-        return (self._bound_value(self.j_lo_edit, 0.0), self._bound_value(self.j_hi_edit, 1.0),
-                self._bound_value(self.p_lo_edit, 0.0), self._bound_value(self.p_hi_edit, 1.0))
+    def _bound_exprs(self):
+        """(j_lo_expr, j_hi_expr, p_lo_expr, p_hi_expr) parsed (see
+        models.parse_custom_expr) from the four bound boxes -- may raise
+        CustomModelError, exactly like parsing emiss_edit/phi_edit's own
+        text, since a bound box is now just as free-form."""
+        return (parse_custom_expr(self.j_lo_edit.text(), 'j_lo'),
+                parse_custom_expr(self.j_hi_edit.text(), 'j_hi'),
+                parse_custom_expr(self.p_lo_edit.text(), 'p_lo'),
+                parse_custom_expr(self.p_hi_edit.text(), 'p_hi'))
 
     # Fixed PIXEL margins for the stacked emiss/phi preview axes (see
     # apply_fixed_margins in widgets.py for the same left/right/bottom/top
@@ -460,7 +526,7 @@ class CustomModelDialog(QDialog):
     # tight_layout() recomputes every spacing itself, including hspace,
     # so anything it's given would just get overridden back to whatever
     # it thinks the tick/label geometry needs).
-    PREVIEW_MARGINS_PX = dict(left=65, right=15, bottom=65, top=10)
+    PREVIEW_MARGINS_PX = dict(left=85, right=15, bottom=65, top=10)
 
     def _apply_preview_margins(self):
         """subplots_adjust the two stacked preview axes to PREVIEW_MARGINS_PX
@@ -483,12 +549,12 @@ class CustomModelDialog(QDialog):
                                   bottom=bottom_px / h, top=1 - top_px / h, hspace=0.0)
 
     def _style_preview_axes(self):
-        self.ax_emiss.set_ylabel(r'$j_\lambda(z)$')
+        self.ax_emiss.set_ylabel(r'$j_p(z)$')
         self.ax_phi.set_ylabel(r"$\phi(z),\ \phi'(z)$")
-        self.ax_phi.set_xlabel('z  (0 = source  →  1 = observer)', fontsize=14)
-        self.ax_emiss.set_xlim(0.0, 1.0)
+        self.ax_phi.set_xlabel('z  (-1 = source (far-side)  →  1 = observer)', fontsize=14)
+        self.ax_emiss.set_xlim(-1.0, 1.0)
         self.ax_emiss.set_ylim(0.0,)
-        self.ax_phi.set_xlim(0.0, 1.0)
+        self.ax_phi.set_xlim(-1.0, 1.0)
         # sharex=True already keeps the two x-axes in sync -- hide the top
         # panel's own tick labels so hspace=0 (see _apply_preview_margins)
         # doesn't jam them into the gap against ax_phi's plot area.
@@ -499,10 +565,18 @@ class CustomModelDialog(QDialog):
     def refit_dialog_equation(self, emiss_expr, phi_expr):
         """Re-render the two live equation previews (see models.
         custom_model_equation_lines) to fit each one's own panel -- called
-        from refresh_preview (whenever j_λ(z)/φ'(z)/the bound boxes
+        from refresh_preview (whenever j_p(z)/φ'(z)/the bound boxes
         change) and from resizeEvent (whenever the dialog itself is
-        resized), matching app.py's own MainWindow.refit_equation."""
-        phi_line, p_line = custom_model_equation_lines(emiss_expr, phi_expr, *self._bounds())
+        resized), matching app.py's own MainWindow.refit_equation. The
+        bound expressions render exactly as typed (a bare number as that
+        number, e.g. '3*w' as that fraction) -- see
+        custom_model_equation_lines."""
+        try:
+            j_lo_expr, j_hi_expr, p_lo_expr, p_hi_expr = self._bound_exprs()
+        except CustomModelError:
+            return
+        phi_line, p_line = custom_model_equation_lines(
+            emiss_expr, phi_expr, j_lo_expr, j_hi_expr, p_lo_expr, p_hi_expr)
         for eq_label, eq in ((self.phi_eq_label, phi_line), (self.p_eq_label, p_line)):
             max_w = max(eq_label.width() - 20, 50)
             max_h = max(eq_label.height() - 20, 20)
@@ -518,7 +592,7 @@ class CustomModelDialog(QDialog):
         actually gave them."""
         super().resizeEvent(event)
         try:
-            emiss_expr = parse_custom_expr(self.emiss_edit.text(), 'j_lambda(z)')
+            emiss_expr = parse_custom_expr(self.emiss_edit.text(), 'j_p(z)')
             phi_expr = parse_custom_expr(self.phi_edit.text(), "phi'(z)")
         except CustomModelError:
             pass
@@ -557,15 +631,19 @@ class CustomModelDialog(QDialog):
         self.table.setItem(row, COL_PREVIEW, QTableWidgetItem(preview_text))
 
     def on_parse(self):
-        """Parse both expressions, (re)populate the constants table -- rows
-        for names that survive re-parsing keep their existing Kind/bounds/
-        preview value, new names start at Kind=Number -- and refresh the
-        preview plot. The Define Model button only unlocks once this
-        succeeds at least once."""
+        """Parse j_p(z)/φ'(z) and the four bound boxes, (re)populate the
+        constants table -- rows for names that survive re-parsing keep
+        their existing Kind/bounds/preview value, new names start at
+        Kind=Number -- and refresh the preview plot. A constant used only
+        inside a bound expression (e.g. j_hi='3*w') shows up here exactly
+        like one used directly in j_p(z)/φ'(z) -- see
+        models.discover_custom_params. The Define Model button only
+        unlocks once this succeeds at least once."""
         try:
-            emiss_expr = parse_custom_expr(self.emiss_edit.text(), 'j_lambda(z)')
+            emiss_expr = parse_custom_expr(self.emiss_edit.text(), 'j_p(z)')
             phi_expr = parse_custom_expr(self.phi_edit.text(), "phi'(z)")
-            names = discover_custom_params(emiss_expr, phi_expr)
+            j_lo_expr, j_hi_expr, p_lo_expr, p_hi_expr = self._bound_exprs()
+            names = discover_custom_params(emiss_expr, phi_expr, j_lo_expr, j_hi_expr, p_lo_expr, p_hi_expr)
         except CustomModelError as e:
             QMessageBox.warning(self, 'Build Custom Model', str(e))
             self.define_button.setEnabled(False)
@@ -627,21 +705,21 @@ class CustomModelDialog(QDialog):
         return specs
 
     def refresh_preview(self):
-        """Redraw j_λ(z) and phi'(z)/phi(z) over z in [0,1] using each
+        """Redraw j_p(z) and phi'(z)/phi(z) over z in [-1,1] using each
         row's own Preview value (converted from that row's display units
         to the physical units the model itself would see) -- called after
         on_parse, whenever a Kind dropdown changes, and whenever a Preview
         value cell is edited (see on_item_changed)."""
         try:
-            emiss_expr = parse_custom_expr(self.emiss_edit.text(), 'j_lambda(z)')
+            emiss_expr = parse_custom_expr(self.emiss_edit.text(), 'j_p(z)')
             phi_expr = parse_custom_expr(self.phi_edit.text(), "phi'(z)")
+            j_lo_expr, j_hi_expr, p_lo_expr, p_hi_expr = self._bound_exprs()
         except CustomModelError:
             return
-        # The equation cards only need the parsed expressions and the
-        # bound boxes -- no numeric constant values -- so refresh them now,
-        # before any of the numeric-preview logic below that can still
-        # legitimately fail (e.g. a Preview value not yet filled in for a
-        # brand new row).
+        # The equation cards only need the parsed expressions -- no numeric
+        # constant values -- so refresh them now, before any of the
+        # numeric-preview logic below that can still legitimately fail
+        # (e.g. a Preview value not yet filled in for a brand new row).
         self.refit_dialog_equation(emiss_expr, phi_expr)
         names, values = [], []
         try:
@@ -656,34 +734,56 @@ class CustomModelDialog(QDialog):
         lambda_m = self.preview_lambda_spin.value() * 1e-3
         nu_mhz = C / lambda_m / 1e6
         try:
-            # The table can be out of sync with j_λ(z)/phi''s own current
-            # text (e.g. a bound box nudged, or Preview value edited,
-            # before ever clicking Parse on freshly-typed text) --
-            # `names` may then be missing a constant the expression
-            # actually references, which only surfaces once sympy's
-            # lambdified callable is actually called and hits an
-            # undefined name.
-            z, emiss_z, phi_prime_z, phi_z = preview_los_profiles(
-                emiss_expr, phi_expr, names, values, nu_mhz, lambda_m, *self._bounds())
+            # The table can be out of sync with j_p(z)/phi''s (or a bound
+            # box's) own current text (e.g. a bound box nudged, or Preview
+            # value edited, before ever clicking Parse on freshly-typed
+            # text) -- `names` may then be missing a constant an
+            # expression actually references, which only surfaces once
+            # sympy's lambdified callable is actually called and hits an
+            # undefined name. p0/chi0/phi0 -- fixed preview values, see
+            # CUSTOM_P0_PREVIEW et al. -- aren't in `names`/`values` at all:
+            # they're the model's own standard sliders, not discovered
+            # constants, but j_p(z)/phi'(z)/the four bounds can still
+            # reference them (see models.py's own module comment above
+            # build_custom_model).
+            #
+            # preview_los_profiles's own default n=300 is nowhere near
+            # enough to make a delta(...)/gaussian(...)'s own narrow spike
+            # visible (or even numerically present) -- bump it the same way
+            # build_custom_model's own custom_func does whenever either
+            # field uses one (see custom_preview_n).
+            j_lo, j_hi, p_lo, p_hi = preview_custom_bounds(
+                j_lo_expr, j_hi_expr, p_lo_expr, p_hi_expr, names, values,
+                CUSTOM_P0_PREVIEW, CUSTOM_CHI0_PREVIEW, CUSTOM_PHI0_PREVIEW)
+            preview_n = custom_preview_n(emiss_expr, phi_expr, names, values,
+                                          CUSTOM_P0_PREVIEW, CUSTOM_CHI0_PREVIEW, CUSTOM_PHI0_PREVIEW)
+            z, emiss_p_z, phi_prime_z, phi_z = preview_los_profiles(
+                emiss_expr, phi_expr, names, values,
+                CUSTOM_P0_PREVIEW, CUSTOM_CHI0_PREVIEW, CUSTOM_PHI0_PREVIEW,
+                nu_mhz, lambda_m, j_lo, j_hi, p_lo, p_hi, n=preview_n)
         except (NameError, TypeError, ValueError):
             return
         self.ax_emiss.clear()
         self.ax_phi.clear()
-        # j_lambda(z) may now be complex (a profile using 'i' for a
+        # j_p(z) may now be complex (a profile using 'i' for a
         # position-dependent intrinsic EVPA, e.g. 'exp(2*i*chi_z*z)') --
         # .real/.imag are safe on a plain-real array too (imag is then all
         # zeros), so only draw the second line when there's an actual
         # imaginary part to show, keeping every existing real-only model's
-        # preview pixel-identical to before this.
-        has_imag = np.any(np.abs(emiss_z.imag) > 1e-12 * max(1.0, np.max(np.abs(emiss_z))))
-        self.ax_emiss.plot(z, emiss_z.real, color='limegreen', label='Re' if has_imag else None)
+        # preview pixel-identical to before this. j(z), the denominator's
+        # own unpolarized shape, isn't plotted here at all: it only ever
+        # collapses to one number, J (see the equation cards above), so a
+        # per-z preview of it wouldn't show anything P(lambda)'s own shape
+        # actually depends on -- only its overall normalization.
+        has_imag = np.any(np.abs(emiss_p_z.imag) > 1e-12 * max(1.0, np.max(np.abs(emiss_p_z))))
+        self.ax_emiss.plot(z, emiss_p_z.real, color='limegreen', label='Re' if has_imag else None)
         if has_imag:
-            self.ax_emiss.plot(z, emiss_z.imag, color='limegreen', linestyle='dotted', label='Im')
+            self.ax_emiss.plot(z, emiss_p_z.imag, color='limegreen', linestyle='dotted', label='Im')
             self.ax_emiss.legend(fontsize=8, loc='best')
         self.ax_phi.plot(z, phi_z, color='magenta', label=r"$\phi$")
         self.ax_phi.plot(z, phi_prime_z, color='magenta', linestyle='dotted', label=r"$\phi'$")
         self.ax_phi.legend(fontsize=8, loc='best')
-        self.ax_phi.hlines(0, xmin=0, xmax=1, linestyle='dashed',color='k')
+        self.ax_phi.hlines(0, xmin=-1, xmax=1, linestyle='dashed',color='k')
         self._style_preview_axes()
         self._apply_preview_margins()
         # A synchronous draw() (not draw_idle()'s deferred repaint) so the
@@ -699,11 +799,11 @@ class CustomModelDialog(QDialog):
         if param_specs is None:
             return
         edit_name = self._edit_func.__name__ if self._edit_func is not None else None
-        j_lo, j_hi, p_lo, p_hi = self._bounds()
         try:
             self.model_func = build_custom_model(
                 label, self.emiss_edit.text(), self.phi_edit.text(), param_specs,
-                j_lo=j_lo, j_hi=j_hi, p_lo=p_lo, p_hi=p_hi, name=edit_name)
+                j_lo=self.j_lo_edit.text(), j_hi=self.j_hi_edit.text(),
+                p_lo=self.p_lo_edit.text(), p_hi=self.p_hi_edit.text(), name=edit_name)
         except (CustomModelError, ValueError) as e:
             QMessageBox.warning(self, 'Build Custom Model', str(e))
             return

@@ -58,7 +58,7 @@ class ValueLineEdit(QLineEdit):
 # apply_fixed_margins). Sized generously from measured worst cases (long
 # negative numbers, scientific notation, wide mathtext labels) so the
 # right-side rotated ylabel + tick labels are always fully visible
-PLOT_MARGINS_PX = dict(left=85, right=125, bottom=75, top=25)
+PLOT_MARGINS_PX = dict(left=85, right=125, bottom=95, top=25)
 
 # Continuous version of measurements.py's band_colors() red->violet HSV
 # sweep (same RAINBOW_HUE_MAX endpoint), used to color StokesPlot's Polar

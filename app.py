@@ -69,7 +69,7 @@ from polvista.models import (
     MODELS, MODELS_BY_NAME, C, Param, stokes_I, stokes_QU, evpa, pol,
     set_spectral_shape, full_equation, build_custom_model, CUSTOM_MODEL_DEFS,
     CustomModelError)
-from polvista.custom_model_dialog import CustomModelDialog
+from polvista.build_model import CustomModel
 from polvista.fitting import (
     qu_fit, estimate_alpha, estimate_ssa_shape, estimate_shape_2comp, fit_statistics,
     multinest_fit, load_previous_run)
@@ -845,7 +845,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         dialog right back up. Blocking means rebuild_sliders has to be
         called explicitly afterward instead (same pattern already used by
         load_model_action, for the same reason)."""
-        dialog = CustomModelDialog(self)
+        dialog = CustomModel(self)
         if dialog.exec_() and dialog.model_func is not None:
             func = dialog.model_func
             spec = MODELS[func]
@@ -869,7 +869,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         custom one. Reopens the builder dialog pre-filled from its own
         saved definition (see models.CUSTOM_MODEL_DEFS); on success, the
         edited model *replaces* the original in place (same combo row,
-        same func.__name__ -- see CustomModelDialog's own edit_func param
+        same func.__name__ -- see CustomModel's own edit_func param
         and build_custom_model's `name`) rather than adding a second entry,
         since build_custom_model always returns a fresh function object
         even when reusing the same name."""
@@ -877,7 +877,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         existing_def = CUSTOM_MODEL_DEFS.get(func)
         if existing_def is None:
             return
-        dialog = CustomModelDialog(self, existing_def=existing_def, edit_func=func)
+        dialog = CustomModel(self, existing_def=existing_def, edit_func=func)
         if not (dialog.exec_() and dialog.model_func is not None):
             return
         new_func = dialog.model_func
@@ -1304,12 +1304,19 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         complex_pol_action = QAction('Complex polarization', self)
         complex_pol_action.triggered.connect(self.show_complex_polarization_help)
         help_menu.addAction(complex_pol_action)
+        custom_model_action = QAction('Custom models', self)
+        custom_model_action.triggered.connect(self.show_custom_model_help)
+        help_menu.addAction(custom_model_action)
         qufitting_action = QAction('QU-fitting', self)
         qufitting_action.triggered.connect(self.show_qufitting_help)
         help_menu.addAction(qufitting_action)
+        rmsynth_action = QAction('RM-synthesis', self)
+        rmsynth_action.triggered.connect(self.show_rmsynth_help)
+        help_menu.addAction(rmsynth_action)
         about_action = QAction('About Polvista', self)
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
+
 
     def reset_parameters(self):
         """ParamSlider always starts at its kind's default, so rebuilding
@@ -1840,6 +1847,17 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.complex_pol_dialog.activateWindow()
 
 
+    def show_custom_model_help(self):
+        if getattr(self, 'custom_model_dialog', None) is None:
+            tex_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), 'help', 'Custom_models.tex')
+            self.custom_dialog = TexViewerDialog(
+                'Custom models', tex_path, parent=self)
+        self.custom_dialog.show()
+        self.custom_dialog.raise_()
+        self.custom_dialog.activateWindow()
+
+
     def show_qufitting_help(self):
         if getattr(self, 'qufit_dialog', None) is None:
             tex_path = os.path.join(
@@ -1851,6 +1869,17 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.qufit_dialog.activateWindow()
 
 
+    def show_rmsynth_help(self):
+        if getattr(self, 'rmsynth_dialog', None) is None:
+            tex_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), 'help', 'RM-synthesis.tex')
+            self.rmsynth_dialog = TexViewerDialog(
+                'RM-synthesis', tex_path, parent=self)
+        self.rmsynth_dialog.show()
+        self.rmsynth_dialog.raise_()
+        self.rmsynth_dialog.activateWindow()
+
+
     def show_about(self):
         # QMessageBox.about is a simple info dialog (no warning icon/buttons
         # beyond OK) -- Help > About Polvista.
@@ -1858,13 +1887,11 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         box.setWindowTitle('About Polvista')
         box.setTextFormat(Qt.RichText)
         box.setText('<b>Polvista: POLarization VISualizer Tool for Astronomy</b><br><br>'
-                    'Interactive tool to explore the Faraday effect and maybe even fit some spectropolarimetric data!<br><br>'
+                    'An interactive tool to explore the Faraday effect and maybe even fit or simulate some spectropolarimetric data!<br><br>'
                     'Author: Douglas Carlos, 2026 <a href="https://github.com/medoug7/polvista">GitHub</a>')
 
         box.findChild(QLabel, 'qt_msgbox_label').setOpenExternalLinks(True)
         box.exec_()
-
-    
 
 
 
@@ -1876,11 +1903,12 @@ def main():
     app = QApplication(sys.argv)
     # Every numeric spin box in this app (wavelength range, noise levels,
     # MultiNest efficiency/tolerance, the custom-model builder's
-    # preview-lambda, ...) -- and, via the same QDoubleValidator mechanism,
-    # its j_lo/j_hi/p_lo/p_hi bound boxes -- expects '.' as the decimal
-    # point, matching how saved model/measurement files and the expression
-    # fields already treat it -- but QDoubleSpinBox/QDoubleValidator's
-    # built-in text validation otherwise follows QLocale::system() by
+    # preview-lambda, ...) expects '.' as the decimal point, matching how
+    # saved model/measurement files and the expression fields (including
+    # the custom-model builder's own j_lo/j_hi/p_lo/p_hi bound boxes,
+    # plain expression QLineEdits with no QDoubleValidator of their own)
+    # already treat it -- but QDoubleSpinBox's built-in text validation
+    # otherwise follows QLocale::system() by
     # default, which on a system whose locale uses ',' (e.g. pt_BR)
     # silently rejects '.' keystrokes instead of accepting them. Setting
     # the whole application's default locale once here (any QLocale-aware
