@@ -570,14 +570,21 @@ class MeasurementsMixin:
     def clear_measurement_points(self):
         """Remove any Generate'd points from both plot canvases and reset
         the Spectral parameters box -- wired to the Measurements tab's own
-        Clear button, and also called by app.py's Clear data button (see
-        MainWindow.clear_data), since that button clears every simulated/
-        loaded overlay together."""
+        Clear button.
+
+        Also clears the RM-synth tab's own plot, but only if it was last
+        synthesized from these same measurements (see self.rmsynth_source
+        and app.MainWindow.clear_data's analogous handling of loaded data)
+        -- a model- or data-sourced Faraday spectrum survives this."""
         self.canvas.clear_measurement_data()
         self.stokes_canvas.clear_measurement_data()
         self.set_spectral_params_message('Generate some points to see per-band fits.')
         self.meas_export_rows = None
         self.export_meas_button.setEnabled(False)
+        self.rmsynth_measurements_button.setEnabled(False)
+        if self.rmsynth_source == 'measurements':
+            self.rmsynth_source = None
+            self.refresh_rmsynth_empty_axis()
         self.update_plot()
 
     def generate_measurements(self):
@@ -713,6 +720,7 @@ class MeasurementsMixin:
         self.set_spectral_params_bands(results_lines)
         self.meas_export_rows = export_rows
         self.export_meas_button.setEnabled(True)
+        self.rmsynth_measurements_button.setEnabled(True)
         self.update_plot()
 
     def export_measurements_action(self):

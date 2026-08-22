@@ -1,2 +1,61 @@
-\section{The QU-fitting technique}
+\section{RM synthesis}
+QU-fitting (see the QU-fitting help page) requires committing to a specific analytical model for the Faraday screen before the data can be interpreted. RM synthesis takes the opposite approach: it recovers the Faraday-depth structure of the source directly from the observed $q(\lambda^2)$, $u(\lambda^2)$ with no model assumed at all, by treating the complex polarization as a superposition of emission from a continuum of Faraday depths $\phi$, each rotating the EVPA by its own amount $\phi\lambda^2$:
+\begin{equation}\label{eq:rmsynth_forward}
+    \displaystyle P(\lambda^2) = \int_{-\infty}^{\infty} F(\phi)\,e^{2i\phi(\lambda^2-\lambda_0^2)}\,d\phi
+\end{equation}
+$F(\phi)$, the complex Faraday dispersion function, is the amount of polarized emission associated with each Faraday depth $\phi$; recovering it from the observed $P(\lambda^2)=q(\lambda^2)+iu(\lambda^2)$ is formally a Fourier transform, the same relationship an interferometer has with the sky brightness it images, with $\lambda^2$ playing the role the $(u,v)$ plane plays there:
+\begin{equation}\label{eq:rmsynth_inverse}
+    \displaystyle F(\phi) = K\int_{-\infty}^{\infty} P(\lambda^2)\,e^{-2i\phi(\lambda^2-\lambda_0^2)}\,d\lambda^2, \qquad K=\left(\int w(\lambda^2)\,d\lambda^2\right)^{-1}
+\end{equation}
+where $w(\lambda^2)$ is a weight and $\lambda_0^2$ is a reference wavelength (chosen as the weighted mean $\lambda^2$ of the actual channels) whose only role is numerical: evaluating the rotation relative to $\lambda_0^2$ rather than to $\lambda^2=0$ keeps the coherent EVPA rotation across the band from aliasing $F(\phi)$'s peak away from the source's true $\phi$.
+\\
 
+\subsection{The dirty Faraday spectrum}
+Real data give $P$ at a finite number $N$ of discrete channels rather than a continuum, so Equation \ref{eq:rmsynth_inverse} becomes a sum. The result is called the dirty Faraday spectrum, in direct analogy with an interferometer's dirty image: it is exactly what Equation \ref{eq:rmsynth_inverse} would give from perfect, continuous $\lambda^2$ coverage only if that coverage were in fact complete.
+\begin{equation}\label{eq:dirty}
+    \displaystyle F_{\rm dirty}(\phi) = K\sum_{i=1}^{N} w_i P_i\,e^{-2i\phi(\lambda_i^2-\lambda_0^2)}, \qquad K=\left(\sum_{i=1}^N w_i\right)^{-1}
+\end{equation}
+
+\subsection{The RMSF and its resolution}
+Setting $P_i=1$ in Equation \ref{eq:dirty} gives the Rotation Measure Spread Function (RMSF) $R(\phi)$, the response of this particular $\lambda^2$ sampling to a single, unresolved Faraday-depth component -- the direct analog of an interferometer's dirty beam:
+\begin{equation}\label{eq:rmsf}
+    \displaystyle R(\phi) = K\sum_{i=1}^N w_i\,e^{-2i\phi(\lambda_i^2-\lambda_0^2)}
+\end{equation}
+Because real coverage in $\lambda^2$ is always finite and incomplete, $R(\phi)$ is never a single spike: it has a main lobe of finite width flanked by sidelobes, so $F_{\rm dirty}(\phi)$ is really the true $F(\phi)$ convolved with $R(\phi)$, sidelobes and all. Three scales, set purely by the $\lambda^2$ sampling and not by the source itself, describe how well a given setup can do this (Brentjens \& de Bruyn 2005):
+\begin{equation}\label{eq:fwhm}
+    \displaystyle {\rm FWHM}_\phi \approx \frac{2\sqrt{3}}{\Delta\lambda^2}
+\end{equation}
+is the resolution in $\phi$ (the RMSF main lobe's width), set by the total bandwidth $\Delta\lambda^2=\lambda^2_{\rm max}-\lambda^2_{\rm min}$ actually covered;
+\begin{equation}\label{eq:phimax}
+    \displaystyle \phi_{\rm max} \approx \frac{\sqrt{3}}{\delta\lambda^2}
+\end{equation}
+is the largest $|\phi|$ still measurable before the rotation across a single channel's own width $\delta\lambda^2$ (the finest channel spacing present) smears the polarized signal within that channel away; and
+\begin{equation}\label{eq:phialias}
+    \displaystyle \phi_{\rm alias} = \frac{\pi}{\Delta\lambda^2}
+\end{equation}
+is the periodicity beyond which $R(\phi)$'s response to a real $\phi$ becomes ambiguous with a wrapped-around copy of itself, from the same $2\phi\lambda^2$ phase completing an extra full $\pi$ turn between channels.
+\\
+
+\subsection{Weighting}
+Each channel's weight $w_i$ combines its own noise, as an inverse-variance weight $1/\sigma_i^2$, with a Briggs (robust) re-weighting across $\lambda^2$ that downweights crowded regions of the band and upweights sparser ones -- the same robust weighting radio-interferometric imaging applies across the $(u,v)$ plane, trading a little resolution for suppressed sidelobes when the coverage is uneven. The noise itself also propagates through Equation \ref{eq:dirty} into an expected noise level $\sigma_{\rm FDF}$ in the Faraday spectrum, used both as the RM-CLEAN stopping threshold below and, drawn on the plot, as a reference for how much of $F_{\rm dirty}(\phi)$ is signal rather than noise.
+\\
+
+\section{RM-CLEAN}
+The sidelobes in $F_{\rm dirty}(\phi)$ are deconvolved with RM-CLEAN (Heald 2009), the same Högbom CLEAN algorithm interferometric imaging uses, run here in the $\phi$ domain instead of on the sky. At each iteration, the peak of the current residual spectrum is found, a small fraction (the loop gain $g$) of it is recorded as a clean component, and a matching gain-scaled, shifted copy of the RMSF is subtracted from the residual:
+\begin{equation}\label{eq:clean_iter}
+    \displaystyle F_{\rm res}^{(k+1)}(\phi) = F_{\rm res}^{(k)}(\phi) - g\,F_{\rm res}^{(k)}(\phi_{\rm peak})\,R(\phi-\phi_{\rm peak})
+\end{equation}
+This repeats until the residual drops to a few times $\sigma_{\rm FDF}$ or a maximum iteration count is reached. The recovered components are then restored: convolved with an idealized Gaussian "clean beam" whose FWHM matches the RMSF main lobe (measured directly from $R(\phi)$ itself, not just the analytic estimate of Equation \ref{eq:fwhm}), with the final residual added back on top -- giving the clean spectrum $F_{\rm clean}(\phi)$ plotted alongside the dirty one. The peak of $F_{\rm clean}$ gives the source's own $\phi_{\rm peak}$, with an uncertainty
+\begin{equation}\label{eq:phierr}
+    \displaystyle \sigma_\phi = \frac{{\rm FWHM}}{2\,{\rm SNR}}, \qquad {\rm SNR}=\frac{|F(\phi_{\rm peak})|}{\sigma_{\rm FDF}}
+\end{equation}
+\\
+
+\section{Implementation in the RM-synth tab}
+The RM-synth tab's three buttons all feed one $(\lambda,q,u,\sigma_q,\sigma_u)$ set of channels through the same RM synthesis + RM-CLEAN pipeline above, differing only in where those channels come from:
+
+For the "model" button, the channels are a dedicated grid spaced uniformly in $\lambda^2$ (not simply reusing the displayed curve's own wavelength grid) over the full selected wavelength range -- a grid spaced uniformly, or log-uniformly, in $\lambda$ instead leaves $\lambda^2$ coverage badly skewed toward the short-wavelength end over a wide band, which starves the long-$\lambda^2$-baseline coverage the resolution in Equation \ref{eq:fwhm} actually depends on. There being no real per-point noise for a pure curve, every channel is weighted equally, at a constant small enough that $\sigma_{\rm FDF}$ reads as effectively zero rather than as a spurious noise floor.
+
+For the "data" and "measurements" buttons, the channels are the loaded or simulated points themselves, each with its own real (or simulated) noise flowing directly into the weighting of Equation \ref{eq:dirty}.
+
+The plot itself shows the dirty spectrum $|F_{\rm dirty}(\phi)|$ (dashed grey) and the clean spectrum $|F_{\rm clean}(\phi)|$ (green) together with the individual CLEAN components (orange stems), the noise floor $\sigma_{\rm FDF}$ (dotted red), and $\phi_{\rm peak}$ with its uncertainty (Equation \ref{eq:phierr}) alongside the RMSF value, with a solid horizontal scale bar showing that resolution element's actual width on the plot's own axis.

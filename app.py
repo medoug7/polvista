@@ -68,16 +68,17 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from polvista.models import (
     MODELS, MODELS_BY_NAME, C, Param, stokes_I, stokes_QU, evpa, pol,
     set_spectral_shape, full_equation, build_custom_model, CUSTOM_MODEL_DEFS,
-    CustomModelError)
+    CustomModelError, SPECTRAL_SHAPES, TEMP_BOUNDS_K, BETA_BOUNDS)
 from polvista.build_model import CustomModel
 from polvista.fitting import (
     qu_fit, estimate_alpha, estimate_ssa_shape, estimate_shape_2comp, fit_statistics,
     multinest_fit, load_previous_run)
 from polvista.latex_stuff import latex_pixmap, fit_equation_pixmap, TexViewerDialog
 from polvista.widgets import (
-    ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDEST_UNIT, ModelPlot, StokesPlot)
+    ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDEST_UNIT, ModelPlot, StokesPlot, RMSynthPlot)
 from polvista.sampling import SamplingMixin
 from polvista.measurements import MeasurementsMixin
+from polvista.rm_synthesis import compute_faraday_spectrum, phi_axis_half_width, FaradaySpectrumError
 
 # pymultinest (Bayesian/nested-sampling fitting) is an optional dependency --
 # it's a compiled Fortran library wrapper that's a much heavier install than
@@ -146,13 +147,24 @@ DRAG_N_POINTS_CAP = 150
 PHI_LOG_RANGE = (-6.5, 6.5)
 DPHI_LOG_RANGE = (0.0, 6.5)
 
+# Placeholder q_err/u_err for rmsynth_from_model's noiseless model curve --
+# rm_synthesis.compute_faraday_spectrum only ever uses q_err/u_err in ratios
+# (Briggs relative weighting) or as an overall multiplicative scale
+# (sigma_fdf, the CLEAN threshold), never in absolute terms that would
+# affect the recovered dirty/clean spectrum itself -- so any constant works
+# equally well for "every point weighted equally", but the constant's own
+# absolute size *does* set sigma_fdf/threshold's absolute size. A
+# fractional-polarization curve is typically well under 1 in amplitude, so
+# using 1.0 here (rather than something negligibly small) previously made
+# the plotted sigma_fdf noise line -- and the CLEAN stopping threshold --
+# come out comparable to or larger than the curve's own peak, even though
+# there's no real noise to represent.
+RMSYNTH_MODEL_WEIGHT = 1e-6
+
 # Linear range for power-law spectral indices
 # +/-3 covers typical AGN jet spectral indices.
 ALPHA_RANGE = (-3.0, 2.0)
 EPS_RANGE = (0.0, 1.0)
-
-# Spectrum box's shape dropdown: (display label, models.set_spectral_shape key).
-SPECTRAL_SHAPES = [('Power-law', 'powerlaw'), ('Log-parabola', 'logparabola'), ('SSA', 'ssa'), ('Thermal', 'thermal'),]
 
 # Multipliers applied to the current wavelength range's own (nu_min, nu_max)
 # to get the SSA/thermal turnover-frequency sliders' (lo, hi) bounds --
@@ -160,20 +172,7 @@ SPECTRAL_SHAPES = [('Power-law', 'powerlaw'), ('Log-parabola', 'logparabola'), (
 # direction.
 NU0_BOUNDS_MULT = (1e-3, 1e3)
 
-# (lo, hi) [K] bounds for the thermal shape's electron-temperature
-# sliders -- not tied to the plotted band (unlike NU0_BOUNDS_MULT), since T
-# sets the Wien cutoff/Rayleigh-Jeans amplitude rather than a frequency
-# within it. Spans cool photoionized gas (~1e2 K) through hot X-ray-emitting
-# plasma (~1e8 K).
-TEMP_BOUNDS_K = (1e-1, 1e7)
 DEFAULT_TEMP_K = 1e4  # typical HII-region/AGN narrow-line-region electron temperature
-
-# (lo, hi) bounds for the log-parabola shape's curvature-index (beta)
-# sliders -- linear, unlike nu0/T (beta doesn't span decades). Wide enough
-# to explore both a strongly peaked (beta<0) and a divergent (beta>0)
-# spectrum; beta=0 (the default) reduces the shape exactly to a plain
-# power law.
-BETA_BOUNDS = (-2.0, 2.0)
 DEFAULT_BETA = 0.0
 
 # Quick-select wavelength ranges (min_mm, max_mm) for the preset dropdown.
@@ -294,6 +293,16 @@ class ParamSlider(QWidget):
             # (K, never 0).
             self.lo, self.hi = np.log10(lo), np.log10(hi)
             default = 0.5 * (self.lo + self.hi)
+        elif self.kind in ('freq', 'wave'):
+            # log-scale like nu0/temp -- a custom model's own characteristic
+            # frequency/wavelength constant (e.g. a break frequency inside
+            # j_p(z)) can plausibly span decades too, same reasoning as
+            # nu0/temp -- see CUSTOM_PARAM_KINDS's own module comment in
+            # models.py for why this is a separate kind from 'nu0' (units:
+            # MHz/m, matching the reserved nu/lambda symbols exactly, no
+            # GHz-style conversion applied anywhere else).
+            self.lo, self.hi = np.log10(lo), np.log10(hi)
+            default = 0.5 * (self.lo + self.hi)
         else:  # 'scale' -- e.g. s, f
             self.lo, self.hi = lo, hi
             default = 0.5 * (lo + hi)
@@ -363,15 +372,16 @@ class ParamSlider(QWidget):
             return 10 ** working - 1
         if self.kind == 'p':
             return working / 100
-        if self.kind in ('nu0', 'temp'):
+        if self.kind in ('nu0', 'temp', 'freq', 'wave'):
             return 10 ** working
         return working  # scale, alpha, eps
 
     def encode(self, typed):
         """Inverse of decode: turn a number typed into the value field
         (in the same units/domain shown there -- degrees for X, percent
-        for p, the physical value itself for phi/dphi/nu0/temp, unitless
-        for scale/alpha/eps) back into the slider's "working" domain."""
+        for p, the physical value itself for phi/dphi/nu0/temp/freq/wave,
+        unitless for scale/alpha/eps) back into the slider's "working"
+        domain."""
         if self.kind in ('X', 'p'):
             return typed  # already the working-domain value (deg / %)
         if self.kind == 'phi':
@@ -382,7 +392,7 @@ class ParamSlider(QWidget):
             if typed <= 0:
                 return 0.0
             return np.log10(typed + 1)
-        if self.kind in ('nu0', 'temp'):
+        if self.kind in ('nu0', 'temp', 'freq', 'wave'):
             return np.log10(typed) if typed > 0 else self.lo
         return typed  # scale, alpha, eps
 
@@ -414,7 +424,7 @@ class ParamSlider(QWidget):
             typed = phys * 180 / np.pi
         elif self.kind == 'p':
             typed = phys * 100
-        else:  # phi/dphi/scale/alpha/eps/nu0/temp already share value()'s domain
+        else:  # phi/dphi/scale/alpha/eps/nu0/temp/freq/wave already share value()'s domain
             typed = phys
         self.slider.setValue(self.raw_from_working(self.encode(typed)))
         self.update_label()
@@ -426,7 +436,7 @@ class ParamSlider(QWidget):
             text = f'{working:.1f}'
         elif self.kind == 'p':
             text = f'{working:.2f}'
-        elif self.kind in ('phi', 'dphi', 'nu0', 'temp'):
+        elif self.kind in ('phi', 'dphi', 'nu0', 'temp', 'freq', 'wave'):
             text = f'{phys:.2e}'
         elif self.kind == 'eps':
             text = f'{phys:.3f}'
@@ -469,6 +479,16 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.sliders = []
         self.fit_data = None  # (wl, q, q_err, u, u_err, freq, I) from the Load Data... button, or None
         self.data_nu_min = None  # [MHz] loaded data's own nu_min, set by Fitting -- see run_fit
+
+        # Which source the RM-synth tab's currently plotted Faraday
+        # spectrum (if any) was synthesized from -- 'model'/'data'/
+        # 'measurements', or None while its plot is still the empty
+        # placeholder. Lets Clear data / the Measurements tab's Clear only
+        # blank the RM-synth plot when it's actually theirs to blank (see
+        # clear_data/clear_measurement_points) -- a model-sourced spectrum
+        # has nothing to do with loaded data or generated measurements, so
+        # it survives either.
+        self.rmsynth_source = None
 
         # MultiNest (Sampling tab) result state -- see apply_posterior_result,
         # build_corner_tab, run_multinest_fit, load_samples_action.
@@ -794,13 +814,58 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
 
         stokes_layout.addWidget(self.stokes_canvas, stretch=1)
 
+        # RM-synth tab: the Faraday-depth spectrum from RM synthesis +
+        # RM-CLEAN (rm_synthesis.compute_faraday_spectrum), synthesized on
+        # demand from one of three sources -- never from a parameter-slider
+        # drag or the wavelength-range spin boxes, unlike p_evpa_tab/
+        # stokes_tab above (see RMSynthPlot's own docstring and
+        # rmsynth_from_model/_data/_measurements below).
+        self.rmsynth_canvas = RMSynthPlot(self)
+        self.rmsynth_toolbar = NavigationToolbar(self.rmsynth_canvas, self)
+        rmsynth_tab = QWidget()
+        rmsynth_layout = QVBoxLayout(rmsynth_tab)
+        rmsynth_layout.setContentsMargins(0, 0, 0, 0)
+
+        rmsynth_top_row = QHBoxLayout()
+        rmsynth_top_row.addWidget(self.rmsynth_toolbar)
+        rmsynth_top_row.addStretch(1)
+        rmsynth_top_row.addWidget(QLabel('Synthesize from:'))
+        self.rmsynth_model_button = QPushButton('model')
+        self.rmsynth_model_button.setToolTip(
+            "Compute the Faraday spectrum of the model curve over the full selected wavelength range.")
+        self.rmsynth_model_button.clicked.connect(self.rmsynth_from_model)
+        rmsynth_top_row.addWidget(self.rmsynth_model_button)
+        self.rmsynth_data_button = QPushButton('data')
+        self.rmsynth_data_button.setToolTip("Compute the Faraday spectrum of the loaded data.")
+        self.rmsynth_data_button.setEnabled(False)  # only enabled once data is loaded, see load_data_action
+        self.rmsynth_data_button.clicked.connect(self.rmsynth_from_data)
+        rmsynth_top_row.addWidget(self.rmsynth_data_button)
+        self.rmsynth_measurements_button = QPushButton('measurements')
+        self.rmsynth_measurements_button.setToolTip("Compute the Faraday spectrum of the generated measurements.")
+        self.rmsynth_measurements_button.setEnabled(False)  # only enabled once Generate has produced points
+        self.rmsynth_measurements_button.clicked.connect(self.rmsynth_from_measurements)
+        rmsynth_top_row.addWidget(self.rmsynth_measurements_button)
+        rmsynth_layout.addLayout(rmsynth_top_row)
+
+        rmsynth_layout.addWidget(self.rmsynth_canvas, stretch=1)
+
+        # The empty plot's own phi axis tracks the wavelength-range spin
+        # boxes (but only while there's nothing actually plotted yet, see
+        # refresh_rmsynth_empty_axis) -- these are ordinary spin boxes, not
+        # parameter sliders, so this doesn't conflict with the tab never
+        # redrawing on a slider drag.
+        self.wl_min.valueChanged.connect(self.refresh_rmsynth_empty_axis)
+        self.wl_max.valueChanged.connect(self.refresh_rmsynth_empty_axis)
+        self.refresh_rmsynth_empty_axis()
+
         # QTabWidget switches between the plot pages via clickable tabs. A
-        # third "Corner plot" tab is added/removed dynamically by
+        # fourth "Corner plot" tab is added/removed dynamically by
         # build_corner_tab/remove_corner_tab once a MultiNest fit (or
         # Load samples) has something to show there.
         self.plot_tabs = QTabWidget()
         self.plot_tabs.addTab(p_evpa_tab, 'p / EVPA  vs  λ²')
         self.plot_tabs.addTab(stokes_tab, 'I, Q, U  vs  ν')
+        self.plot_tabs.addTab(rmsynth_tab, 'RM-synth')
         right_layout.addWidget(self.plot_tabs, stretch=1)
         root.addWidget(right, stretch=1)
 
@@ -844,7 +909,13 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         would treat as "the sentinel got picked again" and reopen this same
         dialog right back up. Blocking means rebuild_sliders has to be
         called explicitly afterward instead (same pattern already used by
-        load_model_action, for the same reason)."""
+        load_model_action, for the same reason). shape_combo is blocked for
+        the same reason as model_combo above: firing on_spectral_shape_changed
+        before rebuild_sliders has actually built this new model's own
+        sliders would read stale slider state -- rebuild_sliders's own
+        trailing sync_spectrum_ui/refit_equation/update_plot calls cover it
+        once, in the right order, after both combo boxes are already
+        settled."""
         dialog = CustomModel(self)
         if dialog.exec_() and dialog.model_func is not None:
             func = dialog.model_func
@@ -855,6 +926,17 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             self.model_combo.setCurrentIndex(insert_at)
             self.model_combo.blockSignals(False)
             self._last_model_index = insert_at
+            # Whatever Spectral model the builder dialog's own (preview-only)
+            # dropdown was left on becomes this new model's *initial* live
+            # Spectrum-box selection -- so opacity (if SSA/Thermal was
+            # previewed) is already active the moment the model is first
+            # shown, matching what its equation card/preview just showed,
+            # rather than silently reverting to Power-law.
+            shape_idx = self.shape_combo.findData(dialog.spectral_shape_combo.currentData())
+            if shape_idx >= 0:
+                self.shape_combo.blockSignals(True)
+                self.shape_combo.setCurrentIndex(shape_idx)
+                self.shape_combo.blockSignals(False)
             self.rebuild_sliders()
         elif revert_index is not None:
             self.model_combo.blockSignals(True)
@@ -867,17 +949,24 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         """Models menu's "Edit Custom Model..." entry -- only ever enabled
         (see rebuild_sliders) while the currently selected model is a
         custom one. Reopens the builder dialog pre-filled from its own
-        saved definition (see models.CUSTOM_MODEL_DEFS); on success, the
-        edited model *replaces* the original in place (same combo row,
-        same func.__name__ -- see CustomModel's own edit_func param
+        saved definition (see models.CUSTOM_MODEL_DEFS) and its own
+        current live Spectrum-box shape (see CustomModel's own
+        initial_spectral_shape param -- editing shouldn't visually revert
+        opacity off just because the dialog's own preview-only dropdown
+        always used to start at Power-law); on success, the edited model
+        *replaces* the original in place (same combo row, same
+        func.__name__ -- see CustomModel's own edit_func param
         and build_custom_model's `name`) rather than adding a second entry,
         since build_custom_model always returns a fresh function object
-        even when reusing the same name."""
+        even when reusing the same name. The live Spectrum-box shape itself
+        is untouched by this -- it's global/shared state, not something
+        Edit resets."""
         func = self.model_combo.currentData()
         existing_def = CUSTOM_MODEL_DEFS.get(func)
         if existing_def is None:
             return
-        dialog = CustomModel(self, existing_def=existing_def, edit_func=func)
+        dialog = CustomModel(self, existing_def=existing_def, edit_func=func,
+                              initial_spectral_shape=self.shape_combo.currentData())
         if not (dialog.exec_() and dialog.model_func is not None):
             return
         new_func = dialog.model_func
@@ -1257,6 +1346,109 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self._plot_pending = False  # this call's own full-res redraw supersedes any coalesced one
         self.update_plot()  # one final full-resolution redraw once the drag settles
 
+    # ── RM-synth tab ───────────────────────────────────────────────────────
+    def rmsynth_wl_bounds_m(self):
+        """(wl_min, wl_max) [m] of the Wavelength range box's own current
+        selection -- shared by refresh_rmsynth_empty_axis and
+        rmsynth_from_model (which synthesizes over this same full range)."""
+        wl_min_mm = min(self.wl_min.value(), self.wl_max.value())
+        wl_max_mm = max(self.wl_min.value(), self.wl_max.value())
+        return wl_min_mm * 1e-3, wl_max_mm * 1e-3
+
+    def refresh_rmsynth_empty_axis(self, *_):
+        """Keep the RM-synth tab's own empty-plot phi range matched to the
+        current wavelength-range selection -- but only while nothing has
+        actually been synthesized there yet (self.rmsynth_source is None).
+        Once a source has been plotted, the wavelength-range spin boxes no
+        longer touch that tab at all (see RMSynthPlot's own docstring)
+        until Clear data/the Measurements tab's Clear (or another
+        Synthesize from click) replaces it."""
+        if self.rmsynth_source is not None:
+            return
+        wl_lo, wl_hi = self.rmsynth_wl_bounds_m()
+        self.rmsynth_canvas.set_empty(phi_axis_half_width(wl_lo ** 2, wl_hi ** 2))
+
+    def run_rmsynth(self, wl, q, u, q_err, u_err, source):
+        """Shared tail end of rmsynth_from_model/_data/_measurements: run
+        RM synthesis + RM-CLEAN on one (wl [m], q, u, q_err, u_err) set of
+        channels and, on success, draw it -- replacing whatever the
+        RM-synth tab showed before -- and remember which source it came
+        from (see self.rmsynth_source)."""
+        try:
+            result = compute_faraday_spectrum(wl, q, u, q_err, u_err)
+        except FaradaySpectrumError as e:
+            QMessageBox.warning(self, 'RM synthesis', str(e))
+            return
+        self.rmsynth_canvas.plot_spectrum(result, source)
+        self.rmsynth_source = source
+
+    def rmsynth_from_model(self):
+        """'model' button: Faraday spectrum of the model curve over the
+        full selected wavelength range. q, u are the model's own fractional
+        (Q/I, U/I) polarization -- func(wl, pars)'s real/imaginary parts,
+        the same complex value ModelPlot's p/EVPA are derived from -- so
+        this reads on the same fractional-polarization scale as
+        rmsynth_from_data/_measurements below. There's no per-point noise
+        for a pure curve, so every point is weighted equally, at a
+        negligibly small absolute scale (see RMSYNTH_MODEL_WEIGHT) so the
+        resulting sigma_fdf/CLEAN threshold reads as ~0 rather than as a
+        spurious noise floor comparable to the curve's own amplitude.
+
+        Deliberately does NOT reuse current_state()'s own wl_ext, and
+        deliberately does NOT just mirror it in lambda^2 either: that grid
+        is spaced (log-)uniformly in wavelength, and log spacing is
+        invariant under squaring (log(lambda^2) = 2 log(lambda) is uniform
+        whenever log(lambda) is), so a log-uniform-in-lambda^2 grid over
+        the same endpoints would be numerically identical to it. Either
+        way, over a wide band this piles most points up near the
+        short-wavelength end, starving RM synthesis of the long-lambda^2-
+        baseline coverage it actually needs -- which in turn fools
+        rm_synthesis.measure_fwhm into picking an oversized CLEAN restoring
+        beam and smearing the recovered spectrum into broad artificial
+        tails. Sampling *linearly* (uniformly) in lambda^2 instead -- same
+        endpoints (rmsynth_wl_bounds_m, the same full range
+        refresh_rmsynth_empty_axis previews) and point count -- gives RM
+        synthesis the even lambda^2 coverage it's actually sensitive to,
+        regardless of the Visualization tab's own log-x display toggle
+        (that toggle is about how the curve looks on screen, not what RM
+        synthesis needs)."""
+        func, spec, pars, _ = self.current_state()
+        wl_lo, wl_hi = self.rmsynth_wl_bounds_m()
+        n_points = self.n_points.value()
+        l2_ext = np.linspace(wl_lo ** 2, wl_hi ** 2, n_points)
+        wl_ext = np.sqrt(l2_ext)
+        fit = func(wl_ext, pars)
+        weight = np.full_like(wl_ext, RMSYNTH_MODEL_WEIGHT)
+        self.run_rmsynth(wl_ext, fit.real, fit.imag, weight, weight, 'model')
+
+    def rmsynth_from_data(self):
+        """'data' button: Faraday spectrum of the data loaded via Load
+        data -- greyed out (see load_data_action/clear_data) until some is.
+        self.fit_data's own q, u, q_err, u_err are already the fractional
+        (Q/I, U/I) polarization and its propagated errors (see
+        load_data_action), exactly what this needs."""
+        if self.fit_data is None:
+            return
+        wl, q, q_err, u, u_err, _freq, _I = self.fit_data
+        self.run_rmsynth(wl, q, u, q_err, u_err, 'data')
+
+    def rmsynth_from_measurements(self):
+        """'measurements' button: Faraday spectrum of the Measurements
+        tab's last Generate'd points -- greyed out (see
+        generate_measurements/clear_measurement_points) until there are
+        any. self.meas_export_rows holds absolute (I, Q, U) per point (see
+        generate_measurements), so q, u and their errors are derived here
+        the same way widgets.stokes_to_frac_qu/load_data_action do."""
+        if not self.meas_export_rows:
+            return
+        rows = np.asarray(self.meas_export_rows, dtype=float)
+        freq_ghz, I, I_err, Q, Q_err, U, U_err = (rows[:, i] for i in (1, 2, 3, 4, 5, 6, 7))
+        wl = C / (freq_ghz * 1e9)
+        q, u = Q / I, U / I
+        q_err = np.sqrt((Q_err / I) ** 2 + (Q * I_err / I ** 2) ** 2)
+        u_err = np.sqrt((U_err / I) ** 2 + (U * I_err / I ** 2) ** 2)
+        self.run_rmsynth(wl, q, u, q_err, u_err, 'measurements')
+
     # ── Menu bar ───────────────────────────────────────────────────────────
     def build_menu(self):
         # self.menuBar() gives the QMainWindow's built-in top menu bar;
@@ -1352,18 +1544,28 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.rebuild_sliders()
 
     def clear_data(self):
-        """Erase any reference data points loaded via the Load Data... button.
+        """Erase any reference data points loaded via the Load Data... button
+        -- generated measurements (the Measurements tab's own Clear button/
+        clear_measurement_points) are a separate overlay and untouched here.
         Also closes the Corner plot tab (it was built against this data),
         but leaves any posterior-sample overlay in place -- only Reset
-        model clears that, see reset_parameters."""
+        model clears that, see reset_parameters.
+
+        Also clears the RM-synth tab's own plot, but only if it was last
+        synthesized from this same loaded data (see self.rmsynth_source) --
+        a model- or measurements-sourced Faraday spectrum has nothing to do
+        with this data and survives it."""
         self.canvas.clear_reference_data()
         self.stokes_canvas.clear_reference_data()
         self.fit_data = None
         self.data_nu_min = None
         self.remove_corner_tab()
         self.fit_button.setEnabled(False)
+        self.rmsynth_data_button.setEnabled(False)
+        if self.rmsynth_source == 'data':
+            self.rmsynth_source = None
+            self.refresh_rmsynth_empty_axis()
         self.set_sampling_tab_enabled(False)
-        self.clear_measurement_points()
         self.results_label.setText(self.NO_FIT_TEXT)
         self.update_plot()
 
@@ -1828,6 +2030,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # here, since it should only take effect once the user clicks Fitting.
         self.fit_data = (wl, q, q_err, u, u_err, freq, I)
         self.fit_button.setEnabled(True)
+        self.rmsynth_data_button.setEnabled(True)
         self.set_sampling_tab_enabled(True)
 
         self.update_plot()

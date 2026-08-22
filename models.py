@@ -41,6 +41,29 @@ K_BOLTZMANN = 1.380649e-23  # J/K
 # 'ssa'/'thermal'/'logparabola' for the other. SPECTRAL_TEMP(_2) is only
 # ever read when the matching shape is 'thermal'; SPECTRAL_BETA(_2) only
 # when it's 'logparabola'.
+# Spectrum box's shape dropdown (app.py) and the custom-model builder's own
+# preview-only Spectral-model dropdown (build_model.py): (display label,
+# set_spectral_shape key). Kept here rather than in app.py so build_model.py
+# can import it too without app.py<->build_model.py becoming circular.
+SPECTRAL_SHAPES = [('Power-law', 'powerlaw'), ('Log-parabola', 'logparabola'), ('SSA', 'ssa'), ('Thermal', 'thermal'),]
+
+# (lo, hi) [K] bounds for the thermal shape's electron-temperature
+# sliders -- not tied to the plotted band (unlike app.NU0_BOUNDS_MULT),
+# since T sets the Wien cutoff/Rayleigh-Jeans amplitude rather than a
+# frequency within it. Spans cool photoionized gas (~1e2 K) through hot
+# X-ray-emitting plasma (~1e8 K). Kept here rather than in app.py (like
+# SPECTRAL_SHAPES above) so build_model.py's own locked "T" row (see its
+# CustomModel._sync_locked_rows) can show the same bounds without a
+# circular import.
+TEMP_BOUNDS_K = (1e-1, 1e7)
+
+# (lo, hi) bounds for the log-parabola shape's curvature-index (beta)
+# sliders -- linear, unlike nu0/T (beta doesn't span decades). Wide enough
+# to explore both a strongly peaked (beta<0) and a divergent (beta>0)
+# spectrum; beta=0 (the default) reduces the shape exactly to a plain
+# power law. Kept here for the same reason TEMP_BOUNDS_K is.
+BETA_BOUNDS = (-2.0, 2.0)
+
 SPECTRAL_SHAPE = 'powerlaw'
 SPECTRAL_SHAPE_2 = 'powerlaw'
 SPECTRAL_NU0 = None    # MHz -- SSA/thermal turnover frequency: a
@@ -125,7 +148,7 @@ def reference_nu(nu, nu_min=None):
     return component_reference_nu(nu, nu_min, SPECTRAL_NU0, SPECTRAL_SHAPE)
 
 
-def thermal_source(ratio, nu0, T):
+def thermal_source(ratio, nu0, T, apply_escape=True):
     """Normalized thermal free-free source function
     S'(nu) = B_nu(T)*(1-e^-tau_nu) / [B_nu0(T)*(1-e^-tau0)], `ratio` =
     nu/nu0, tau0 fixed to 1 and tau_nu = (nu/nu0)**-2.1 the free-free
@@ -133,6 +156,13 @@ def thermal_source(ratio, nu0, T):
     convention as 'ssa' -- nu0 is where tau_nu=1). `nu0` [MHz] is only
     used to get the dimensionless Theta = h*nu0/(k_B*T) below; `T` [K] is
     the electron temperature.
+
+    `apply_escape=False` returns the bare local Planck source function
+    (`planck_ratio` below) alone, without the `(1-e^-tau_nu)/(1-e^-tau0)`
+    escape-probability bracket -- see source_function's own docstring for
+    why a caller (models.build_custom_model's own per-z opacity) would
+    want that bare piece instead of this function's default, already-
+    escaped, whole-slab emergent ratio.
 
     This single expression has three asymptotes, set by Theta: optically
     thick (ratio << 1) is the Rayleigh-Jeans blackbody, S' ~ ratio**2;
@@ -158,19 +188,21 @@ def thermal_source(ratio, nu0, T):
     aborting the fit."""
     nu0_hz = nu0 * 1e6
     theta = H_PLANCK * nu0_hz / (K_BOLTZMANN * T)
-    tau = ratio ** -2.1
-    bracket = -np.expm1(-tau)
-    tau0 = 1.0
-    bracket0 = -np.expm1(-tau0)
     theta_ratio = theta * ratio
     with np.errstate(over='ignore', invalid='ignore'):
         log_planck_ratio = (3 * np.log(ratio) + theta * (1 - ratio)
                              + np.log1p(-np.exp(-theta)) - np.log1p(-np.exp(-theta_ratio)))
     planck_ratio = np.exp(np.clip(log_planck_ratio, -700.0, 700.0))
+    if not apply_escape:
+        return np.nan_to_num(planck_ratio, nan=0.0, posinf=1e300, neginf=0.0)
+    tau = ratio ** -2.1
+    bracket = -np.expm1(-tau)
+    tau0 = 1.0
+    bracket0 = -np.expm1(-tau0)
     return np.nan_to_num(planck_ratio * bracket / bracket0, nan=0.0, posinf=1e300, neginf=0.0)
 
 
-def source_function(nu, nu0, alpha, shape, T=None, beta=None):
+def source_function(nu, nu0, alpha, shape, T=None, beta=None, apply_escape=True):
     """Normalized source function S'(nu), S'(nu0)=1, in the given `shape`
     ('powerlaw'/'ssa'/'thermal'/'logparabola' -- always passed explicitly
     by the caller, e.g. a two-component model's own per-component
@@ -192,16 +224,36 @@ def source_function(nu, nu0, alpha, shape, T=None, beta=None):
     on both sides (concave down in log-log); beta>0 diverges on both
     sides instead (concave up) -- see MODELS/spec.params for typical
     bounds. Unlike 'ssa'/'thermal', nu0 here is still the shared band edge
-    (see component_reference_nu), not a free turnover of its own."""
+    (see component_reference_nu), not a free turnover of its own.
+
+    `apply_escape=False` (only meaningful for 'ssa'/'thermal' -- a no-op
+    for 'powerlaw'/'logparabola', which have no tau_nu/escape-probability
+    concept at all) strips the `(1-e^-tau_nu)/(1-e^-tau0)` bracket,
+    returning the bare *local* source function shape alone -- `ratio**2.5`
+    for 'ssa' (notably alpha-independent: the universal synchrotron
+    self-absorption source-function shape doesn't depend on the electron
+    power-law index, only tau_nu's own frequency-scaling does), or the
+    bare Planck ratio for 'thermal' (see thermal_source). That bracket is
+    the closed-form *emergent*-intensity solution of a uniform, unresolved
+    slab -- i.e. it already *is* a line-of-sight integral, just collapsed
+    algebraically for the special case of z-independent source/absorption
+    coefficients. A caller building its own per-z optical depth (see
+    build_custom_model's own opacity term) needs the bare S(nu) alone for
+    Kirchhoff's law (alpha'(z)=j(z)/S(nu)) -- reusing the bracketed value
+    there would double-apply that same escape-probability physics, once
+    via the bracket and again via the newly-resolved per-z integral."""
     ratio = nu / nu0
     if shape == 'ssa':
+        bare = ratio ** 2.5
+        if not apply_escape:
+            return bare
         tau0 = 1.0
         tau_nu = tau0 * ratio ** (alpha - 2.5)
         # (1-e^-x) = -expm1(-x); tau0's constant denominator cancels the
         # sign, and expm1 keeps this well-behaved as tau_nu -> 0.
-        return ratio ** 2.5 * np.expm1(-tau_nu) / np.expm1(-tau0)
+        return bare * np.expm1(-tau_nu) / np.expm1(-tau0)
     if shape == 'thermal':
-        return thermal_source(ratio, nu0, T)
+        return thermal_source(ratio, nu0, T, apply_escape=apply_escape)
     if shape == 'logparabola':
         return ratio ** (alpha + beta * np.log(ratio))
     return ratio ** alpha
@@ -552,7 +604,10 @@ def spectral_param_single():
     """The single trailing alpha appended to single-component models --
     shapes the model's own Stokes I(nu) (normalized to 1 at nu_min, the
     lowest frequency/longest wavelength currently plotted; see stokes_I())
-    but has no effect on p=P/I itself."""
+    but has no effect on p=P/I itself -- except for a custom model with
+    SSA/thermal opacity active (see _custom_P_raw/_custom_opacity_attenuation),
+    where alpha also shapes the per-z optical depth tau_nu that opacity
+    term builds, and so can change p=P/I too."""
     return [Param('alpha', r'$\alpha$', 'alpha',
                   'Spectral index of total intensity: I(nu) ∝ nu^alpha. '
                   'Shapes Stokes I(nu) but has no effect on p=P/I.')]
@@ -757,6 +812,18 @@ def weights_latex(shape1, shape2):
     return r"w_1=\varepsilon\,S_1'(\nu),\ \ w_2=(1-\varepsilon)\,S_2'(\nu),\ \ " + eps_def
 
 
+def _insert_opacity_factor(latex):
+    """Splice the e^{-tau_lambda(z)} attenuation factor into a custom
+    model's own P(lambda) equation text, right after its always-present
+    Faraday phase factor -- shared by full_equation (main window) and the
+    builder dialog's own live preview (build_model.refit_dialog_equation)
+    so both show it identically whenever SSA/thermal opacity applies (see
+    _custom_P_raw/_custom_opacity_attenuation for the actual computation).
+    Works on either the full '$...$'-delimited line or its bare inner text
+    -- the pattern matched has no trailing '$' of its own."""
+    return latex.replace(r'\lambda^2}\,dz', r'\lambda^2}\,e^{-\tau_\lambda(z)}\,dz')
+
+
 def full_equation(spec, shape1, shape2):
     """The full (centered, possibly multi-line) equation-card LaTeX for
     `spec` at the given spectral shape(s): its own P(lambda) equation, plus
@@ -765,12 +832,18 @@ def full_equation(spec, shape1, shape2):
 
     Single-component model: one line, S'(nu) to the left of P(lambda)
     (S'(nu) shapes only the Stokes I spectrum there, not p=P/I itself, but
-    the choice is still shown).
+    the choice is still shown) -- except a *custom* model with SSA/thermal
+    `shape1` (see _insert_opacity_factor), where selecting that shape adds
+    a genuine e^{-tau_lambda(z)} attenuation into P(lambda) itself (see
+    _custom_P_raw), shown here so the choice's effect on P(lambda), not
+    just S'(nu), is visible.
 
     Two-component model: the w1/w2/epsilon definition on its own line
     first, then S'(nu) to the left of P(lambda) on the line below (matching
     the single-component layout, since P(lambda) itself is written in
     terms of w1/w2 -- see each two-component model's own `equation`).
+    Custom models are always single-component, so the opacity factor above
+    never applies here.
 
     A custom model's own `equation` (see build_custom_model) can itself
     already be more than one line -- e.g. its own phi(z)=... definition
@@ -780,6 +853,8 @@ def full_equation(spec, shape1, shape2):
     s_prime = s_prime_latex(spec.n_components, shape1, shape2)
     lines = spec.equation.strip().split('\n')
     inner = lines[-1].strip()[1:-1]  # strip that line's own surrounding '$...$'
+    if getattr(spec.func, 'is_custom', False) and shape1 in ('ssa', 'thermal'):
+        inner = _insert_opacity_factor(inner)
     main_line = f'${s_prime}\\qquad\\quad {inner}$'
     extra_lines = lines[:-1]  # e.g. a custom model's own phi(z)=... line, if any
     if spec.n_components == 1:
@@ -1299,8 +1374,51 @@ def _cumtrapz0(y, z):
     return out
 
 
+def _custom_opacity_attenuation(emiss_fn, consts, chi0_val, phi0_val, j_lo, j_hi,
+                                 z, nu, lam, emiss_den_zw, shape, nu0, alpha_val, T_val, beta_val):
+    """exp(-tau(z,nu)) -- the per-z opacity attenuation envelope
+    _custom_P_raw's own SSA/thermal case multiplies onto both j_p(z) and
+    j(z) before they're integrated (see there), built via Kirchhoff's law
+    alpha'(z) = j(z)/S(nu) with S(nu) the *bare* local source function
+    (source_function(..., apply_escape=False) -- see its own docstring for
+    why the default, already-escaped S'(nu) can't be reused here without
+    double-applying the same escape-probability physics this per-z
+    integral is itself computing).
+
+    tau(z,nu) = integral_z^1 alpha'(z') dz' is built the same suffix-
+    integral way phi(z) is in _custom_P_raw (_cumtrapz0 + total-minus-
+    prefix), from j(z,nu) = `emiss_den_zw` (already computed, and already
+    masked to 0 outside [j_lo,j_hi], by the caller), then rescaled by a
+    single amplitude so that tau at the emitting region's far edge
+    (z=j_lo, the model's own *total* column depth) equals 1 exactly at
+    nu=nu0 -- preserving the same "nu0 is where the model turns over"
+    meaning every other SSA/thermal model already has (see
+    source_function's own docstring). That requires j(z) evaluated at
+    exactly nu=nu0 too (`emiss_den_z_nu0` below), independent of whatever
+    wavelengths `nu`/`lam` this call actually needs -- mirrors stokes_I's
+    own raw_ref pattern (re-evaluating at a fixed reference frequency)."""
+    prefix_j = _cumtrapz0(emiss_den_zw, z[:, 0])
+    w_zw = prefix_j[-1:, :] - prefix_j            # W(z,nu): (n_grid, n_lambda)
+    s_bare_nu = source_function(nu, nu0, alpha_val, shape, T=T_val, beta=beta_val,
+                                 apply_escape=False)                          # (1, n_lambda)
+
+    nu0_arr = np.array([[nu0]])
+    lam0_arr = np.array([[C / nu0 / 1e6]])
+    emiss_den_z_nu0 = np.abs(_eval_zw(emiss_fn, z, nu0_arr, lam0_arr, 1.0, chi0_val, phi0_val, consts))
+    emiss_den_z_nu0 = np.where((z >= j_lo) & (z <= j_hi), emiss_den_z_nu0, 0.0)
+    w_total_nu0 = np.trapz(emiss_den_z_nu0[:, 0], z[:, 0])
+    s_bare_nu0 = source_function(nu0_arr, nu0, alpha_val, shape, T=T_val, beta=beta_val,
+                                  apply_escape=False)[0, 0]
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        amplitude = s_bare_nu0 / w_total_nu0 if w_total_nu0 > 0 else 0.0
+        tau_zw = np.nan_to_num(amplitude * w_zw / s_bare_nu, nan=0.0, posinf=1e300, neginf=0.0)
+    return np.exp(-tau_zw)
+
+
 def _custom_P_raw(emiss_fn, phi_fn, consts, p0_val, chi0_val, phi0_val,
-                   x, j_lo, j_hi, p_lo, p_hi, n):
+                   x, j_lo, j_hi, p_lo, p_hi, n,
+                   shape='powerlaw', nu0=None, alpha_val=None, T_val=None, beta_val=None):
     """P(x) = integral_{j_lo}^{j_hi} j_p(z) dz / integral_{j_lo}^{j_hi} j(z) dz,
     the LOS integral custom_func actually needs, evaluated on an n-point z
     grid -- j_p(z) = emiss_fn(z) * e^{2i*phi(z)*lambda^2} (`emiss_fn` is the
@@ -1317,7 +1435,20 @@ def _custom_P_raw(emiss_fn, phi_fn, consts, p0_val, chi0_val, phi0_val,
     readable -- `x` there is only ever the subset of wavelengths
     custom_func has already determined are worth resolving (see its own
     `resolvable` mask), at whatever quadrature size `n` _custom_quad_n
-    decided that subset needs."""
+    decided that subset needs.
+
+    `shape` is the live Spectrum-box shape (models.SPECTRAL_SHAPE) custom_func
+    passes in; only 'ssa'/'thermal' (with `nu0`/`alpha_val`/`T_val`/`beta_val`
+    -- that component's own turnover/spectral-index/temperature/curvature)
+    add a genuine per-z opacity attenuation on top of the always-optically-
+    thin integral above (see _custom_opacity_attenuation) -- 'powerlaw'/
+    'logparabola' behave exactly as before this existed. Opacity only
+    changes P(lambda)'s own *shape* when something else in the integrand
+    also varies with z (an internal phi'(z), or a spatial gradient in
+    j_p(z) itself) -- a spatially-uniform emissivity with a purely external
+    Faraday screen cancels it out exactly between this numerator and
+    denominator, same as it already does for the plain spectral index (see
+    stokes_I's own docstring)."""
     z = np.linspace(-1.0, 1.0, n)[:, None]      # (n_grid, 1) -- full LOS
     lam = x[None, :]                            # (1, n_lambda)
     nu = (C / x / 1e6)[None, :]                 # (1, n_lambda) MHz
@@ -1334,6 +1465,12 @@ def _custom_P_raw(emiss_fn, phi_fn, consts, p0_val, chi0_val, phi0_val,
     # expression need not be linear in p0 (e.g. 'p0**2*exp(2*i*chi0)+w').
     emiss_den_zw = np.abs(_eval_zw(emiss_fn, z, nu, lam, 1.0, chi0_val, phi0_val, consts))
     emiss_den_zw = np.where((z >= j_lo) & (z <= j_hi), emiss_den_zw, 0.0)
+    if shape in ('ssa', 'thermal'):
+        atten_zw = _custom_opacity_attenuation(
+            emiss_fn, consts, chi0_val, phi0_val, j_lo, j_hi, z, nu, lam, emiss_den_zw,
+            shape, nu0, alpha_val, T_val, beta_val)
+        emiss_num_zw = emiss_num_zw * atten_zw
+        emiss_den_zw = emiss_den_zw * atten_zw
     # phi_prime_zw is left complex too -- phi'(z) (the Faraday-depth
     # *density*) may itself use 'i', e.g. 'phi0 + i*sigma' adding a
     # wavelength-dependent exponential damping/growth on top of the
@@ -1363,14 +1500,15 @@ def _custom_P_raw(emiss_fn, phi_fn, consts, p0_val, chi0_val, phi0_val,
 
 def preview_los_profiles(emiss_expr, phi_expr, const_names, const_values,
                           p0_prev, chi0_prev, phi0_prev,
-                          nu_mhz, lambda_m, j_lo, j_hi, p_lo, p_hi, n=300):
-    """(z, emiss_p_z, phi_prime_z, phi_z) arrays over z in [-1,1] for the
-    custom-model builder dialog's own preview plot, already masked to
-    emiss(z)=0 outside [j_lo,j_hi] and phi'(z)=0 outside [p_lo,p_hi]
-    exactly like the registered model itself (see build_custom_model) --
-    `emiss_expr`/`phi_expr` already parsed (see parse_custom_expr),
-    `const_values` a plain list of numbers in the same order as
-    `const_names`, and `p0_prev`/`chi0_prev`/`phi0_prev` the preview values
+                          nu_mhz, lambda_m, j_lo, j_hi, p_lo, p_hi, n=300,
+                          shape='powerlaw', nu0=None, alpha_val=None, T_val=None, beta_val=None):
+    """(z, emiss_p_z, phi_prime_z, phi_z, emiss_p_z_attenuated) arrays over
+    z in [-1,1] for the custom-model builder dialog's own preview plot,
+    already masked to emiss(z)=0 outside [j_lo,j_hi] and phi'(z)=0 outside
+    [p_lo,p_hi] exactly like the registered model itself (see
+    build_custom_model) -- `emiss_expr`/`phi_expr` already parsed (see
+    parse_custom_expr), `const_values` a plain list of numbers in the same
+    order as `const_names`, and `p0_prev`/`chi0_prev`/`phi0_prev` the preview values
     to evaluate p0/chi0/phi0 at if `emiss_expr`/`phi_expr` reference them
     (they're ordinary symbols now, not applied automatically -- see the
     module comment above). `nu_mhz`/`lambda_m` are the single
@@ -1397,7 +1535,19 @@ def preview_los_profiles(emiss_expr, phi_expr, const_names, const_values,
     matching prefix/total-minus-prefix construction for why. Not used by
     the registered model itself -- that's custom_func, built (with its own
     adaptive-resolution quadrature grid, not this fixed n=300 preview one)
-    by build_custom_model below."""
+    by build_custom_model below.
+
+    `shape`/`nu0`/`alpha_val`/`T_val`/`beta_val` mirror _custom_P_raw's own
+    opacity inputs, except sourced from the builder dialog's own preview-
+    only Spectral-model dropdown (build_model.py) rather than a real,
+    registered model's live Spectrum-box selection -- there is no such
+    model yet at Define-time. When `shape` is 'ssa'/'thermal',
+    `emiss_p_z_attenuated` is `emiss_p_z` with the same per-z e^{-tau(z)}
+    envelope _custom_P_raw applies (via _custom_opacity_attenuation)
+    multiplied in, so the builder's own preview plot can show what
+    actually gets integrated once opacity is included, next to the
+    unattenuated shape as typed; otherwise it's identical to `emiss_p_z`
+    (no opacity to show)."""
     z = np.linspace(-1.0, 1.0, n)
     emiss_fn = _lambdify_zw(emiss_expr, const_names)
     phi_fn = _lambdify_zw(phi_expr, const_names)
@@ -1409,7 +1559,17 @@ def preview_los_profiles(emiss_expr, phi_expr, const_names, const_values,
     phi_prime_z = np.where((z >= p_lo) & (z <= p_hi), phi_prime_z, 0.0)
     prefix_z = _cumtrapz0(phi_prime_z, z)
     phi_z = prefix_z[-1] - prefix_z
-    return z, emiss_p_z, phi_prime_z, phi_z
+    if shape in ('ssa', 'thermal'):
+        emiss_den_z = np.abs(_eval_zw(emiss_fn, z, nu_mhz, lambda_m, 1.0, chi0_prev, phi0_prev, const_values))
+        emiss_den_z = np.where((z >= j_lo) & (z <= j_hi), emiss_den_z, 0.0)
+        atten_z = _custom_opacity_attenuation(
+            emiss_fn, const_values, chi0_prev, phi0_prev, j_lo, j_hi,
+            z[:, None], np.array([[nu_mhz]]), np.array([[lambda_m]]), emiss_den_z[:, None],
+            shape, nu0, alpha_val, T_val, beta_val)[:, 0]
+        emiss_p_z_attenuated = emiss_p_z * atten_z
+    else:
+        emiss_p_z_attenuated = emiss_p_z
+    return z, emiss_p_z, phi_prime_z, phi_z, emiss_p_z_attenuated
 
 
 def preview_custom_bounds(j_lo_expr, j_hi_expr, p_lo_expr, p_hi_expr, const_names, const_values,
@@ -1436,15 +1596,27 @@ def preview_custom_bounds(j_lo_expr, j_hi_expr, p_lo_expr, p_hi_expr, const_name
 
 
 # The custom-model builder dialog's "Kind" dropdown for a discovered
-# constant maps straight onto these five existing Param.kind values -- a
-# custom constant marked this way gets exactly the same slider behavior
-# (log-scale depth, log-scale dispersion, degree-display angle,
-# percent-display fraction, or a plain linear number) as a built-in
-# model's own p_0/X_0/phi/dphi param, for free, via app.ParamSlider.
-# eps/alpha/nu0/temp still aren't offered here -- a custom model always
-# gets one alpha automatically (spectral_param_single) and has no second
-# component to blend or turnover of its own.
-CUSTOM_PARAM_KINDS = ('p', 'X', 'phi', 'dphi', 'scale')
+# constant maps straight onto these Param.kind values -- a custom constant
+# marked this way gets exactly the same slider behavior (log-scale depth,
+# log-scale dispersion, degree-display angle, percent-display fraction, a
+# plain linear number, or -- 'freq'/'wave' -- a log-scale frequency
+# [MHz]/wavelength [m], for a constant meant to set the model's own
+# characteristic spectral scale, e.g. a break frequency inside j_p(z)
+# itself, distinct from the shared nu0 turnover the main window's own
+# Spectrum box controls) as a built-in model's own p_0/X_0/phi/dphi param,
+# for free, via app.ParamSlider. 'freq'/'wave' deliberately aren't the
+# same kind as the Spectrum box's own 'nu0' (which works -- and is labeled
+# -- in GHz, converted to MHz only by app.py's own sync_spectrum_ui right
+# before it reaches set_spectral_shape): a discovered constant's value
+# reaches j_p(z)/phi'(z) with no such conversion step of its own, so
+# giving it 'nu0' would silently hand a GHz-valued number to an expression
+# where the reserved 'nu' symbol is MHz-valued -- 'freq' avoids that by
+# being MHz (matching 'nu') from end to end, with its own Param.kind so
+# app.ParamSlider can tell the two apart. eps/alpha/nu0/temp still aren't
+# offered here -- a custom model always gets one alpha automatically
+# (spectral_param_single) and has no second component to blend or shared
+# turnover of its own to duplicate.
+CUSTOM_PARAM_KINDS = ('p', 'X', 'phi', 'dphi', 'scale', 'freq', 'wave')
 
 # Names that would collide with either the reserved line-of-sight
 # coordinate or the model's own always-present spectral param (alpha, see
@@ -1724,17 +1896,24 @@ def build_custom_model(label, emiss_str, phi_str, param_specs,
     closed-form factor the way the old design did (see the module comment
     above).
 
-    `param_specs` is a {constant_name: (kind, lo, hi)} dict covering every
-    *other* free symbol `emiss_str`/`phi_str` introduce, i.e. excluding the
-    reserved z/nu/lambda/p0/chi0/phi0 (see discover_custom_params) -- `kind`
-    one of CUSTOM_PARAM_KINDS (picked via the builder dialog's own "Kind"
-    dropdown; see its module docstring), `lo`/`hi` already in that kind's
-    own physical units (radians for 'X', a 0-1 fraction for 'p', rad/m^2
-    for 'phi', as-is for 'scale' -- i.e. the same units app.ParamSlider
-    expects in spec.bounds for that kind, not necessarily what the dialog
-    displayed to the user). Plain ValueError if any constant is missing or
-    its kind isn't recognized (a caller bug, not a user-input problem --
-    the builder dialog always derives param_specs from
+    `param_specs` is a {constant_name: (kind, lo, hi[, description])} dict
+    covering every *other* free symbol `emiss_str`/`phi_str` introduce,
+    i.e. excluding the reserved z/nu/lambda/p0/chi0/phi0 (see
+    discover_custom_params) -- `kind` one of CUSTOM_PARAM_KINDS (picked
+    via the builder dialog's own "Kind" dropdown; see its module
+    docstring), `lo`/`hi` already in that kind's own physical units
+    (radians for 'X', a 0-1 fraction for 'p', rad/m^2 for 'phi', as-is for
+    'scale' -- i.e. the same units app.ParamSlider expects in spec.bounds
+    for that kind, not necessarily what the dialog displayed to the
+    user). The optional trailing `description` (the dialog's own
+    Description column, see build_model.py) becomes that constant's
+    Param.description -- shown as its slider's tooltip in the main window
+    exactly like p0/chi0/phi0's own fixed tooltips (see app.ParamSlider)
+    -- falling back to a generic "User-defined constant '<name>'." when
+    omitted (every 3-element tuple, e.g. from a 'custom_definition' saved
+    before this) or left blank. Plain ValueError if any constant is
+    missing or its kind isn't recognized (a caller bug, not a user-input
+    problem -- the builder dialog always derives param_specs from
     discover_custom_params's own output first, restricted to a valid Kind
     dropdown selection).
 
@@ -1849,10 +2028,18 @@ def build_custom_model(label, emiss_str, phi_str, param_specs,
         value for can't be trusted (see below for the ones it doesn't even
         try).
 
-        (x, params)-keyed cache (see CUSTOM_FUNC_CACHE_MAX) -- checked/
-        filled around the actual computation below, transparently to every
-        caller."""
-        cache_key = (x.tobytes(), tuple(np.asarray(params, dtype=np.float64)))
+        (x, params, spectral-shape)-keyed cache (see CUSTOM_FUNC_CACHE_MAX)
+        -- checked/filled around the actual computation below,
+        transparently to every caller. SPECTRAL_SHAPE/SPECTRAL_NU0/
+        SPECTRAL_TEMP/SPECTRAL_BETA have to be part of the key (not just
+        `params`) now too -- unlike every other model, this one's own
+        result can depend on them directly, via the SSA/thermal opacity
+        term (see _custom_P_raw/_custom_opacity_attenuation); without this,
+        flipping the main window's Spectrum box between Power-law and SSA
+        for the same model/params would keep returning the *other* shape's
+        already-cached P(lambda)."""
+        cache_key = (x.tobytes(), tuple(np.asarray(params, dtype=np.float64)),
+                     SPECTRAL_SHAPE, SPECTRAL_NU0, SPECTRAL_TEMP, SPECTRAL_BETA)
         cached = _cache.get(cache_key)
         if cached is not None:
             _cache.move_to_end(cache_key)
@@ -1870,6 +2057,7 @@ def build_custom_model(label, emiss_str, phi_str, param_specs,
         chi0 = params[1]
         phi0_val = params[2]
         consts = params[3:3 + n_const]
+        alpha_val = params[3 + n_const]
         # j_lo/j_hi/p_lo/p_hi are typically just the Define-time literal
         # again (every _eval_bound call below a no-op past the lambdify),
         # but re-evaluated here rather than reused from the closure so a
@@ -1959,9 +2147,17 @@ def build_custom_model(label, emiss_str, phi_str, param_specs,
         # for phi_fn) are already applied inside it, via emiss_fn/phi_fn
         # being called with their actual current values, not as a separate
         # closed-form factor the way the old design applied p0*e^{2i*chi0}
-        # here.
-        result[resolvable] = _custom_P_raw(emiss_fn, phi_fn, consts,
-                                            p0_val, chi0, phi0_val, x_res, j_lo, j_hi, p_lo, p_hi, n)
+        # here. shape/nu0/T/beta are read straight off the live, shared
+        # Spectrum-box globals (same ones stokes_I itself reads) rather than
+        # threaded through params -- opacity is gated purely on whichever
+        # shape the main window currently has selected for this model, not
+        # a choice baked in at Define-time (see build_model.py's own
+        # Spectral-model dropdown, which only ever previews this).
+        nu_res = C / x_res / 1e6
+        result[resolvable] = _custom_P_raw(
+            emiss_fn, phi_fn, consts, p0_val, chi0, phi0_val, x_res, j_lo, j_hi, p_lo, p_hi, n,
+            shape=SPECTRAL_SHAPE, nu0=reference_nu(nu_res),
+            alpha_val=alpha_val, T_val=SPECTRAL_TEMP, beta_val=SPECTRAL_BETA)
         return cache_and_return(result)
 
     _cache = OrderedDict()  # see CUSTOM_FUNC_CACHE_MAX; one cache per custom model, not shared
@@ -1973,10 +2169,18 @@ def build_custom_model(label, emiss_str, phi_str, param_specs,
     custom_func.__qualname__ = func_name
 
     title = title or label
+    # param_specs[n][3] (the dialog's own Description column, see
+    # build_model.py) if present and non-blank, else a generic fallback --
+    # covers both a 3-element tuple (no description column existed yet
+    # when it was written, e.g. a 'custom_definition' saved before this)
+    # and a 4-element one where the user simply left it blank.
+    const_descriptions = {n: (param_specs[n][3] if len(param_specs[n]) > 3 and param_specs[n][3]
+                               else f"User-defined constant '{n}'.")
+                           for n in const_names}
     params = ([Param('p0', r'$p_0$', 'p', "Intrinsic fractional polarization amplitude -- referenced as 'p0' in j_p(z)."),
                Param('X_0', r'$\chi_0$', 'X', "Intrinsic EVPA (overall constant phase) -- referenced as 'chi0' in j_p(z)."),
                Param('phi0', r'$\phi_0$', 'phi', "Faraday-depth scale -- referenced as 'phi0' in j_p(z)/phi'(z).")]
-              + [Param(n, _custom_param_latex(n), param_specs[n][0], f"User-defined constant '{n}'.")
+              + [Param(n, _custom_param_latex(n), param_specs[n][0], const_descriptions[n])
                  for n in const_names]
               + spectral_param_single())
     lo = ([CUSTOM_P0_BOUNDS[0], -np.pi / 2, CUSTOM_PHI0_BOUNDS[0]]

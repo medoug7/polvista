@@ -13,9 +13,11 @@ from PyQt5.QtWidgets import QLineEdit
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.collections import LineCollection
+import matplotlib.transforms as mtransforms
 
 from polvista.models import C, stokes_I, stokes_QU, stokes_components, evpa, pol
 from polvista.measurements import RAINBOW_HUE_MAX
+from polvista.rm_synthesis import sci_latex
 
 SLIDER_STEPS = 10000  # integer resolution backing each QSlider
 
@@ -31,7 +33,7 @@ QU_POLAR_MAX_SEGMENTS = 500
 
 # Physical unit shown next to each slider's readout, keyed by Param.kind.
 UNITS = {'p': '%', 'X': '°', 'phi': 'rad/m²', 'dphi': 'rad/m²', 'scale': '', 'alpha': '', 'eps': '',
-         'nu0': 'GHz', 'temp': 'K'}
+         'nu0': 'GHz', 'temp': 'K', 'freq': 'MHz', 'wave': 'm'}
 # Widest unit string, used to fix every slider's unit label to the same
 # width so the value boxes above/below each other line up regardless of
 # which unit (or none) a given row happens to show.
@@ -58,7 +60,7 @@ class ValueLineEdit(QLineEdit):
 # apply_fixed_margins). Sized generously from measured worst cases (long
 # negative numbers, scientific notation, wide mathtext labels) so the
 # right-side rotated ylabel + tick labels are always fully visible
-PLOT_MARGINS_PX = dict(left=85, right=125, bottom=95, top=25)
+PLOT_MARGINS_PX = dict(left=85, right=125, bottom=95, top=40)
 
 # Continuous version of measurements.py's band_colors() red->violet HSV
 # sweep (same RAINBOW_HUE_MAX endpoint), used to color StokesPlot's Polar
@@ -809,3 +811,115 @@ class StokesPlot(FigureCanvas):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         apply_fixed_margins(self.fig, self, extra_adjust={'wspace': 0.0})
+
+
+class RMSynthPlot(FigureCanvas):
+    """The 'RM-synth' tab's canvas -- the Faraday-depth spectrum |F(phi)|
+    from RM synthesis + RM-CLEAN (see rm_synthesis.compute_faraday_spectrum).
+
+    Unlike ModelPlot/StokesPlot, nothing here is wired to a slider drag or
+    the wavelength-range spin boxes: it only ever changes when the user
+    explicitly picks a source via the 'Synthesize from' buttons (see
+    app.MainWindow.rmsynth_from_model/_data/_measurements), each of which
+    calls plot_spectrum() and replaces whatever was drawn before outright.
+    set_empty() is the only other entry point, used both at startup and to
+    show a plausible phi axis range (from the current wavelength selection,
+    see app.MainWindow.refresh_rmsynth_empty_axis) whenever nothing has
+    been synthesized yet, or the last synthesized source's own data has
+    been cleared (Clear data / the Measurements tab's Clear).
+
+    A plain ax.clear() + full redraw is used throughout (unlike those other
+    two canvases' careful set_data()-only updates) since redraws here are
+    rare, user-initiated events, not something that has to keep up with a
+    slider drag."""
+
+    def __init__(self, parent=None):
+        self.fig = Figure(figsize=(10, 4))
+        super().__init__(self.fig)
+        self.setParent(parent)
+        self.ax = self.fig.subplots()
+        apply_fixed_margins(self.fig, self)
+        self.set_empty(1.0)
+
+    def _style_axes(self, exponent=0):
+        self.ax.set_xlabel(rf'Faraday depth $\phi$  [ $10^{{{exponent}}}$ rad m$^{{-2}}$ ]')
+        self.ax.set_ylabel(r'$|F(\phi)|$  [ fractional polarization ]')
+        self.ax.grid(True, linestyle='dotted')
+
+    def set_empty(self, phi_half_width):
+        """Reset to a blank plot spanning +/-`phi_half_width` [rad/m^2] --
+        the range of Faraday depths reachable by the currently selected
+        wavelength range (see rm_synthesis.phi_axis_half_width), with
+        nothing plotted yet."""
+        self.ax.clear()
+        phi_half_width = max(phi_half_width, 1e-30)
+        exponent = int(np.floor(np.log10(phi_half_width)))
+        self._style_axes(exponent)
+        scale = 10.0 ** exponent
+        self.ax.set_xlim(-phi_half_width / scale, phi_half_width / scale)
+        self.ax.set_ylim(0, 1)
+        apply_fixed_margins(self.fig, self)
+        self.draw_idle()
+
+    def plot_spectrum(self, result, source_label):
+        """Draw the dirty/clean Faraday spectrum from `result` (an
+        rm_synthesis.compute_faraday_spectrum() return dict); `source_label`
+        ('model'/'data'/'measurements') only affects the title."""
+        self.ax.clear()
+        ax = self.ax
+        phi = result['phi']
+        exponent = int(np.floor(np.log10(phi[-1]))) if phi[-1] > 0 else 0
+        self._style_axes(exponent)
+        scale = 10.0 ** exponent
+        phi = phi / scale
+        amp_dirty = np.abs(result['F_dirty'])
+        amp_clean = np.abs(result['F_clean'])
+
+        ax.plot(phi, amp_dirty, color='grey', ls='dashed', lw=1, label=r'$|F(\phi)|$ dirty')
+        ax.plot(phi, amp_clean, color='tab:green', lw=1.5, label=r'$|F(\phi)|$ clean')
+
+        nz = np.nonzero(result['components'])[0]
+        if len(nz):
+            markerline, _, _ = ax.stem(
+                phi[nz], np.abs(result['components'][nz]), linefmt='tab:orange',
+                markerfmt='o', basefmt=' ', label='CLEAN components')
+            markerline.set_markersize(4)
+            markerline.set_markerfacecolor('white')
+            markerline.set_markeredgecolor('tab:orange')
+
+        sigma_fdf = result['sigma_fdf']
+        if sigma_fdf > 0:
+            ax.axhline(sigma_fdf, color='r', lw=1, ls='dotted', label=r'$\sigma_{noise}$')
+
+        phi_peak, phi_err, fwhm = result['phi_peak'], result['phi_err'], result['fwhm']
+        ax.axvline(phi_peak / scale, color='k', lw=0.8, ls=':')
+        err = phi_err if np.isfinite(phi_err) else None
+        label = (r'$\phi_{\rm peak} = $' + sci_latex(phi_peak, err) + '\n'
+                  + r'RMSF $= $' + sci_latex(fwhm))
+        ax.annotate(label, xy=(0.03, 0.92), xycoords='axes fraction', color='k', va='top')
+
+        # RMSF "beam" scale bar -- a solid black horizontal segment, length =
+        # the RMSF main-lobe FWHM (in the plot's own phi units, see
+        # exponent/scale above), directly below the phi_peak/RMSF text so
+        # its extent reads as that RMSF value's own visual scale -- same
+        # device as RM_synth.py's own plot_clean.
+        beam_trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
+        beam_y = 0.78
+        beam_x0 = phi[0] + 0.03 * (phi[-1] - phi[0])
+        beam_x1 = beam_x0 + fwhm / scale
+        ax.plot([beam_x0, beam_x1], [beam_y, beam_y], color='k', lw=2,
+                solid_capstyle='butt', transform=beam_trans)
+        cap = 0.01
+        for x in (beam_x0, beam_x1):
+            ax.plot([x, x], [beam_y - cap, beam_y + cap], color='k', lw=2, transform=beam_trans)
+
+        ax.set_xlim(phi[0], phi[-1])
+        ax.set_ylim(0, 1.3 * max(np.max(amp_dirty), np.max(amp_clean), 1e-12))
+        ax.set_title(f'Faraday spectrum -- from {source_label}')
+        ax.legend(loc='upper right', fontsize=12)
+        apply_fixed_margins(self.fig, self)
+        self.draw_idle()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        apply_fixed_margins(self.fig, self)
