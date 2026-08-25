@@ -27,3 +27,6 @@ polvista = "polvista.app:main"
 [tool.setuptools]
 packages = ["polvista"]
 package-dir = { "polvista" = "." }
+
+[tool.setuptools.package-data]
+polvista = ["help/*.tex"]
