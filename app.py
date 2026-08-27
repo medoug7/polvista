@@ -829,6 +829,23 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         rmsynth_top_row = QHBoxLayout()
         rmsynth_top_row.addWidget(self.rmsynth_toolbar)
         rmsynth_top_row.addStretch(1)
+        rmsynth_top_row.addWidget(QLabel('robust='))
+        self.rmsynth_robust = QDoubleSpinBox()
+        # Standard Briggs robust range: +2 -> natural (inverse-noise-
+        # variance) weighting, maximizing sensitivity at the cost of a
+        # broader RMSF; -2 -> uniform weighting, minimizing RMSF sidelobes/
+        # broadening at the cost of sensitivity (see briggs_weights and
+        # Heald 2009 Sec. 2.4, which only ever compares those two extremes).
+        self.rmsynth_robust.setRange(-2.0, 2.0)
+        self.rmsynth_robust.setDecimals(1)
+        self.rmsynth_robust.setSingleStep(0.1)
+        self.rmsynth_robust.setValue(2.0)
+        self.rmsynth_robust.setToolTip(
+            "Briggs robust parameter for weighting RM synthesis channels: "
+            "+2 = natural weighting (best sensitivity), -2 = uniform "
+            "weighting (best resolution/lowest sidelobes).")
+        self.rmsynth_robust.valueChanged.connect(self.rerun_rmsynth)
+        rmsynth_top_row.addWidget(self.rmsynth_robust)
         rmsynth_top_row.addWidget(QLabel('Synthesize from:'))
         self.rmsynth_model_button = QPushButton('model')
         self.rmsynth_model_button.setToolTip(
@@ -1375,12 +1392,25 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         RM-synth tab showed before -- and remember which source it came
         from (see self.rmsynth_source)."""
         try:
-            result = compute_faraday_spectrum(wl, q, u, q_err, u_err)
+            result = compute_faraday_spectrum(wl, q, u, q_err, u_err, robust=self.rmsynth_robust.value())
         except FaradaySpectrumError as e:
             QMessageBox.warning(self, 'RM synthesis', str(e))
             return
         self.rmsynth_canvas.plot_spectrum(result, source)
         self.rmsynth_source = source
+
+    def rerun_rmsynth(self, *_):
+        """robust= spin box's valueChanged: re-run RM synthesis on whatever
+        source is currently plotted (if any) so changing the weighting
+        updates the Faraday spectrum immediately, without requiring another
+        Synthesize from click. A no-op while the tab is still empty."""
+        source = self.rmsynth_source
+        if source == 'model':
+            self.rmsynth_from_model()
+        elif source == 'data':
+            self.rmsynth_from_data()
+        elif source == 'measurements':
+            self.rmsynth_from_measurements()
 
     def rmsynth_from_model(self):
         """'model' button: Faraday spectrum of the model curve over the

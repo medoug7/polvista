@@ -56,11 +56,23 @@ class ValueLineEdit(QLineEdit):
         self.selectAll()
 
 
-# Fixed PIXEL margins for the two plot canvases below (not fractions -- see
-# apply_fixed_margins). Sized generously from measured worst cases (long
+# Fixed PIXEL margins for the three plot canvases below (not fractions --
+# see apply_fixed_margins). Sized generously from measured worst cases (long
 # negative numbers, scientific notation, wide mathtext labels) so the
-# right-side rotated ylabel + tick labels are always fully visible
-PLOT_MARGINS_PX = dict(left=85, right=125, bottom=95, top=40)
+# right-side rotated ylabel + tick labels are always fully visible.
+# ModelPlot (p, chi vs lambda^2) and RMSynthPlot (Faraday spectrum) use this
+# one directly; StokesPlot needs more left room (see STOKES_MARGINS_PX).
+PLOT_MARGINS_PX = dict(left=80, right=125, bottom=95, top=40)
+
+# StokesPlot's own margins -- wider left than PLOT_MARGINS_PX: ax_I is
+# log-scaled, and a sub-decade y-range (e.g. Stokes I over a narrow band
+# like Standard ALMA, where the spectral index alone doesn't swing I across
+# a full decade) makes matplotlib label *minor* ticks too (e.g. '4x10^-1'),
+# which are wider than the plain 'x10^n' decade labels
+# _bound_yaxis_ticklabels's scilimits assumes -- and that formatter doesn't
+# apply to a log axis at all (ax.ticklabel_format raises on one), so ax_I's
+# ylabel needs the extra room unconditionally.
+STOKES_MARGINS_PX = dict(PLOT_MARGINS_PX, left=120)
 
 # Continuous version of measurements.py's band_colors() red->violet HSV
 # sweep (same RAINBOW_HUE_MAX endpoint), used to color StokesPlot's Polar
@@ -70,14 +82,14 @@ QU_RAINBOW_CMAP = mcolors.ListedColormap(
     [colorsys.hsv_to_rgb(RAINBOW_HUE_MAX * t, 1.0, 1.0) for t in np.linspace(0, 1, 256)])
 
 
-def apply_fixed_margins(fig, canvas, extra_adjust=None):
-    """Set fig.subplots_adjust margins from PLOT_MARGINS_PX, converted to
-    the fractions matplotlib wants using the canvas's *current* pixel size
-    """
+def apply_fixed_margins(fig, canvas, extra_adjust=None, margins=PLOT_MARGINS_PX):
+    """Set fig.subplots_adjust margins from `margins` (PLOT_MARGINS_PX by
+    default, STOKES_MARGINS_PX for StokesPlot), converted to the fractions
+    matplotlib wants using the canvas's *current* pixel size."""
 
     w = max(canvas.width(), 1)
     h = max(canvas.height(), 1)
-    m = PLOT_MARGINS_PX
+    m = margins
     left_px, right_px = m['left'], m['right']
     bottom_px, top_px = m['bottom'], m['top']
     # Guard against pathologically narrow/short windows where the fixed
@@ -94,6 +106,21 @@ def apply_fixed_margins(fig, canvas, extra_adjust=None):
     fig.subplots_adjust(left=left_px / w, right=1 - right_px / w,
                         bottom=bottom_px / h, top=1 - top_px / h,
                         **(extra_adjust or {}),)
+
+
+def _bound_yaxis_ticklabels(ax):
+    """Force the y-axis into matplotlib's compact offset/scientific form
+    (a single shared '10^n' multiplier, not per-tick scientific notation)
+    once its values fall outside [0.01, 1000) -- e.g. a weak-polarization
+    model/source whose p or |F(phi)| peaks at, say, 1e-4 would otherwise
+    get plain-decimal ticks like '0.00014': wide enough to push the
+    auto-positioned ylabel past PLOT_MARGINS_PX's fixed left budget and
+    off the edge of the canvas entirely (that budget assumes ordinary-
+    looking numbers, not open-ended decimal precision). Bounding the
+    format keeps tick-label width -- and therefore the auto-computed
+    ylabel position -- within what the fixed margins were sized for,
+    regardless of how small/large the data actually gets."""
+    ax.ticklabel_format(style='sci', axis='y', scilimits=(-2, 3), useMathText=True)
 
 
 def _finite_bounds(arr, fallback):
@@ -146,8 +173,15 @@ class ModelPlot(FigureCanvas):
         # doesn't change between frames (labels, grid) is set only once.
         self.ax_p.set_ylabel(r'$p$ [ % ]')
         self.ax_p.grid(True)
-        self.ax_x.set_ylabel(r'$\chi$ [ deg ]', rotation=270, labelpad=15)
+        _bound_yaxis_ticklabels(self.ax_p)
+        # labelpad=25 (not the default ~4): rotation=270 + tick_right()
+        # above put this ylabel right next to its own tick labels rather
+        # than the usual comfortable gap a left-side ylabel gets "for
+        # free" from the tick marks sitting between it and the axis --
+        # the default pad reads as touching/crowded against them.
+        self.ax_x.set_ylabel(r'$\chi$ [ deg ]', rotation=270, labelpad=25)
         self.ax_x.grid(True)
+        _bound_yaxis_ticklabels(self.ax_x)
         self.line_p, = self.ax_p.plot([], [], color='tab:blue')
         self.line_x, = self.ax_x.plot([], [], color='tab:red')
         self.xscale = None  # forces the first set_xscale('log') call to actually apply
@@ -387,7 +421,7 @@ class StokesPlot(FigureCanvas):
         super().__init__(self.fig)
         self.setParent(parent)
         self.ax_I, self.ax_QU = self.fig.subplots(1, 2, gridspec_kw={'wspace': 0})
-        apply_fixed_margins(self.fig, self, extra_adjust={'wspace': 0.0})
+        apply_fixed_margins(self.fig, self, extra_adjust={'wspace': 0.0}, margins=STOKES_MARGINS_PX)
 
         self.ax_I.set_xlabel(r'$\nu$ [ GHz ]')
         self.ax_I.set_ylabel(r'$I$ [ normalized ]')
@@ -475,7 +509,10 @@ class StokesPlot(FigureCanvas):
         n_samples = len(self.posterior_samples) if self.posterior_samples is not None else 0
         if self.mode == 'Polar':
             self.ax_QU.set_xlabel(r'$q$')
-            self.ax_QU.set_ylabel(r'$u$', rotation=270, labelpad=15)
+            # labelpad=25, not the default ~4 -- see ModelPlot.ax_x's own
+            # comment (same rotation=270 + tick_right() crowding).
+            self.ax_QU.set_ylabel(r'$u$', rotation=270, labelpad=25)
+            _bound_yaxis_ticklabels(self.ax_QU)
             self.line_Q = self.line_U = None
             self.line_Q1 = self.line_U1 = self.line_Q2 = self.line_U2 = None
             self.line_QU = LineCollection([], cmap=QU_RAINBOW_CMAP, norm=mcolors.Normalize(0, 1), zorder=3)
@@ -489,7 +526,8 @@ class StokesPlot(FigureCanvas):
             self.ax_QU.hlines(y=0.0, xmin=-xlim[1], xmax=xlim[1], linestyle='dashed', color='k')
         else:
             self.ax_QU.set_xlabel(r'$\nu$ [ GHz ]')
-            self.ax_QU.set_ylabel(r'$Q$, $U$ [ normalized ]', rotation=270, labelpad=15)
+            self.ax_QU.set_ylabel(r'$Q$, $U$ [ normalized ]', rotation=270, labelpad=25)
+            _bound_yaxis_ticklabels(self.ax_QU)
             self.ax_QU.set_xscale(self.xscale or 'linear')
             self.line_QU = None
             self.line_Q, = self.ax_QU.plot([], [], color='green', label=r'$Q$')
@@ -810,7 +848,7 @@ class StokesPlot(FigureCanvas):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        apply_fixed_margins(self.fig, self, extra_adjust={'wspace': 0.0})
+        apply_fixed_margins(self.fig, self, extra_adjust={'wspace': 0.0}, margins=STOKES_MARGINS_PX)
 
 
 class RMSynthPlot(FigureCanvas):
@@ -845,6 +883,7 @@ class RMSynthPlot(FigureCanvas):
         self.ax.set_xlabel(rf'Faraday depth $\phi$  [ $10^{{{exponent}}}$ rad m$^{{-2}}$ ]')
         self.ax.set_ylabel(r'$|F(\phi)|$  [ fractional polarization ]')
         self.ax.grid(True, linestyle='dotted')
+        _bound_yaxis_ticklabels(self.ax)
 
     def set_empty(self, phi_half_width):
         """Reset to a blank plot spanning +/-`phi_half_width` [rad/m^2] --
@@ -895,7 +934,7 @@ class RMSynthPlot(FigureCanvas):
         ax.axvline(phi_peak / scale, color='k', lw=0.8, ls=':')
         err = phi_err if np.isfinite(phi_err) else None
         label = (r'$\phi_{\rm peak} = $' + sci_latex(phi_peak, err) + '\n'
-                  + r'RMSF $= $' + sci_latex(fwhm))
+                  + r'$R(\phi) = $' + sci_latex(fwhm))
         ax.annotate(label, xy=(0.03, 0.92), xycoords='axes fraction', color='k', va='top')
 
         # RMSF "beam" scale bar -- a solid black horizontal segment, length =
