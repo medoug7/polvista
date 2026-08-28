@@ -19,13 +19,14 @@ from PyQt5.QtWidgets import (
     QPushButton, QFileDialog, QMessageBox, QStyle, QStyleOptionSlider,
     QStylePainter)
 
+import matplotlib.transforms as mtransforms
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
 from polvista.models import MODELS, MODELS_BY_NAME
-from polvista.fitting import multinest_fit, load_previous_run
+from polvista.fitting import multinest_fit, load_previous_run, expand_pars_errs
 from polvista.latex_stuff import latex_pixmap
 from polvista.widgets import ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDEST_UNIT
 
@@ -40,25 +41,188 @@ N_POSTERIOR_DRAWS = 40
 # Qualitative palette for non-winning mode families in the Corner plot tab
 # (see SamplingMixin.build_corner_tab), assigned in evidence-rank order --
 # mirrors qu_fit.py's corner_plot(); the winning family is always 'b'.
-FAMILY_PALETTE = ['tab:orange', 'tab:green', 'tab:red', 'tab:purple']
+FAMILY_PALETTE = ['#ff7f00', '#4daf4a', '#f781bf', '#a65628', '#984ea3',
+                   '#999999', '#e41a1c', '#dede00']
+
+# Gap (points, not a fraction of the panel -- see build_corner_tab's own
+# use of this) between each panel's rotated tick numbers and its own axis
+# label (x on the bottom row, y on the left column). Both x and y share
+# one value since matplotlib's own native, tick-aware auto-positioning
+# (build_corner_tab re-enables it, undoing corner.corner()'s own fixed
+# axes-*fraction* placement) measures the actual rendered tick-label
+# extent itself at every redraw -- unlike that fraction-based placement,
+# a single points value here already reads the same regardless of ndim,
+# font scaling, or how many digits a given fit's tick numbers happen to
+# have, so there's no separate x/y or per-model tuning to do.
+CORNER_LABELPAD_PT = 3.0
 
 
-def format_sci_title(latex, value, lo, hi):
+def sci_exponent(value):
+    """Power-of-ten exponent such that value/10**exponent lands in [1, 10)
+    (0 for value==0) -- used by build_corner_tab to auto-scale each phi/
+    dphi parameter's own corner column/row (axis label and panel content
+    alike) by its own magnitude instead of a fixed 10^5, and by
+    format_sci_title for that same panel's title, so both agree."""
+    return int(np.floor(np.log10(abs(value)))) if value != 0 else 0
+
+
+def format_sci_title(latex, value, lo, hi, exp):
     """'$\\phi=(1.23^{+0.45}_{-0.32})\\times10^{5}$'-style corner-panel
     title for a phi/dphi parameter: `value`/`lo`/`hi` (lo/hi already the
     *magnitudes* of the lower/upper uncertainty, not absolute bounds --
     see fitting.median_pctl_errs) in the parameter's own raw (unscaled,
-    rad/m^2) units, with an exponent picked from `value`'s own magnitude
-    so the mantissa lands in [1, 10) -- unlike the fixed 10^5 scaling
-    every other phi/dphi panel content uses (see build_corner_tab's
-    scale_map), which suits the shared plotted axis range but not a
-    single title's own value, which can land anywhere from ~10^2 to
-    ~10^6 depending on the parameter and the fit."""
-    exp = int(np.floor(np.log10(abs(value)))) if value != 0 else 0
+    rad/m^2) units, scaled by 10**`exp` (see sci_exponent -- build_corner_tab
+    passes the same exponent it used to scale this panel's plotted samples,
+    so the title's mantissa and the panel's own axis agree)."""
     scale = 10.0 ** exp
     v, l, h = value / scale, lo / scale, hi / scale
     name = latex.strip('$')
     return fr'${name}=({v:.2f}^{{+{h:.2f}}}_{{-{l:.2f}}})\times10^{{{exp}}}$'
+
+
+def fit_diagonal_titles(fig, ndim):
+    """Left-align (instead of corner.corner()'s default centered) whichever
+    of `fig`'s `ndim` diagonal-panel titles is currently too wide for its
+    own panel, so a long value/error string overflows only into the
+    always-empty upper-triangle space next to it rather than spilling
+    left into the real, populated panel in the same row -- lower-triangle
+    corner layouts keep that one populated, unlike the empty upper-
+    triangle side. Only worth the (no-longer-centered) trade once the
+    title actually doesn't fit, so this only flips a title once its
+    rendered width exceeds its axes' -- measured in real, dpi-aware
+    pixels via a forced draw, not guessed from character count.
+
+    Must be re-run (see build_corner_tab's canvas.mpl_connect call, and
+    its own module docstring on `size`) after every resize, not just once
+    at construction: Qt's FigureCanvasQT.resizeEvent() re-fits this same
+    figure's *inches* to whatever on-screen pixel footprint the Corner
+    tab actually ends up with, while every font (a point, hence fixed-
+    pixel, size) does not shrink or grow along with it -- so a title
+    measured as fitting at the figure's construction size can still end
+    up wider than its panel once the embedded canvas reaches its real
+    displayed size (typically *smaller*, hence tighter, since `size`
+    already overshoots that real footprint on purpose, more so the
+    larger ndim is -- see build_corner_tab), or, after a later resize,
+    the reverse. Each call re-checks (and resets any previously-flipped
+    title back to centered first) rather than assuming last call's
+    answer still holds."""
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    for i in range(ndim):
+        ax = fig.axes[i * ndim + i]
+        title = ax.title
+        if not title.get_text():
+            continue
+        title.set_horizontalalignment('center')
+        title.set_x(0.5)
+        if title.get_window_extent(renderer).width > ax.get_window_extent(renderer).width:
+            title.set_horizontalalignment('left')
+            title.set_x(0.0)
+
+
+def fit_corner_margins(fig, ndim):
+    """Grow `fig`'s outer left/bottom/top/right margins by however far its
+    actually-rendered content (tick labels, axis labels, the phi/dphi
+    titles build_corner_tab overwrites, the family legend) overflows the
+    figure bounds, rather than trusting corner.corner()'s own fixed
+    dim-based formula (sized for its own default, unscaled fonts -- too
+    tight once our larger ndim=4 fonts are in play, too generous once our
+    smaller ndim=8 ones shrink to fit).
+
+    Must be re-run (see build_corner_tab's canvas.mpl_connect call) after
+    every resize, not just once at construction, for the same reason
+    fit_diagonal_titles is: Qt's FigureCanvasQT.resizeEvent() re-fits this
+    same figure's *inches* to the Corner tab's real on-screen footprint,
+    so a margin fraction measured as generous enough at construction can
+    leave too little *absolute* room once the embedded canvas reaches its
+    real (typically smaller) displayed size -- visibly so, cutting off a
+    bottom-row axis label's descender/exponent -- and using the figure's
+    *current* width/height (rather than a single shared side length) also
+    matters here specifically because that real footprint is not
+    generally square the way this figure's construction size is."""
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    bbox = fig.get_tightbbox(renderer)
+    w_in, h_in = fig.get_size_inches()
+    # Denser plots pack more (smaller, tighter-spaced) tick/axis labels
+    # along each edge, so the same flat pad reads as comfortable headroom
+    # at ndim=4 but noticeably tighter once there's more of that small
+    # text lined up along it -- barely different for a 4-parameter model
+    # like burn, a bit more breathing room for an 8-parameter one like
+    # comp2RMdep.
+    pad_in = 0.06 + 0.025 * max(0, ndim - 4)
+    sp = fig.subplotpars
+    fig.subplots_adjust(
+        left=sp.left + max(0.0, pad_in - bbox.x0) / w_in,
+        bottom=sp.bottom + max(0.0, pad_in - bbox.y0) / h_in,
+        top=sp.top - max(0.0, bbox.y1 - h_in + pad_in) / h_in,
+        right=sp.right - max(0.0, bbox.x1 - w_in + pad_in) / w_in)
+
+
+def fit_corner_label_ink_pad(fig, bottom_axes, left_axes):
+    """Nudge each axis-label's own `labelpad` (see build_corner_tab's own
+    reset of these to matplotlib's native auto-positioning) so the
+    *visible ink* of every bottom-row x-label sits a consistent distance
+    below its tick numbers, and likewise for every left-column y-label --
+    on top of, not instead of, fig.align_xlabels()/align_ylabels()'s own
+    alignment.
+
+    Those two already place every label in a group at the *exact* same
+    anchor (verified directly: identical `label.get_position()` across a
+    whole row/column) -- but that anchor is the edge of each label's own
+    nominal font-metric bounding box, not of its rendered ink, and how
+    much invisible padding a mathtext string's box reserves above/beside
+    its ink varies with the string's own content: a label with a
+    superscript (our phi/dphi panels' own "$\\times10^{n}$" suffix, see
+    scale_map) fills nearly all of its box right up to that edge, while a
+    plain "$p_1$"/"$\\chi_1$" leaves several points of empty box above its
+    own ink -- so at a small on-screen size the two loosely look aligned,
+    but blown up to CORNER_SAVE_DPI for a saved PNG (where this was
+    actually noticed) that gap becomes an obviously inconsistent few
+    pixels between adjacent labels.
+
+    Measuring that ink gap (rather than trusting the nominal box) once,
+    via a throwaway high-dpi Agg render, and folding the *difference* from
+    whichever label in the group needs the least correction into that
+    axis's own `labelpad` (in points -- dpi-independent, so this needs no
+    re-run on resize the way fit_corner_margins/fit_diagonal_titles do)
+    makes the visible gap uniform regardless of which specific labels a
+    given model happens to mix in one row/column."""
+    orig_dpi = fig.dpi
+    probe = FigureCanvasAgg(fig)
+    try:
+        fig.dpi = CORNER_SAVE_DPI
+        probe.draw()
+        renderer = probe.get_renderer()
+        arr = np.asarray(renderer.buffer_rgba())
+        H = arr.shape[0]
+        pt_per_px = 72.0 / CORNER_SAVE_DPI
+
+        def ink_gap(text, side):
+            bbox = text.get_window_extent(renderer)
+            x0, x1 = int(np.floor(bbox.x0)), int(np.ceil(bbox.x1))
+            y0, y1 = int(np.floor(bbox.y0)), int(np.ceil(bbox.y1))
+            r0, r1 = H - y1, H - y0
+            crop = arr[max(r0, 0):max(r1, 0), max(x0, 0):max(x1, 0), :3]
+            if crop.size == 0:
+                return 0.0
+            ink = crop.min(axis=2) < 200
+            if side == 'top':
+                rows = np.where(ink.any(axis=1))[0]
+                return float(rows.min()) if rows.size else 0.0
+            cols = np.where(ink.any(axis=0))[0]
+            return float(crop.shape[1] - 1 - cols.max()) if cols.size else 0.0
+
+        x_gaps = {ax: ink_gap(ax.xaxis.label, 'top') for ax in bottom_axes}
+        y_gaps = {ax: ink_gap(ax.yaxis.label, 'right') for ax in left_axes}
+        x_target = max(x_gaps.values(), default=0.0)
+        y_target = max(y_gaps.values(), default=0.0)
+        for ax, gap in x_gaps.items():
+            ax.xaxis.labelpad = CORNER_LABELPAD_PT + (x_target - gap) * pt_per_px
+        for ax, gap in y_gaps.items():
+            ax.yaxis.labelpad = CORNER_LABELPAD_PT + (y_target - gap) * pt_per_px
+    finally:
+        fig.dpi = orig_dpi
 
 
 class RangeSlider(QWidget):
@@ -351,7 +515,38 @@ class MultiNestWorker(QThread):
         try:
             best_pars, errs, info = multinest_fit(
                 progress_callback=self.progress.emit, **self.kwargs)
-        except Exception as e:
+        except (Exception, SystemExit) as e:
+            # SystemExit included: pymultinest itself calls sys.exit(1)
+            # (rather than raising ImportError) when its compiled
+            # libmultinest.so isn't on LD_LIBRARY_PATH -- see app.py's
+            # module docstring. Without catching it here that would escape
+            # this thread uncaught and leave the UI stuck mid-fit instead
+            # of reporting the failure.
+            self.failed.emit(str(e))
+            return
+        self.finished_ok.emit(best_pars, errs, info)
+
+
+class LoadSamplesWorker(QThread):
+    """Runs fitting.load_previous_run() in a background thread so the UI
+    stays responsive while it re-reads a completed MultiNest run's output
+    files and re-clusters them into mode families (load_samples_action) --
+    a few seconds' worth of disk I/O and numpy work with no natural
+    progress fraction, hence no `progress` signal (unlike MultiNestWorker):
+    the caller just shows an indeterminate busy bar for the duration."""
+    finished_ok = pyqtSignal(list, list, dict)   # best_pars, errs, info
+    failed = pyqtSignal(str)
+
+    def __init__(self, kwargs, parent=None):
+        super().__init__(parent)
+        self.kwargs = kwargs
+
+    def run(self):
+        try:
+            best_pars, errs, info = load_previous_run(**self.kwargs)
+        except (Exception, SystemExit) as e:
+            # SystemExit included: see MultiNestWorker.run -- same
+            # pymultinest sys.exit(1) risk applies here too.
             self.failed.emit(str(e))
             return
         self.finished_ok.emit(best_pars, errs, info)
@@ -366,7 +561,7 @@ class MultiNestWorker(QThread):
 # the same on-screen pixel footprint -- see build_corner_tab's `size`
 # comment), so CornerToolbar's Save button renders at this higher dpi
 # instead, independent of whatever dpi the embedded canvas itself is using.
-CORNER_SAVE_DPI = 300
+CORNER_SAVE_DPI = 600
 
 
 class CornerToolbar(NavigationToolbar):
@@ -400,8 +595,9 @@ class SamplingMixin:
     def build_sampling_tab(self):
         """Build the "Sampling" tab (MultiNest fit options: output dir, #
         live points, sampling efficiency, evidence tolerance, prior-bounds
-        rows, Load samples) and add it to self.left_tabs. Only called from
-        MainWindow.__init__ when HAS_PYMULTINEST is True."""
+        rows, Load samples) and add it to self.left_tabs. Always called
+        from MainWindow.__init__, regardless of whether pymultinest is
+        actually installed -- see module docstring."""
         self.sampling_tab = QWidget()
         sampling_layout = QVBoxLayout(self.sampling_tab)
 
@@ -516,23 +712,11 @@ class SamplingMixin:
         self.left_tabs.addTab(self.sampling_tab, 'Sampling')
         self.left_tabs.setTabToolTip(
             self.left_tabs.indexOf(self.sampling_tab),
-            'Load data first (Load data button) to enable Bayesian sampling.')
-        # MultiNest fits against loaded q/u data (see run_multinest_fit) --
-        # greyed out until Load data succeeds, see MainWindow.load_data_action
-        # / clear_data.
-        self.set_sampling_tab_enabled(False)
-
-    def set_sampling_tab_enabled(self, enabled):
-        """Enable/disable (grey out) the Sampling tab. No-op if pymultinest
-        isn't installed (no Sampling tab was ever built, see HAS_PYMULTINEST)."""
-        if not hasattr(self, 'sampling_tab'):
-            return
-        idx = self.left_tabs.indexOf(self.sampling_tab)
-        if idx == -1:
-            return
-        if not enabled and self.left_tabs.currentIndex() == idx:
-            self.left_tabs.setCurrentWidget(self.param_box)  # back to Visualization
-        self.left_tabs.setTabEnabled(idx, enabled)
+            'Load data first (Load data button) to enable Fit!.')
+        # The tab itself is always accessible (e.g. Load samples doesn't
+        # need any data currently loaded) -- only Fit! is gated on loaded
+        # data, via the shared self.fit_button (see MainWindow.load_data_action
+        # / clear_data), same as the Visualization tab's own fit.
 
     def choose_sampling_outdir(self):
         directory = QFileDialog.getExistingDirectory(
@@ -561,7 +745,7 @@ class SamplingMixin:
         rather than trying to preserve a per-model customization across a
         model switch."""
         if not hasattr(self, 'sampling_bounds_layout'):
-            return  # HAS_PYMULTINEST is False -- no Sampling tab was built
+            return  # Sampling tab not built yet
 
         for row in getattr(self, 'sampling_bounds_rows', {}).values():
             row.setParent(None)
@@ -790,15 +974,29 @@ class SamplingMixin:
         """Stash a random subset of the winning family's posterior (for the
         faint spaghetti overlay on the Visualization tab's plots -- see
         app.ModelPlot/StokesPlot.set_posterior_samples) and (re)build the
-        Corner plot tab from the full result."""
+        Corner plot tab from the full result. The Corner tab's own family
+        dropdown (see build_corner_tab) defaults to this same winning
+        family (selected_idx=0) -- our winner-selection criteria don't
+        change, only which family is *displayed* can, via that dropdown."""
         spec = MODELS[model]
         pol_idx = info['pol_idx']
         spectral_pars = {i: best_pars[i] for i in spec.indices('alpha') + spec.indices('eps')}
-        winner_samples = info['winner_samples']  # (n, len(pol_idx)), pol_idx-local order
+        self.stash_posterior_samples(model, pol_idx, info['winner_samples'], spectral_pars)
+        self.build_corner_tab(model, best_pars, errs, info)
+        self.update_plot()
 
+    def stash_posterior_samples(self, model, pol_idx, pol_samples, spectral_pars):
+        """(Re)build the faint spaghetti-overlay posterior draws (see
+        app.ModelPlot/StokesPlot.set_posterior_samples) from `pol_samples`
+        (pol_idx-local order, e.g. info['winner_samples'] or a Corner-tab
+        `other_families` entry's own 'samples') -- shared by
+        apply_posterior_result (the winning family) and
+        on_corner_family_selected (whichever family the Corner tab's
+        dropdown currently has picked)."""
+        spec = MODELS[model]
         rng = np.random.default_rng(0)
-        n_draws = min(N_POSTERIOR_DRAWS, len(winner_samples))
-        subset = winner_samples[rng.choice(len(winner_samples), size=n_draws, replace=False)]
+        n_draws = min(N_POSTERIOR_DRAWS, len(pol_samples))
+        subset = pol_samples[rng.choice(len(pol_samples), size=n_draws, replace=False)]
 
         full_samples = np.zeros((n_draws, len(spec.params)))
         full_samples[:, pol_idx] = subset
@@ -810,23 +1008,29 @@ class SamplingMixin:
         self.canvas.set_posterior_samples(full_samples, model)
         self.stokes_canvas.set_posterior_samples(full_samples, model)
 
-        self.build_corner_tab(model, best_pars, errs, info)
-        self.update_plot()
-
     def clear_posterior_samples(self):
         self.posterior_samples = None
         self.posterior_model = None
         self.canvas.set_posterior_samples(None, None)
         self.stokes_canvas.set_posterior_samples(None, None)
 
-    def build_corner_tab(self, model, best_pars, errs, info):
-        """(Re)build the 'Corner plot' tab: the winning family's own pooled
-        posterior (blue, opaque) plus up to 4 other mode families overlaid
-        in their own color at alpha=0.5 (if MultiNest found more than one),
-        with the winning point-estimate drawn as dashed truths= crosshairs
-        and a legend of each family's evidence share/ln Z/chi2 -- mirrors
-        qu_fit.py's corner_plot(). Removed by Reset model or Clear data
-        (see remove_corner_tab)."""
+    def build_corner_tab(self, model, best_pars, errs, info, selected_idx=0):
+        """(Re)build the 'Corner plot' tab: `selected_idx`'s family's own
+        pooled posterior (blue, opaque, with titled diagonal panels) plus
+        every other surviving mode family overlaid in its own color at
+        alpha=0.5, with that family's own point-estimate drawn as dashed
+        truths= crosshairs and a legend of each family's evidence share/
+        ln Z/chi2 -- mirrors qu_fit.py's corner_plot(). `selected_idx` is
+        an index into `families` (see below): 0 is always our actual
+        winning family (the one apply_posterior_result's own selection
+        criteria picked, per SamplingMixin's module docstring -- that
+        choice never changes), 1.. are info['other_families'] in their own
+        already-evidence-descending order. A top-right dropdown
+        (corner_family_combo, populated below) lets the user switch
+        `selected_idx` (see on_corner_family_selected) to inspect any
+        other non-discarded family without disturbing which one is
+        actually the winner. Removed by Reset model or Clear data (see
+        remove_corner_tab)."""
         try:
             import corner
             import matplotlib.colors as mcolors
@@ -840,15 +1044,64 @@ class SamplingMixin:
 
         spec = MODELS[model]
         pol_idx = info['pol_idx']
+        ndim = len(pol_idx)
         kinds_pol = [spec.params[i].kind for i in pol_idx]
         labels = [spec.params[i].latex for i in pol_idx]
-        scale_map = {'p': 100.0, 'X': 180.0 / np.pi, 'phi': 1e-5, 'dphi': 1e-5, 'scale': 1.0}
-        scales = np.array([scale_map[k] for k in kinds_pol])
+        scale_map = {'p': 100.0, 'X': 180.0 / np.pi, 'scale': 1.0}
 
-        winner_samples = info['winner_samples'] * scales[np.newaxis, :]
-        truths = [best_pars[i] * s for i, s in zip(pol_idx, scales)]
-        other_families = info['other_families']
+        # families[0] is always the actual winner -- reconstructed here
+        # (rather than stored as its own 'family' dict by best_family()
+        # itself) purely because best_pars/errs/info is the shape every
+        # other caller (sliders, Results box, ...) already works with; see
+        # the docstring above for why index 0 is special. families[1:] are
+        # info['other_families'] verbatim -- both already carry the same
+        # 'pars'/'errs' (pol_idx-local, (2,ndim) lo/hi errs)/'samples'/
+        # 'evidence_share'/'chi2'/'lnZ' shape (see fitting.best_family).
+        winner_errs_pol = np.array([[errs[i][0] for i in pol_idx],
+                                     [errs[i][1] for i in pol_idx]])
+        winner_family = dict(
+            pars=[best_pars[i] for i in pol_idx], errs=winner_errs_pol,
+            samples=info['winner_samples'], evidence_share=info['evidence_share'],
+            chi2=info['winner_chi2'], lnZ=info['winner_lnZ'])
+        families = [winner_family] + info['other_families']
         dropped = info['dropped']
+        selected_idx = max(0, min(selected_idx, len(families) - 1))
+
+        # Cached so on_corner_family_selected (the dropdown's own handler)
+        # can rebuild this tab and the Visualization-tab model curves for
+        # a newly-picked family without re-clustering MultiNest's raw
+        # output -- everything it needs is already sitting in `families`.
+        self._corner_model = model
+        self._corner_best_pars = best_pars
+        self._corner_errs = errs
+        self._corner_info = info
+        self._corner_families = families
+        self._corner_selected_idx = selected_idx
+
+        sel = families[selected_idx]
+
+        # phi/dphi's raw physical scale (~1e2-1e6 rad/m^2) varies enough
+        # per-parameter -- both across a model's own several phi/dphi pars
+        # and across fits -- that a single fixed factor (the old flat 1e-5,
+        # i.e. always "units of 10^5") left some panels' numbers tiny and
+        # others' huge. Each phi/dphi *column/row* now gets its own
+        # exponent instead, picked from that parameter's own point
+        # estimate in the family actually being plotted (`sel` -- not
+        # always the winner, see selected_idx above), the same way
+        # format_sci_title already scales that panel's title; every other
+        # family drawn in this same column/row (the non-selected overlays
+        # below) is scaled by that same factor for a shared, legible axis.
+        phi_exps = {i: sci_exponent(sel['pars'][i]) for i, k in enumerate(kinds_pol) if k in ('phi', 'dphi')}
+        scales = np.array([10.0 ** -phi_exps[i] if i in phi_exps else scale_map[k]
+                            for i, k in enumerate(kinds_pol)])
+        plot_labels = [
+            (fr"{lbl.strip('$')}\;(\times10^{{{phi_exps[i]}}})" if i in phi_exps and phi_exps[i] != 0
+             else lbl.strip('$'))
+            for i, lbl in enumerate(labels)]
+        plot_labels = [fr'${lbl}$' for lbl in plot_labels]
+
+        sel_samples = sel['samples'] * scales[np.newaxis, :]
+        truths = [p * s for p, s in zip(sel['pars'], scales)]
 
         # A bare (non-pyplot) Figure -- corner.corner() builds its KxK axes
         # grid directly onto it (Figure.subplots()) when passed an empty
@@ -869,7 +1122,6 @@ class SamplingMixin:
         # keeps each panel's text-to-panel-size ratio roughly constant
         # instead of only fixing it for whatever ndim happened to be
         # tested.
-        ndim = len(pol_idx)
         size = max(2.2 * ndim + 1.5, 6.0)
         fig = Figure(figsize=(size, size))
 
@@ -881,42 +1133,47 @@ class SamplingMixin:
         max_n_ticks = 5 if ndim <= 5 else (4 if ndim <= 7 else 3)
         label_kwargs = {'fontsize': label_fs}
         title_kwargs = {'fontsize': title_fs}
-        # corner.corner() places each bottom-row axis label at -0.3 axes-
-        # fraction below its own axes (ax.xaxis.set_label_coords) -- too
-        # close to the tick numbers directly above it once those ticks
-        # have any real height, so the two overlap. This isn't actually an
-        # ndim-driven effect (measured overlap was, if anything, *worse*
-        # at ndim=4 than ndim=8: our tick/label fontsizes already scale
-        # together with panel size -- see the ndim comment above -- so the
-        # ratio between "gap available" and "tick height" stays roughly
-        # constant across model sizes), so a single flat labelpad works
-        # for every model rather than needing its own ndim formula; 0.13
-        # was picked by rendering both a 4- and an 8-parameter model and
-        # measuring the actual tick-label/axis-label pixel gap until
-        # neither overlapped, with a few pixels to spare.
-        labelpad = 0.15
+        # corner.corner() itself only ever gets 0 here: build_corner_tab
+        # replaces its axis-label placement with matplotlib's own native,
+        # tick-aware auto-positioning right after the last corner.corner()
+        # call below (see CORNER_LABELPAD_PT), so whatever this adds on
+        # top of corner's own fixed -0.3 axes-fraction offset would just
+        # be thrown away regardless of its value.
+        labelpad = 0.0
 
-        ranked_colors = [FAMILY_PALETTE[i % len(FAMILY_PALETTE)] for i in range(len(other_families))]
-        # Weakest-evidence family drawn first, winner last, so an
+        # Color assignment: the selected family is always blue/opaque; every
+        # other family gets a FAMILY_PALETTE color assigned in evidence-
+        # share-descending order (so, as before selected_idx became
+        # pickable, the highest-evidence non-selected family is always
+        # 'tab:orange', etc. -- this just no longer assumes the winner
+        # (index 0) is always the selected one).
+        non_selected_desc = sorted((k for k in range(len(families)) if k != selected_idx),
+                                    key=lambda k: -families[k]['evidence_share'])
+        color_by_k = {selected_idx: 'b'}
+        for rank, k in enumerate(non_selected_desc):
+            color_by_k[k] = FAMILY_PALETTE[rank % len(FAMILY_PALETTE)]
+
+        # Weakest-evidence family drawn first, selected family last, so an
         # overlapping higher-evidence contour is never hidden underneath a
         # lower-evidence one.
-        draw_order = sorted(zip(other_families, ranked_colors), key=lambda fc: fc[0]['evidence_share'])
+        draw_order = sorted(non_selected_desc, key=lambda k: families[k]['evidence_share'])
 
-        for family, color in draw_order:
-            fam_samples = family['samples'] * scales[np.newaxis, :]
+        for k in draw_order:
+            fam_samples = families[k]['samples'] * scales[np.newaxis, :]
+            color = color_by_k[k]
             faded_color = mcolors.to_rgba(color, alpha=0.5)
             corner.corner(
-                fam_samples, fig=fig, labels=labels, plot_datapoints=False,
+                fam_samples, fig=fig, labels=plot_labels, plot_datapoints=False,
                 color=faded_color, levels=(0.5, 0.8, 0.95),
                 hist_kwargs={'color': color, 'alpha': 0.5},
-                contour_kwargs={'colors': 'k', 'alpha': 0.5},
+                contour_kwargs={'colors': 'k', 'alpha': 0.5,'linewidths': 0.2},
                 fill_contours=True, smooth=1.0, show_titles=False,
                 label_kwargs=label_kwargs, max_n_ticks=max_n_ticks, labelpad=labelpad)
 
         corner.corner(
-            winner_samples, fig=fig, show_titles=True, labels=labels,
+            sel_samples, fig=fig, show_titles=True, labels=plot_labels,
             plot_datapoints=False, color='b', levels=(0.5, 0.8, 0.95),
-            hist_kwargs={'color': 'b'}, contour_kwargs={'colors': 'k'},
+            hist_kwargs={'color': 'b'}, contour_kwargs={'colors': 'k','linewidths': 0.2},
             fill_contours=True, smooth=1.0, title_fmt='.2f',
             label_kwargs=label_kwargs, title_kwargs=title_kwargs,
             max_n_ticks=max_n_ticks, labelpad=labelpad)
@@ -924,85 +1181,227 @@ class SamplingMixin:
         for ax in fig.axes:
             ax.tick_params(axis='both', which='major', labelsize=tick_fs)
 
-        # phi/dphi's raw physical scale (~1e4-1e6 rad/m^2) doesn't suit a
-        # fixed '10^5'-scaled decimal (see scale_map above, which exists
-        # for the *panel contents* -- histograms/contours need one shared
-        # scale per axis to be legible at all) -- their titles instead get
-        # their own per-parameter exponent picked from that title's own
-        # center value, overwriting whatever corner.corner()'s generic
-        # title_fmt wrote for just those two diagonal panels (fig.axes'
-        # flattened K*K layout puts panel (i,i) at index i*ndim+i -- see
+        # Undo corner.corner()'s own ax.xaxis/yaxis.set_label_coords() calls
+        # (each one flips that Axis's _autolabelpos off -- see
+        # matplotlib.axis.Axis.set_label_coords) and restore each label's
+        # default transform (x/y in display coords, the other in axes
+        # fraction -- see XAxis._init()/YAxis._init()) so matplotlib's own
+        # _update_label_position takes back over at every draw from here
+        # on: it measures the real rendered tick-label-plus-spine bbox and
+        # places the label CORNER_LABELPAD_PT points beyond it, self-
+        # correcting for ndim/font size/tick digit count/resizing alike
+        # instead of the single guessed axes-fraction offset this replaces.
+        # Bottom-row panels (index (ndim-1)*ndim+j) get an x-label; left-
+        # column panels (index i*ndim) get a y-label -- except (0, 0), the
+        # top-left diagonal/histogram panel, which corner.corner() never
+        # gives one (its y-axis is just bin counts).
+        bottom_axes = [fig.axes[(ndim - 1) * ndim + j] for j in range(ndim)]
+        left_axes = [fig.axes[i * ndim] for i in range(1, ndim)]
+        for ax in bottom_axes:
+            ax.xaxis.labelpad = CORNER_LABELPAD_PT
+            ax.xaxis._autolabelpos = True
+            ax.xaxis.label.set_transform(mtransforms.blended_transform_factory(
+                ax.transAxes, mtransforms.IdentityTransform()))
+        for ax in left_axes:
+            ax.yaxis.labelpad = CORNER_LABELPAD_PT
+            ax.yaxis._autolabelpos = True
+            ax.yaxis.label.set_transform(mtransforms.blended_transform_factory(
+                mtransforms.IdentityTransform(), ax.transAxes))
+
+        # Left to itself, _update_label_position places each label
+        # CORNER_LABELPAD_PT beyond that *one* panel's own tick-label bbox
+        # -- so a row/column with wider tick numbers (e.g. "-800" vs "0")
+        # sits its label further out than its neighbors, staggering the
+        # whole bottom/left edge instead of lining up. align_xlabels/
+        # align_ylabels register these panels as siblings so
+        # _update_label_position (via _get_tick_boxes_siblings) unions
+        # *all* of a group's tick-label bboxes before placing every label
+        # in it -- i.e. whichever panel needs the most room sets the pad
+        # for the whole row/column -- rather than each panel picking its
+        # own. A one-time registration: the union is re-measured from
+        # scratch at every draw (including our own resize-triggered
+        # ones), so this doesn't need re-running there.
+        fig.align_xlabels(bottom_axes)
+        fig.align_ylabels(left_axes)
+
+        # align_xlabels/align_ylabels line up every label's own nominal
+        # font-metric box -- not its rendered ink, which for some
+        # label strings (e.g. our phi/dphi panels' own superscripted
+        # "(x10^n)" suffix vs a plain "$p_1$"/"$\chi_1$") sits much
+        # closer to that box's edge than for others (see
+        # fit_corner_label_ink_pad's own docstring for the full
+        # reasoning) -- fold that per-label difference into each axis's
+        # labelpad now, in points, so it applies unchanged regardless of
+        # dpi (on-screen or a saved PNG) without needing a resize hook.
+        fit_corner_label_ink_pad(fig, bottom_axes, left_axes)
+
+        # corner.corner() re-applies its own fixed wspace=hspace=0.05
+        # gutter (a fraction of each panel's own width/height) on every
+        # call, so this has to run after the last one above rather than
+        # once up front. Zeroing it here -- before the title-overflow and
+        # margin measurements below, both of which need the real final
+        # panel geometry to measure against -- packs the KxK grid edge to
+        # edge; safe since corner.corner() already hides every tick label
+        # except the bottom row's and left column's (see corner.core), so
+        # there's no interior label left to collide with a touching
+        # neighbor.
+        fig.subplots_adjust(wspace=0.0, hspace=0.0)
+
+        # phi/dphi's raw physical scale (~1e2-1e6 rad/m^2) doesn't suit a
+        # single title-wide formula -- their titles get their own
+        # per-parameter exponent (the same one `scales`/`plot_labels` above
+        # already picked for that whole column/row, so title and axis
+        # agree), overwriting whatever corner.corner()'s generic title_fmt
+        # wrote for just those two diagonal panels (fig.axes' flattened
+        # K*K layout puts panel (i,i) at index i*ndim+i -- see
         # corner.core._get_fig_axes, which reads it back the same way).
+        # `sel` (not always the winner, since selected_idx may not be 0)
+        # is the family show_titles=True was rendered for just above, so
+        # its own pars/errs are what these titles must match.
         for local_i, kind in enumerate(kinds_pol):
             if kind in ('phi', 'dphi'):
-                orig_i = pol_idx[local_i]
-                lo, hi = errs[orig_i]
-                title = format_sci_title(labels[local_i], best_pars[orig_i], lo, hi)
+                lo, hi = sel['errs'][0, local_i], sel['errs'][1, local_i]
+                title = format_sci_title(labels[local_i], sel['pars'][local_i], lo, hi, phi_exps[local_i])
                 fig.axes[local_i * ndim + local_i].set_title(title, **title_kwargs)
 
         corner.overplot_lines(fig, truths, color='k', linestyle='--', alpha=0.4)
         corner.overplot_points(fig, [truths], marker='s', color='k', alpha=0.4)
 
-        if other_families:
-            legend_handles = [mpatches.Patch(
-                color='b',
-                label=fr"mass={info['evidence_share']:.1f}%, $\ln Z$={info['winner_lnZ']:.2f}, "
-                      fr"$\chi_\nu^2$={info['winner_chi2']:.2f} (winner)")]
-            for family, color in zip(other_families, ranked_colors):
+        if len(families) > 1 or dropped['count'] > 0:
+            legend_handles = []
+            for k, family in enumerate(families):
+                bits = []
+                if k == 0:
+                    bits.append('winner')
+                if k == selected_idx and selected_idx != 0:
+                    bits.append('shown')
+                suffix = f" ({', '.join(bits)})" if bits else ''
                 legend_handles.append(mpatches.Patch(
-                    color=color, alpha=0.5,
+                    color=color_by_k[k], alpha=(1.0 if k == selected_idx else 0.5),
                     label=fr"mass={family['evidence_share']:.1f}%, $\ln Z$={family['lnZ']:.2f}, "
-                          fr"$\chi_\nu^2$={family['chi2']:.2f}"))
+                          fr"$\chi_\nu^2$={family['chi2']:.2f}{suffix}"))
             if dropped['count'] > 0:
                 legend_handles.append(mpatches.Patch(
                     color='none', label=f"+{dropped['count']} more, {dropped['evidence_share']:.1f}% combined"))
             fig.legend(handles=legend_handles, loc='upper right', frameon=False, fontsize=9)
 
-        # corner.corner() picks its own left/bottom/top margins from a
-        # fixed formula (based on its own internal `dim`, unaware of our
-        # ndim-scaled font sizes above), sized for its own default fonts --
-        # too tight once our larger ndim=4 fonts are in play, and (in the
-        # other direction) far too generous once our smaller ndim=8 fonts
-        # shrink to fit, wasting panel space on blank margin that grows
-        # right along with the figure's own inch size (see `size` above)
-        # even as the actual text needing room for shrinks. Rather than
-        # hand-tuning another ndim-keyed formula, measure what's actually
-        # rendered (tick labels, axis labels, the phi/dphi titles just
-        # overwritten above, the legend) via a throwaway Agg renderer, and
-        # grow the margins by exactly however far that content overflows
-        # the current figure bounds -- self-correcting for any ndim, font
-        # size, or label content instead of guessing.
-        #
-        # pad_in itself (the safety margin added *beyond* that measured
-        # overflow) grows a little past ndim=4 rather than staying flat:
-        # denser plots pack more (smaller, tighter-spaced) tick/axis
-        # labels along each edge, so the same flat pad reads as
-        # comfortable headroom at ndim=4 but noticeably tighter once
-        # there's more of that small text lined up along it -- barely
-        # different for a 4-parameter model like burn, a bit more
-        # breathing room for an 8-parameter one like comp2RMdep.
-        probe = FigureCanvasAgg(fig)
-        probe.draw()
-        bbox = fig.get_tightbbox(probe.get_renderer())
-        pad_in = 0.06 + 0.025 * max(0, ndim - 4)
-        sp = fig.subplotpars
-        fig.subplots_adjust(
-            left=sp.left + max(0.0, pad_in - bbox.x0) / size,
-            bottom=sp.bottom + max(0.0, pad_in - bbox.y0) / size,
-            top=sp.top - max(0.0, bbox.y1 - size + pad_in) / size,
-            right=sp.right - max(0.0, bbox.x1 - size + pad_in) / size)
+        # Approximate first pass at the figure's current (construction-
+        # time) size -- see fit_corner_margins's/fit_diagonal_titles's own
+        # docstrings for why this alone isn't reliable once actually
+        # embedded, and canvas.mpl_connect below for the real fix. A bare
+        # Figure (as built above) has no canvas of its own yet -- both
+        # functions need one to draw with, so give it a throwaway Agg one;
+        # the real Qt canvas built just below replaces it as fig.canvas
+        # regardless. Margins first, then titles, since the former decides
+        # each panel's actual width, which the latter checks titles against.
+        FigureCanvasAgg(fig)
+        fit_corner_margins(fig, ndim)
+        fit_diagonal_titles(fig, ndim)
 
         canvas = FigureCanvas(fig)
+
+        # Re-run both the margin fit and the diagonal-title fit (in that
+        # order -- the former decides each panel's actual on-screen width,
+        # which the latter checks titles against) once Qt actually gives
+        # this canvas its real on-screen size; the passes already done
+        # above, at the figure's construction-time size, are only ever a
+        # first guess (see both functions' own docstrings).
+        def _refit_corner(event):
+            fit_corner_margins(fig, ndim)
+            fit_diagonal_titles(fig, ndim)
+        canvas.mpl_connect('resize_event', _refit_corner)
+
         toolbar = CornerToolbar(canvas, self)
+
+        # Top-right family picker: switches which (non-discarded) family
+        # is drawn opaque/blue above -- and, via on_corner_family_selected,
+        # the model curves on the p/EVPA and Stokes I,Q,U tabs -- without
+        # touching which family our own selection criteria consider the
+        # winner (families[0], always labeled 'Winner' here regardless of
+        # what's currently picked). Built fresh (like the rest of this
+        # tab) on every call; setCurrentIndex() is set *before* connecting
+        # currentIndexChanged so repopulating it here never re-triggers
+        # on_corner_family_selected itself.
+        self.corner_family_combo = QComboBox()
+        self.corner_family_combo.setToolTip(
+            "Pick which family to inspect")
+        for k, family in enumerate(families):
+            text = (f"Winner ({family['evidence_share']:.1f}% mass)" if k == 0
+                    else f"Family {k + 1} ({family['evidence_share']:.1f}% mass)")
+            self.corner_family_combo.addItem(text)
+        self.corner_family_combo.setCurrentIndex(selected_idx)
+        self.corner_family_combo.currentIndexChanged.connect(self.on_corner_family_selected)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(toolbar, stretch=1)
+        top_row.addWidget(QLabel('Solution:'))
+        top_row.addWidget(self.corner_family_combo)
+
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(toolbar)
+        layout.addLayout(top_row)
         layout.addWidget(canvas, stretch=1)
 
         self.corner_tab = tab
         self.plot_tabs.addTab(tab, 'Corner plot')
         self.plot_tabs.setCurrentWidget(tab)
+
+    def on_corner_family_selected(self, k):
+        """corner_family_combo's currentIndexChanged handler: move the
+        Visualization-tab sliders (and so the p/EVPA and Stokes I,Q,U
+        model curves) and the posterior spaghetti-overlay draws to family
+        `k`'s own point estimate/samples, update the Results box to match,
+        and rebuild the Corner tab with `k` as the new selected_idx --
+        same cached model/best_pars/errs/info build_corner_tab last saw,
+        no re-clustering needed. A no-op if the Corner tab isn't currently
+        showing a result (shouldn't happen -- this is only wired to a
+        combo box that lives inside the Corner tab itself)."""
+        info = getattr(self, '_corner_info', None)
+        if info is None:
+            return
+        model, best_pars, errs = self._corner_model, self._corner_best_pars, self._corner_errs
+        families = self._corner_families
+        k = max(0, min(k, len(families) - 1))
+        fam = families[k]
+
+        spec = MODELS[model]
+        pol_idx = info['pol_idx']
+        spectral_pars = {i: best_pars[i] for i in spec.indices('alpha') + spec.indices('eps')}
+        full_pars, _ = expand_pars_errs(len(spec.params), pol_idx, fam['pars'], fam['errs'], spectral_pars)
+        for sl, val in zip(self.sliders, full_pars):
+            sl.set_value(val)
+        self.stash_posterior_samples(model, pol_idx, fam['samples'], spectral_pars)
+
+        self.results_label.setText(
+            self.format_mn_stats(info) if k == 0 else self.format_family_stats(k, fam, info))
+
+        self.build_corner_tab(model, best_pars, errs, info, selected_idx=k)
+        self.update_plot()
+
+    def format_family_stats(self, k, family, info):
+        """Results-box text for a non-winning family picked from the
+        Corner tab's dropdown -- same field set/formulas format_mn_stats()
+        uses for the winner (chi2/dof, chi2_red, ln L, AIC/AICc, BIC),
+        recomputed from `family`'s own chi2/lnZ instead (dof/n_free/n_data
+        are shared across every family of the same model/run, so those
+        come straight from `info`). Clearly marked as not the winner, so
+        it's never mistaken for one at a glance."""
+        dof, n_free, n_data = info['dof'], info['n_free'], info['n_data']
+        chi2 = family['chi2'] * dof
+        aic = 2 * n_free - 2 * family['lnZ']
+        aicc = aic + (2 * n_free * (n_free + 1)) / (dof - 1) if dof > 1 else float('nan')
+        aicc_str = f'{aicc:.4g}' if np.isfinite(aicc) else 'n/a (dof <= 1)'
+        bic = n_free * np.log(n_data) - 2 * family['lnZ']
+        return '\n'.join([
+            f"family #{k + 1} (shown; not the winning family): "
+            f"{family['evidence_share']:.2f}% evidence share",
+            f"χ² = {chi2:.4g}   dof = {dof}",
+            f"χ²_red = {family['chi2']:.4g}",
+            f"ln L = {family['lnZ']:.4g}",
+            f"AIC = {aic:.4g}   AICc = {aicc_str}",
+            f"BIC = {bic:.4g}",
+        ])
 
     def remove_corner_tab(self):
         tab = self.corner_tab
@@ -1013,6 +1412,8 @@ class SamplingMixin:
             self.plot_tabs.removeTab(idx)
         tab.deleteLater()
         self.corner_tab = None
+        self._corner_info = None
+        self._corner_families = None
 
     def load_samples_action(self):
         """Load a previous MultiNest run's output (picked via a directory
@@ -1049,13 +1450,41 @@ class SamplingMixin:
             model = MODELS_BY_NAME[model_name]
             spectral_pars = {int(i): float(v) for i, v in zip(meta['spectral_idx'], meta['spectral_val'])}
             wl, q, q_err, u, u_err = meta['wl'], meta['q'], meta['q_err'], meta['u'], meta['u_err']
-
-            basename = os.path.join(directory, 'mn_')
-            best_pars, errs, info = load_previous_run(wl, q, q_err, u, u_err, model, spectral_pars, basename)
-        except Exception as e:
+        except (Exception, SystemExit) as e:
+            # SystemExit included: see MultiNestWorker.run -- this runs on
+            # the main thread, so letting it escape uncaught would exit the
+            # whole app instead of just reporting the failure here.
             QMessageBox.warning(self, 'Load samples', f'Failed to load samples:\n{e}')
             return
 
+        basename = os.path.join(directory, 'mn_')
+
+        self.fit_button.setEnabled(False)
+        self.load_data_button.setEnabled(False)
+        self.clear_data_button.setEnabled(False)
+        self.sampling_load_button.setEnabled(False)
+        self.sampling_progress.setVisible(True)
+        self.sampling_progress_label.setVisible(True)
+        self.sampling_progress_label.setText('Loading samples...')
+
+        self.mn_model = model
+        self.ls_worker = LoadSamplesWorker(dict(
+            wl=wl, q=q, q_err=q_err, u=u, u_err=u_err, model=model,
+            spectral_pars=spectral_pars, outputfiles_basename=basename,
+        ))
+        self.ls_worker.finished_ok.connect(self.on_load_samples_finished)
+        self.ls_worker.failed.connect(self.on_load_samples_failed)
+        self.ls_worker.start()
+
+    def on_load_samples_finished(self, best_pars, errs, info):
+        self.sampling_progress.setVisible(False)
+        self.sampling_progress_label.setVisible(False)
+        self.fit_button.setEnabled(True)
+        self.load_data_button.setEnabled(True)
+        self.clear_data_button.setEnabled(True)
+        self.sampling_load_button.setEnabled(True)
+
+        model = self.mn_model
         index = self.model_combo.findData(model)
         if index != -1:
             self.model_combo.setCurrentIndex(index)  # triggers rebuild_sliders if it changed
@@ -1063,3 +1492,14 @@ class SamplingMixin:
             sl.set_value(val)
         self.results_label.setText(self.format_mn_stats(info))
         self.apply_posterior_result(model, best_pars, errs, info)
+        self.ls_worker = None
+
+    def on_load_samples_failed(self, msg):
+        self.sampling_progress.setVisible(False)
+        self.sampling_progress_label.setVisible(False)
+        self.fit_button.setEnabled(True)
+        self.load_data_button.setEnabled(True)
+        self.clear_data_button.setEnabled(True)
+        self.sampling_load_button.setEnabled(True)
+        QMessageBox.warning(self, 'Load samples', f'Failed to load samples:\n{msg}')
+        self.ls_worker = None

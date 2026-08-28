@@ -17,10 +17,11 @@ Author: Douglas Carlos, 2026
     We Can load some data and perform simple least-squares regression to any
     given model throught the QU-fitting technique. 
 
-    If pymultinest is installed, polvista will also offer a basic interface
-    to perform bayesian fitting/sampling under the "Sampling" tab.
-    Once a fitting is complete, we can then check the parmeter's posterior
-    probability density distributions.
+    The "Sampling" tab offers a basic interface to perform bayesian
+    fitting/sampling via pymultinest (an optional dependency -- Fit! on
+    that tab reports an error there if it isn't installed, rather than
+    hiding the tab). Once a fitting is complete, we can then check the
+    parmeter's posterior probability density distributions.
 
 """
 import os
@@ -83,20 +84,12 @@ from polvista.rm_synthesis import compute_faraday_spectrum, phi_axis_half_width,
 # pymultinest (Bayesian/nested-sampling fitting) is an optional dependency --
 # it's a compiled Fortran library wrapper that's a much heavier install than
 # the rest of polvista's requirements, so the app must still run with plain
-# least-squares fitting when it isn't present. HAS_PYMULTINEST gates every
-# multinest-only UI element (e.g. the "Sampling" tab, see MainWindow) instead
-# of failing at import time.
-#
-# The pymultinest *package* being importable doesn't mean the compiled
-# libmultinest.so it wraps is actually on LD_LIBRARY_PATH -- when it isn't,
-# pymultinest itself prints a diagnostic and calls sys.exit(1) instead of
-# raising ImportError, so SystemExit has to be caught here too or the whole
-# app dies at startup.
-try:
-    import pymultinest
-    HAS_PYMULTINEST = True
-except (ImportError, SystemExit):
-    HAS_PYMULTINEST = False
+# least-squares fitting when it isn't present. The Sampling tab is always
+# built (see MainWindow); fitting.py only imports pymultinest lazily, inside
+# multinest_fit/load_previous_run themselves, and sampling.py turns a failure
+# there (including the SystemExit pymultinest itself raises when its compiled
+# libmultinest.so isn't on LD_LIBRARY_PATH) into an on-screen error rather
+# than letting it kill the app.
 
 
 # QU-fitting holds epsilon fixed at this value (see MainWindow.run_fit) --
@@ -493,10 +486,15 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # MultiNest (Sampling tab) result state -- see apply_posterior_result,
         # build_corner_tab, run_multinest_fit, load_samples_action.
         self.mn_worker = None
+        self.ls_worker = None      # background worker for load_samples_action, see LoadSamplesWorker
         self.mn_model = None       # model func the most recent MultiNest run/load was for
         self.posterior_samples = None
         self.posterior_model = None
         self.corner_tab = None
+        # Corner tab's own family-picker dropdown state -- see
+        # SamplingMixin.build_corner_tab/on_corner_family_selected.
+        self._corner_info = None
+        self._corner_families = None
 
         # See PLOT_THROTTLE_MS/request_update_plot and DRAG_N_POINTS_CAP/
         # on_slider_drag_started for what these back.
@@ -677,14 +675,14 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         param_box_layout.addWidget(self.spectral_scroll)
         param_box_layout.addWidget(pol_scroll)
 
-        # The parameter sliders live under a "Visualization" tab; a
-        # "Sampling" tab (MultiNest fit options) is only added when
-        # pymultinest is actually installed -- see HAS_PYMULTINEST.
+        # The parameter sliders live under a "Visualization" tab; the
+        # "Sampling" tab (MultiNest fit options) is always built -- whether
+        # pymultinest itself is actually usable is only checked once Fit! is
+        # pressed there (see run_fit/run_multinest_fit), not before.
         self.left_tabs = QTabWidget()
         self.left_tabs.addTab(self.param_box, 'Visualization')
         self.build_measurements_tab()
-        if HAS_PYMULTINEST:
-            self.build_sampling_tab()  # greyed out until data is loaded, see load_data_action
+        self.build_sampling_tab()  # greyed out until data is loaded, see load_data_action
         left_layout.addWidget(self.left_tabs)
 
         # Reset Parameters on the left, Load/Clear Data grouped together in
@@ -725,8 +723,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # literal progress meter; sampling_progress_label carries the actual
         # live numbers (sample count, ln Z) fed by MultiNestWorker.progress.
         # Built unconditionally (harmless without pymultinest, just never
-        # shown) -- only run_multinest_fit ever makes them visible, and
-        # that's only reachable when HAS_PYMULTINEST is True (see run_fit).
+        # shown) -- only run_multinest_fit ever makes them visible.
         self.sampling_progress = QProgressBar()
         self.sampling_progress.setRange(0, 0)
         self.sampling_progress.setTextVisible(False)
@@ -1595,23 +1592,23 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         if self.rmsynth_source == 'data':
             self.rmsynth_source = None
             self.refresh_rmsynth_empty_axis()
-        self.set_sampling_tab_enabled(False)
         self.results_label.setText(self.NO_FIT_TEXT)
         self.update_plot()
 
     def run_fit(self):
         """Dispatches Fit! to the Bayesian (MultiNest) path when the
-        Sampling tab is the active one (and pymultinest is installed), or
-        the ordinary least-squares path otherwise. `self.sampling_tab`
-        only exists when HAS_PYMULTINEST is True, so the short-circuit
-        `and` below matters -- it's never evaluated otherwise."""
+        Sampling tab is the active one, or the ordinary least-squares path
+        otherwise. Whether pymultinest is actually usable is only checked
+        by run_multinest_fit itself (via fitting.multinest_fit's lazy
+        import), which reports a failure there rather than this method
+        gating the choice up front."""
         func, _, _, _ = self.current_state()
         if getattr(func, 'is_custom', False):
             QMessageBox.information(
                 self, 'Fit', "Custom models aren't supported for QU-fitting/Sampling yet -- "
                               "only the Visualization and Measurements tabs.")
             return
-        if HAS_PYMULTINEST and self.left_tabs.currentWidget() is self.sampling_tab:
+        if self.left_tabs.currentWidget() is self.sampling_tab:
             self.run_multinest_fit()
         else:
             self.run_lsq_fit()
@@ -2061,7 +2058,6 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.fit_data = (wl, q, q_err, u, u_err, freq, I)
         self.fit_button.setEnabled(True)
         self.rmsynth_data_button.setEnabled(True)
-        self.set_sampling_tab_enabled(True)
 
         self.update_plot()
 

@@ -692,7 +692,13 @@ def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
     samples / point-estimate (pol_idx-local order) / evidence share / chi2
     / point-lnZ, plus the other surviving families with at least
     `MIN_FAMILY_EVIDENCE_SHARE`% evidence share (capped to the top 4) and
-    a summary of everything else excluded.
+    a summary of everything else excluded. Each `other_families` entry
+    carries the same shape of information as the winner -- 'samples'
+    (pooled, pol_idx-local), 'pars'/'errs' (its own marginal-median point
+    estimate, pol_idx-local, same (2,ndim) errs convention as
+    median_pctl_errs), 'evidence_share', 'chi2', 'lnZ' -- so a caller can
+    treat any of them (not just the winner) as a fully-fledged candidate
+    result; see app.SamplingMixin's Corner-tab family switcher.
 
     - Parses `outputfiles_basename + 'post_separate.dat'` (raw per-mode
       blocks: weight, -2*loglike, params-in-cube-order) and
@@ -818,7 +824,8 @@ def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
                      key=lambda c: -c['evidence_share'])
     significant = [c for c in others if c['evidence_share'] >= MIN_FAMILY_EVIDENCE_SHARE]
     negligible = [c for c in others if c['evidence_share'] < MIN_FAMILY_EVIDENCE_SHARE]
-    other_families = [{'samples': c['pooled_samples'], 'evidence_share': c['evidence_share'],
+    other_families = [{'samples': c['pooled_samples'], 'pars': c['pars'], 'errs': c['errs'],
+                        'evidence_share': c['evidence_share'],
                         'chi2': c['chi2'], 'lnZ': c['lnZ']} for c in significant[:4]]
     trimmed = significant[4:] + negligible
     dropped = {'count': len(trimmed),
@@ -965,6 +972,27 @@ def multinest_fit(wl, q, q_err, u, u_err, model, spectral_pars, kind_bounds,
                              stats['global evidence'], stats['global evidence error'], 2 * len(wl))
 
 
+def expand_pars_errs(ndim_full, pol_idx, pol_pars, pol_errs, spectral_pars):
+    """Scatter a pol_idx-local point estimate (`pol_pars`, and `pol_errs`
+    in the (2,ndim) lo-row/hi-row convention median_pctl_errs/best_family
+    use) back into full-length `best_pars`/`errs` lists -- spectral
+    ('alpha'/'eps'-kind) slots filled from `spectral_pars`, errs=(0,0)
+    there, matching what every slider/model-curve caller (ParamSlider.set_
+    value, ModelPlot/StokesPlot.update_plot) expects. Used by
+    assemble_result() for the winning family, and directly by app.py's
+    Corner-tab family switcher for whichever other family the user picks
+    from its dropdown -- both need the exact same expansion."""
+    best_pars = [0.0] * ndim_full
+    errs = [(0.0, 0.0)] * ndim_full
+    for i, v in zip(pol_idx, pol_pars):
+        best_pars[i] = v
+    for i, lo, hi in zip(pol_idx, pol_errs[0], pol_errs[1]):
+        errs[i] = (lo, hi)
+    for i, v in spectral_pars.items():
+        best_pars[i] = v
+    return best_pars, errs
+
+
 def assemble_result(spec, pol_idx, spectral_pars, best_family_result,
                       global_evidence, global_evidence_err, n_data):
     """Scatter best_family()'s pol_idx-local result back into full-length
@@ -988,14 +1016,7 @@ def assemble_result(spec, pol_idx, spectral_pars, best_family_result,
     ndim_full = len(spec.params)
     n_free = len(pol_idx)
 
-    best_pars = [0.0] * ndim_full
-    errs = [(0.0, 0.0)] * ndim_full
-    for i, v in zip(pol_idx, pol_pars):
-        best_pars[i] = v
-    for i, lo, hi in zip(pol_idx, pol_errs[0], pol_errs[1]):
-        errs[i] = (lo, hi)
-    for i, v in spectral_pars.items():
-        best_pars[i] = v
+    best_pars, errs = expand_pars_errs(ndim_full, pol_idx, pol_pars, pol_errs, spectral_pars)
 
     dof = n_data - n_free
     chi2 = winner_chi2 * dof
