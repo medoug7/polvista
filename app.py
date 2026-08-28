@@ -858,7 +858,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.rmsynth_data_button.clicked.connect(self.rmsynth_from_data)
         rmsynth_top_row.addWidget(self.rmsynth_data_button)
         self.rmsynth_measurements_button = QPushButton('measurements')
-        self.rmsynth_measurements_button.setToolTip("Compute the Faraday spectrum of the generated measurements.")
+        self.rmsynth_measurements_button.setToolTip("Compute the Faraday spectrum of the simulated measurements.")
         self.rmsynth_measurements_button.setEnabled(False)  # only enabled once Generate has produced points
         self.rmsynth_measurements_button.clicked.connect(self.rmsynth_from_measurements)
         rmsynth_top_row.addWidget(self.rmsynth_measurements_button)
@@ -1409,7 +1409,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             self.rmsynth_from_model()
         elif source == 'data':
             self.rmsynth_from_data()
-        elif source == 'measurements':
+        elif source == 'simulation':
             self.rmsynth_from_measurements()
 
     def rmsynth_from_model(self):
@@ -1477,7 +1477,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         q, u = Q / I, U / I
         q_err = np.sqrt((Q_err / I) ** 2 + (Q * I_err / I ** 2) ** 2)
         u_err = np.sqrt((U_err / I) ** 2 + (U * I_err / I ** 2) ** 2)
-        self.run_rmsynth(wl, q, u, q_err, u_err, 'measurements')
+        self.run_rmsynth(wl, q, u, q_err, u_err, 'simulation')
 
     # ── Menu bar ───────────────────────────────────────────────────────────
     def build_menu(self):

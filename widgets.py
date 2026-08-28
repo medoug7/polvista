@@ -954,8 +954,8 @@ class RMSynthPlot(FigureCanvas):
 
         ax.set_xlim(phi[0], phi[-1])
         ax.set_ylim(0, 1.3 * max(np.max(amp_dirty), np.max(amp_clean), 1e-12))
-        ax.set_title(f'Faraday spectrum -- from {source_label}')
-        ax.legend(loc='upper right', fontsize=12)
+        ax.set_title(f'Faraday spectrum - from {source_label}')
+        ax.legend(loc='upper right', fontsize=14)
         apply_fixed_margins(self.fig, self)
         self.draw_idle()
 

@@ -83,7 +83,7 @@ def default_phi_grid(lambda2, phi_max_mult=PHI_MAX_ALIAS_MULT, phi_max_cap=None)
         # towards 0 (wide band) or blows up towards +inf (narrow band).
         phi_max_cap = np.clip(phi_max_mult * phi_alias, PHI_HALF_WIDTH_MIN, PHI_HALF_WIDTH_MAX)
     phi_max = min(phi_max_sampling, phi_max_cap)
-    dphi = fwhm_rmsf / 5.0
+    dphi = fwhm_rmsf / 15.0
 
     n = int(np.ceil(phi_max / dphi))
     phi = dphi * np.arange(-n, n + 1)

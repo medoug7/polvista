@@ -707,9 +707,9 @@ class CustomModel(QDialog):
     def _style_preview_axes(self):
         self.ax_emiss.set_ylabel(r'$j_p(z)$')
         self.ax_phi.set_ylabel(r"$\phi(z),\ \phi'(z)$")
-        self.ax_phi.set_xlabel('z  (-1 = source (far-side)  →  1 = observer)', fontsize=14)
+        self.ax_phi.set_xlabel('z  (-1 = source far-side  →  1 = observer)', fontsize=14)
         self.ax_emiss.set_xlim(-1.0, 1.0)
-        self.ax_emiss.set_ylim(0.0,)
+        #self.ax_emiss.set_ylim(0.0,)
         self.ax_phi.set_xlim(-1.0, 1.0)
         # sharex=True already keeps the two x-axes in sync -- hide the top
         # panel's own tick labels so hspace=0 (see _apply_preview_margins)

@@ -1718,7 +1718,7 @@ def parse_custom_expr(text, what):
     except (SyntaxError, TypeError, ValueError, AttributeError) as e:
         raise CustomModelError(f"Couldn't parse {what} = '{text}': {e}") from e
     except NameError as e:
-        allowed = ', '.join(sorted(_SYMPY_ALLOWED_NAMES))
+        allowed = ', '.join(sorted(list(_SYMPY_ALLOWED_NAMES))+['abs', 'gaussian', 'delta'])
         raise CustomModelError(
             f"Couldn't parse {what} = '{text}': uses a function polvista doesn't recognize. "
             f"Supported functions are: {allowed}.") from e

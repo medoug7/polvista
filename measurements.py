@@ -23,7 +23,7 @@ from polvista.latex_stuff import latex_pixmap
 # fractional hue (0=red). Stops short of 1.0 (which would wrap back through
 # magenta to red) so the sweep reads as a physical rainbow's own red-to-
 # violet order rather than a full color-wheel loop.
-RAINBOW_HUE_MAX = 0.7
+RAINBOW_HUE_MAX = 0.8
 
 
 def band_colors(n):
