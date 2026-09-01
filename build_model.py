@@ -139,7 +139,7 @@ DEFAULT_KIND_LABEL = 'Number'
 # Spectral-model dropdown's current selection -- mirrors app.py's own
 # rebuild_sliders visibility exactly (nu0 needs SSA/Thermal, T needs
 # Thermal, beta needs Log-parabola, alpha is hidden only for Thermal,
-# where source_function's own alpha argument is inert).
+# where intensity_shape's own alpha argument is inert).
 LOCKED_PARAM_ROWS = [
     dict(name='p0', kind_text='Fraction', to_phys=KIND_DEFS['Fraction']['to_phys'],
          lo_disp=CUSTOM_P0_BOUNDS[0] * 100.0, hi_disp=CUSTOM_P0_BOUNDS[1] * 100.0,
@@ -207,8 +207,8 @@ def _intro_html(dpi):
     # expression part (SyntaxError on Python < 3.12), so these can't just
     # be inlined as m(r'...') calls in the f-strings below.
     m = functools.partial(_intro_math, dpi=dpi)
-    equation1 = m(r'$P(\lambda)= \frac{1}{J}\int_{-1}^{1} j_p(z)\,dz$', fontsize=18)
-    equation2 = m(r'$J=\int_{-1}^{1} j(z)\,dz$', fontsize=16)
+    equation1 = m(r'$P(\lambda)= \frac{1}{I_\lambda}\int_{-1}^{1} j_p(z)\,dz$', fontsize=18)
+    equation2 = m(r'$I_\lambda=\int_{-1}^{1} j(z)\,dz$', fontsize=16)
 
     depth_formula = m(r"$\phi(z)=\int_{\max(z, \mathrm{lower})}^{\mathrm{upper}}\phi'(z') dz'$",
                        fontsize=14)
@@ -725,7 +725,7 @@ class CustomModel(QDialog):
         the equation cards below gain (see refit_dialog_equation/
         models._insert_opacity_factor) whenever the Spectral-model
         dropdown (preview-only, see its own tooltip) is SSA/Thermal."""
-        latex = r'\cdot\ e^{2i\phi(z)\lambda^2}'
+        latex = r'\cdot\ j(z)\ e^{2i\phi(z)\lambda^2}'
         if self.spectral_shape_combo.currentData() in ('ssa', 'thermal'):
             latex += r'\,e^{-\tau_\lambda(z)}'
         return f'${latex}$'
@@ -1078,7 +1078,7 @@ class CustomModel(QDialog):
         # imaginary part to show, keeping every existing real-only model's
         # preview pixel-identical to before this. j(z), the denominator's
         # own unpolarized shape, isn't plotted here at all: it only ever
-        # collapses to one number, J (see the equation cards above), so a
+        # collapses to one number, I_lambda (see the equation cards above), so a
         # per-z preview of it wouldn't show anything P(lambda)'s own shape
         # actually depends on -- only its overall normalization.
         #

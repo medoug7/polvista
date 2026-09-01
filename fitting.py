@@ -29,7 +29,7 @@ never touched: (a, b) is converted back to physical (p, X) before every
 import numpy as np
 from scipy.optimize import least_squares
 
-from polvista.models import MODELS, comp2RMdep, comp2intern, source_function
+from polvista.models import MODELS, comp2RMdep, comp2intern, intensity_shape
 
 EPS = 1e-10
 
@@ -204,16 +204,16 @@ def estimate_alpha(freq, I):
 
 
 def estimate_ssa_shape(freq, I, nu0_init, alpha_init, nu0_bounds, fit_nu0):
-    """Nonlinear regression of loaded I(nu) data against the SSA source
-    function shape S'(nu; nu0, alpha, 'ssa') (models.source_function -- the
+    """Nonlinear regression of loaded I(nu) data against the SSA normalized
+    intensity shape I'(nu; nu0, alpha, 'ssa') (models.intensity_shape -- the
     caller must only invoke this for a single-component model whose own
     Spectrum-box shape is 'ssa', see models.set_spectral_shape), anchored
     the same way estimate_alpha
-    is: log(I/I[i0]) fit against log(S'/S'[i0]) at the lowest-frequency
+    is: log(I/I[i0]) fit against log(I'/I'[i0]) at the lowest-frequency
     point i0, no free intercept.
 
     Unlike a plain power law, alpha appears inside an exponential under
-    SSA (see source_function), so there's no closed form -- this is a
+    SSA (see intensity_shape), so there's no closed form -- this is a
     genuine nonlinear least-squares solve (scipy `least_squares`, same
     machinery `qu_fit` itself uses).
 
@@ -239,8 +239,8 @@ def estimate_ssa_shape(freq, I, nu0_init, alpha_init, nu0_bounds, fit_nu0):
     target = np.log(I / I[i0])
 
     def shape_log_ratio(nu0, alpha):
-        S = source_function(freq, nu0, alpha, 'ssa')
-        return np.log(S / S[i0])
+        Iprime = intensity_shape(freq, nu0, alpha, 'ssa')
+        return np.log(Iprime / Iprime[i0])
 
     if not fit_nu0:
         result = least_squares(lambda p: shape_log_ratio(nu0_init, p[0]) - target, x0=[alpha_init])
@@ -262,8 +262,8 @@ def estimate_shape_2comp(freq, I, eps, nu0_1_init, nu0_2_init, alpha_init,
                           T1=None, T2=None, beta1=None, beta2=None):
     """Two-component counterpart of estimate_ssa_shape: nonlinear
     regression of loaded I(nu) data against a shared-alpha blend
-    eps*S'(nu; nu0_1, alpha, shape1) + (1-eps)*S'(nu; nu0_2, alpha, shape2)
-    (see source_function) -- each component in its own shape, which need
+    eps*I'(nu; nu0_1, alpha, shape1) + (1-eps)*I'(nu; nu0_2, alpha, shape2)
+    (see intensity_shape) -- each component in its own shape, which need
     not match the other's (a 'powerlaw' component and an 'ssa' component
     can be blended together) -- anchored the same log(I/I[i0]) way. alpha
     is always shared between both components -- QU-only fitting has only
@@ -281,7 +281,7 @@ def estimate_shape_2comp(freq, I, eps, nu0_1_init, nu0_2_init, alpha_init,
     `T1`/`T2` are each component's own fixed electron temperature [K],
     required (non-None) only when that component's own shape is 'thermal'
     -- unlike nu0_1/nu0_2, T is never fit here (MainWindow.temp_slider_1/2
-    are always taken as-is), just passed through to source_function.
+    are always taken as-is), just passed through to intensity_shape.
     `beta1`/`beta2` are likewise each component's own fixed curvature
     index, required only when that component's own shape is 'logparabola'
     (MainWindow.beta_slider_1/2), also never fit here.
@@ -298,9 +298,9 @@ def estimate_shape_2comp(freq, I, eps, nu0_1_init, nu0_2_init, alpha_init,
     target = np.log(I / I[i0])
 
     def shape_log_ratio(nu0_1, nu0_2, alpha):
-        S = (eps * source_function(freq, nu0_1, alpha, shape1, T=T1, beta=beta1)
-             + (1.0 - eps) * source_function(freq, nu0_2, alpha, shape2, T=T2, beta=beta2))
-        return np.log(S / S[i0])
+        Iprime = (eps * intensity_shape(freq, nu0_1, alpha, shape1, T=T1, beta=beta1)
+                  + (1.0 - eps) * intensity_shape(freq, nu0_2, alpha, shape2, T=T2, beta=beta2))
+        return np.log(Iprime / Iprime[i0])
 
     lo_nu0, hi_nu0 = nu0_bounds
 
@@ -965,7 +965,13 @@ def multinest_fit(wl, q, q_err, u, u_err, model, spectral_pars, kind_bounds,
         )
 
     analyzer = pymultinest.Analyzer(n_params=ndim, outputfiles_basename=outputfiles_basename)
-    stats = analyzer.get_stats()
+    # get_mode_stats(), not get_stats(): both carry 'global evidence'/
+    # 'global evidence error' (get_stats() is just get_mode_stats() plus a
+    # per-dimension marginal-statistics table this function never reads),
+    # but get_stats() additionally sorts and numpy.interp's the *entire*
+    # posterior column-by-column to build that table -- seconds of wasted
+    # work on a run with many samples, all thrown away below.
+    stats = analyzer.get_mode_stats()
 
     best_family_result = best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars, idx_pol, order_cube)
     return assemble_result(spec, idx_pol, spectral_pars, best_family_result,
@@ -1071,7 +1077,13 @@ def load_previous_run(wl, q, q_err, u, u_err, model, spectral_pars, outputfiles_
     wl = np.asarray(wl)
 
     analyzer = pymultinest.Analyzer(n_params=ndim, outputfiles_basename=outputfiles_basename)
-    stats = analyzer.get_stats()
+    # get_mode_stats(), not get_stats(): both carry 'global evidence'/
+    # 'global evidence error' (get_stats() is just get_mode_stats() plus a
+    # per-dimension marginal-statistics table this function never reads),
+    # but get_stats() additionally sorts and numpy.interp's the *entire*
+    # posterior column-by-column to build that table -- seconds of wasted
+    # work on a run with many samples, all thrown away below.
+    stats = analyzer.get_mode_stats()
 
     best_family_result = best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars, idx_pol, order_cube)
     return assemble_result(spec, idx_pol, spectral_pars, best_family_result,

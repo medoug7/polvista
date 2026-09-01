@@ -14,20 +14,25 @@ H_PLANCK = 6.62607015e-34   # J s
 K_BOLTZMANN = 1.380649e-23  # J/K
 
 
-# ── Spectral shape: normalized source function S'(nu) ─────────────────────────
+# ── Spectral shape: normalized intensity shape I'(nu) ──────────────────────────
 # Every model's spectral weighting (spectral_weights for two-component
 # models, stokes_I's single-component branch) shapes a component's relative
-# intensity via a normalized source function S'(nu), S'(nu0)=1. The standard
-# choice is a power law (nu/nu0)**alpha, with nu0 auto-set to the lowest
-# frequency in the currently plotted band. A log-parabola (nu/nu0)**
-# (alpha+beta*ln(nu/nu0)) shares that same shared-band nu0 -- it's a
-# one-parameter generalization of the power law, adding a curvature term
+# intensity via a normalized intensity shape I'(nu), I'(nu0)=1 -- i.e. the
+# emergent Stokes I(nu)/I(nu0) implied by that component's spectral choice.
+# (Classical radiative-transfer notation reserves "source function" S_nu for
+# j_nu/alpha_nu, the *pre-escape* quantity I_nu relaxes toward -- see
+# intensity_shape's own docstring for where that bare quantity actually
+# shows up, via apply_escape=False, in the custom-model per-z opacity term.)
+# The standard choice is a power law (nu/nu0)**alpha, with nu0 auto-set to
+# the lowest frequency in the currently plotted band. A log-parabola
+# (nu/nu0)**(alpha+beta*ln(nu/nu0)) shares that same shared-band nu0 -- it's
+# a one-parameter generalization of the power law, adding a curvature term
 # beta on top of alpha rather than a new reference frequency. Two other
 # alternatives instead need an explicit turnover frequency nu0 (there's no
 # band edge to fall back on): the classic synchrotron self-absorbed (SSA)
 # spectrum, and a thermal free-free spectrum (full Planck function x
-# free-free opacity, see thermal_source), which also needs an electron
-# temperature T.
+# free-free opacity, see thermal_intensity_shape), which also needs an
+# electron temperature T.
 #
 # Module-level rather than threaded through every model func's fixed
 # (x, params) signature -- there's only ever one "current"
@@ -87,15 +92,16 @@ SPECTRAL_BETA_2 = None  # two-component log-parabola models' component-2
 
 def set_spectral_shape(shape, nu0=None, shape2=None, nu0_2=None, T=None, T2=None,
                         beta=None, beta2=None):
-    """Select the source function(s) S'(nu) used by every model's spectral
-    weighting from here on: 'powerlaw' (the default; nu0 auto-derived per
-    call, always shared between both components of a two-component model --
-    see reference_nu/component_reference_nu), 'ssa' (classic synchrotron
-    self-absorption; `nu0` [MHz] is then required -- there's no band edge
-    to default to), 'thermal' (thermal free-free; `nu0` [MHz] and `T` [K]
-    are then required -- see thermal_source), or 'logparabola' (curved
-    power law sharing the same shared-band nu0 as 'powerlaw'; `beta` is
-    then required -- see source_function).
+    """Select the normalized intensity shape(s) I'(nu) used by every model's
+    spectral weighting from here on: 'powerlaw' (the default; nu0
+    auto-derived per call, always shared between both components of a
+    two-component model -- see reference_nu/component_reference_nu), 'ssa'
+    (classic synchrotron self-absorption; `nu0` [MHz] is then required --
+    there's no band edge to default to), 'thermal' (thermal free-free;
+    `nu0` [MHz] and `T` [K] are then required -- see
+    thermal_intensity_shape), or 'logparabola' (curved power law sharing
+    the same shared-band nu0 as 'powerlaw'; `beta` is then required -- see
+    intensity_shape).
 
     `shape`/`nu0`/`T`/`beta` is a single-component model's own
     shape/turnover frequency/temperature/curvature, or a two-component
@@ -127,7 +133,7 @@ def band_nu0(nu, nu_min):
 
 
 def component_reference_nu(nu, nu_min, nu0_override, shape):
-    """The nu0 [MHz] that anchors one component's S'(nu0)=1: `nu0_override`
+    """The nu0 [MHz] that anchors one component's I'(nu0)=1: `nu0_override`
     (that component's own SSA/thermal turnover frequency, set via
     set_spectral_shape) when `shape` is 'ssa' or 'thermal' and it's set,
     otherwise the shared band nu0 (see band_nu0) -- i.e. only 'ssa'/
@@ -142,15 +148,15 @@ def component_reference_nu(nu, nu_min, nu0_override, shape):
 
 
 def reference_nu(nu, nu_min=None):
-    """The nu0 [MHz] that anchors S'(nu0)=1 for a single-component model:
+    """The nu0 [MHz] that anchors I'(nu0)=1 for a single-component model:
     the SSA turnover frequency set via set_spectral_shape when that shape
     is active, otherwise the shared band nu0 (see band_nu0)."""
     return component_reference_nu(nu, nu_min, SPECTRAL_NU0, SPECTRAL_SHAPE)
 
 
-def thermal_source(ratio, nu0, T, apply_escape=True):
-    """Normalized thermal free-free source function
-    S'(nu) = B_nu(T)*(1-e^-tau_nu) / [B_nu0(T)*(1-e^-tau0)], `ratio` =
+def thermal_intensity_shape(ratio, nu0, T, apply_escape=True):
+    """Normalized thermal free-free intensity shape
+    I'(nu) = B_nu(T)*(1-e^-tau_nu) / [B_nu0(T)*(1-e^-tau0)], `ratio` =
     nu/nu0, tau0 fixed to 1 and tau_nu = (nu/nu0)**-2.1 the free-free
     opacity (folding the usual tau0 normalization into nu0, same
     convention as 'ssa' -- nu0 is where tau_nu=1). `nu0` [MHz] is only
@@ -158,16 +164,18 @@ def thermal_source(ratio, nu0, T, apply_escape=True):
     the electron temperature.
 
     `apply_escape=False` returns the bare local Planck source function
-    (`planck_ratio` below) alone, without the `(1-e^-tau_nu)/(1-e^-tau0)`
-    escape-probability bracket -- see source_function's own docstring for
+    (`planck_ratio` below) alone -- B_nu(T)/B_nu0(T), the true S_nu/S_nu0
+    of classical radiative-transfer notation, via Kirchhoff's law S_nu =
+    B_nu(T) in LTE -- without the `(1-e^-tau_nu)/(1-e^-tau0)`
+    escape-probability bracket -- see intensity_shape's own docstring for
     why a caller (models.build_custom_model's own per-z opacity) would
-    want that bare piece instead of this function's default, already-
-    escaped, whole-slab emergent ratio.
+    want that bare source-function piece instead of this function's
+    default, already-escaped, whole-slab emergent intensity ratio.
 
     This single expression has three asymptotes, set by Theta: optically
-    thick (ratio << 1) is the Rayleigh-Jeans blackbody, S' ~ ratio**2;
+    thick (ratio << 1) is the Rayleigh-Jeans blackbody, I' ~ ratio**2;
     optically thin and still Rayleigh-Jeans (1 << ratio << 1/Theta) is the
-    classical thermal-bremsstrahlung index, S' ~ ratio**-0.1; and
+    classical thermal-bremsstrahlung index, I' ~ ratio**-0.1; and
     ratio >> 1/Theta (h*nu >~ k_B*T) is an exponential Wien cutoff, from
     B_nu(T) itself -- so the -0.1 window is only visible when Theta << 1,
     i.e. nu0 well below k_B*T/h.
@@ -183,7 +191,7 @@ def thermal_source(ratio, nu0, T, apply_escape=True):
     overflows straight to inf once Theta is that large -- and the exponent
     is clipped before the final exp() so a genuinely out-of-float64-range
     answer saturates at a large finite number instead of overflowing,
-    since an inf/nan source function is a non-finite residual that
+    since an inf/nan intensity shape is a non-finite residual that
     scipy's least_squares (used by estimate_shape_2comp) rejects outright,
     aborting the fit."""
     nu0_hz = nu0 * 1e6
@@ -202,8 +210,8 @@ def thermal_source(ratio, nu0, T, apply_escape=True):
     return np.nan_to_num(planck_ratio * bracket / bracket0, nan=0.0, posinf=1e300, neginf=0.0)
 
 
-def source_function(nu, nu0, alpha, shape, T=None, beta=None, apply_escape=True):
-    """Normalized source function S'(nu), S'(nu0)=1, in the given `shape`
+def intensity_shape(nu, nu0, alpha, shape, T=None, beta=None, apply_escape=True):
+    """Normalized intensity shape I'(nu), I'(nu0)=1, in the given `shape`
     ('powerlaw'/'ssa'/'thermal'/'logparabola' -- always passed explicitly
     by the caller, e.g. a two-component model's own per-component
     SPECTRAL_SHAPE/SPECTRAL_SHAPE_2, since the two components of a model
@@ -213,10 +221,10 @@ def source_function(nu, nu0, alpha, shape, T=None, beta=None, apply_escape=True)
     (1-e^-tau_nu)/(1-e^-tau_0), tau_0 fixed to 1 and tau_nu = tau_0*
     (nu/nu0)**(alpha-5/2) the frequency-dependent opacity -- the -5/2 offset
     is what makes alpha the actual optically-thin spectral index (nu >>
-    nu0): S'(nu) there is ~ (nu/nu0)**(5/2) * tau_nu ~ (nu/nu0)**alpha.
-    'thermal': thermal free-free spectrum, see thermal_source -- `alpha`
-    is inert for this shape (its -0.1 optically-thin index is emergent
-    from `T`, not a free parameter); `T` [K] is required.
+    nu0): I'(nu) there is ~ (nu/nu0)**(5/2) * tau_nu ~ (nu/nu0)**alpha.
+    'thermal': thermal free-free spectrum, see thermal_intensity_shape --
+    `alpha` is inert for this shape (its -0.1 optically-thin index is
+    emergent from `T`, not a free parameter); `T` [K] is required.
     'logparabola': curved power law (nu/nu0)**(alpha+beta*ln(nu/nu0)) --
     alpha is still the local spectral index at nu0 (as under 'powerlaw'),
     and `beta` [dimensionless] is required; beta=0 reduces exactly to
@@ -229,19 +237,21 @@ def source_function(nu, nu0, alpha, shape, T=None, beta=None, apply_escape=True)
     `apply_escape=False` (only meaningful for 'ssa'/'thermal' -- a no-op
     for 'powerlaw'/'logparabola', which have no tau_nu/escape-probability
     concept at all) strips the `(1-e^-tau_nu)/(1-e^-tau0)` bracket,
-    returning the bare *local* source function shape alone -- `ratio**2.5`
-    for 'ssa' (notably alpha-independent: the universal synchrotron
-    self-absorption source-function shape doesn't depend on the electron
-    power-law index, only tau_nu's own frequency-scaling does), or the
-    bare Planck ratio for 'thermal' (see thermal_source). That bracket is
-    the closed-form *emergent*-intensity solution of a uniform, unresolved
-    slab -- i.e. it already *is* a line-of-sight integral, just collapsed
-    algebraically for the special case of z-independent source/absorption
-    coefficients. A caller building its own per-z optical depth (see
-    build_custom_model's own opacity term) needs the bare S(nu) alone for
-    Kirchhoff's law (alpha'(z)=j(z)/S(nu)) -- reusing the bracketed value
-    there would double-apply that same escape-probability physics, once
-    via the bracket and again via the newly-resolved per-z integral."""
+    returning the bare *local* source function shape alone (the true,
+    classical-radiative-transfer-sense S_nu/S_nu0 = j_nu/alpha_nu, not
+    I'(nu)) -- `ratio**2.5` for 'ssa' (notably alpha-independent: the
+    universal synchrotron self-absorption source-function shape doesn't
+    depend on the electron power-law index, only tau_nu's own
+    frequency-scaling does), or the bare Planck ratio for 'thermal' (see
+    thermal_intensity_shape). That bracket is the closed-form *emergent*-
+    intensity solution of a uniform, unresolved slab -- i.e. it already
+    *is* a line-of-sight integral, just collapsed algebraically for the
+    special case of z-independent source/absorption coefficients. A caller
+    building its own per-z optical depth (see build_custom_model's own
+    opacity term) needs the bare S(nu) alone for Kirchhoff's law
+    (alpha'(z)=j(z)/S(nu)) -- reusing the bracketed (I'(nu)) value there
+    would double-apply that same escape-probability physics, once via the
+    bracket and again via the newly-resolved per-z integral."""
     ratio = nu / nu0
     if shape == 'ssa':
         bare = ratio ** 2.5
@@ -253,7 +263,7 @@ def source_function(nu, nu0, alpha, shape, T=None, beta=None, apply_escape=True)
         # sign, and expm1 keeps this well-behaved as tau_nu -> 0.
         return bare * np.expm1(-tau_nu) / np.expm1(-tau0)
     if shape == 'thermal':
-        return thermal_source(ratio, nu0, T, apply_escape=apply_escape)
+        return thermal_intensity_shape(ratio, nu0, T, apply_escape=apply_escape)
     if shape == 'logparabola':
         return ratio ** (alpha + beta * np.log(ratio))
     return ratio ** alpha
@@ -314,10 +324,10 @@ def spectral_weights(x, eps, alpha1, alpha2, nu_min=None):
     epsilon is component 1's flux fraction at that reference frequency -- a
     directly-set slider rather than something derived from per-component
     turnover frequencies. Each weight then evolves away from it via that
-    component's own source function S'(nu), in that component's own shape
-    (see source_function/set_spectral_shape -- the two components need not
-    share a shape):
-        w1 = eps * S1'(nu),  w2 = (1-eps) * S2'(nu)
+    component's own normalized intensity shape I'(nu), in that component's
+    own shape (see intensity_shape/set_spectral_shape -- the two
+    components need not share a shape):
+        w1 = eps * I1'(nu),  w2 = (1-eps) * I2'(nu)
     w1+w2 is thus the (normalized) total Stokes I(nu) of the two-component
     system; see stokes_I().
 
@@ -333,8 +343,8 @@ def spectral_weights(x, eps, alpha1, alpha2, nu_min=None):
     nu = C / x / 1e6  # MHz
     nu0_1 = component_reference_nu(nu, nu_min, SPECTRAL_NU0, SPECTRAL_SHAPE)
     nu0_2 = component_reference_nu(nu, nu_min, SPECTRAL_NU0_2, SPECTRAL_SHAPE_2)
-    w1 = eps * source_function(nu, nu0_1, alpha1, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)
-    w2 = (1.0 - eps) * source_function(nu, nu0_2, alpha2, SPECTRAL_SHAPE_2, T=SPECTRAL_TEMP_2, beta=SPECTRAL_BETA_2)
+    w1 = eps * intensity_shape(nu, nu0_1, alpha1, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)
+    w2 = (1.0 - eps) * intensity_shape(nu, nu0_2, alpha2, SPECTRAL_SHAPE_2, T=SPECTRAL_TEMP_2, beta=SPECTRAL_BETA_2)
     return w1, w2
 
 
@@ -426,7 +436,7 @@ def stokes_I(wl, n_components, pars, nu_min=None):
     (the lowest frequency spanned by wl, or an explicit override -- see
     below) for 'powerlaw'/'logparabola'. For a single component the
     spectral index has no effect on p=P/I, but it does shape the total
-    intensity spectrum itself, via S'(nu) (see source_function/
+    intensity spectrum itself, via I'(nu) (see intensity_shape/
     set_spectral_shape); for two components this is the same w1+w2 total
     weight that already governs how the polarization blends between them.
 
@@ -438,10 +448,11 @@ def stokes_I(wl, n_components, pars, nu_min=None):
 
     'ssa' and 'thermal' are the exception: each anchors at that
     component's own turnover nu0 instead (see two_component_ref_wl for the
-    two-component case), not nu_min. Both source functions are already
-    physically normalized to S'(nu0)=1 by construction (see
-    thermal_source, and source_function's 'ssa' branch at ratio=1), so
-    this is a genuine physical anchor rather than an arbitrary one -- and
+    two-component case), not nu_min. Both intensity shapes are already
+    physically normalized to I'(nu0)=1 by construction (see
+    thermal_intensity_shape, and intensity_shape's 'ssa' branch at
+    ratio=1), so this is a genuine physical anchor rather than an
+    arbitrary one -- and
     it means dragging that component's own turnover slider rescales the
     displayed curve, since nu0 is exactly where it now reads 1. (Only
     'powerlaw'/'logparabola' need the nu_min fallback: they have no
@@ -458,11 +469,11 @@ def stokes_I(wl, n_components, pars, nu_min=None):
     if n_components == 1:
         alpha = pars[-1]
         nu0 = reference_nu(nu, nu_min)
-        raw = source_function(nu, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)
+        raw = intensity_shape(nu, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)
         if SPECTRAL_SHAPE in ('ssa', 'thermal'):
-            raw_ref = 1.0  # source_function is already S'(nu0)=1 by construction for both
+            raw_ref = 1.0  # intensity_shape is already I'(nu0)=1 by construction for both
         else:
-            raw_ref = source_function(nu_min_arr, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)[0]
+            raw_ref = intensity_shape(nu_min_arr, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)[0]
     else:
         eps, alpha1, alpha2 = pars[-3:]
         wl_ref = two_component_ref_wl(nu, nu_min, SPECTRAL_SHAPE, SPECTRAL_SHAPE_2)
@@ -730,7 +741,7 @@ register(comp2mixdep,
               r'+\frac{w_2}{w_1+w_2}p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
 
 
-# ── Equation-card display: prepend the chosen S'(nu) definition(s) to a
+# ── Equation-card display: prepend the chosen I'(nu) definition(s) to a
 # model's own polarization equation, and -- for two-component models -- the
 # w1/w2/epsilon definition built from them, on its own line above. Built
 # dynamically (not baked into ModelSpec.equation at registration time) since
@@ -743,65 +754,65 @@ register(comp2mixdep,
 # component_reference_nu). When both components share one shape, the
 # combined, unsubscripted-nu0 (powerlaw) or i-subscripted (ssa) templates
 # below are used, matching the paper; when they don't (one 'powerlaw', one
-# 'ssa'), full_equation instead builds each component's own S_i'(nu) line
-# separately (see _s_prime_component_latex). The frequency-dependent opacity
+# 'ssa'), full_equation instead builds each component's own I_i'(nu) line
+# separately (see _i_prime_component_latex). The frequency-dependent opacity
 # tau_nu isn't shown as its own term -- tau_0 is fixed to 1, so it's inlined
-# directly into S'(nu) instead of introducing it as a separate symbol.
-S_PRIME_POWERLAW = r"S'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha}"
-S_PRIME_SSA_ONE = (r"S'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{5/2}"
+# directly into I'(nu) instead of introducing it as a separate symbol.
+I_PRIME_POWERLAW = r"I'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha}"
+I_PRIME_SSA_ONE = (r"I'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{5/2}"
                     r"\left[\dfrac{1-e^{-(\nu/\nu_0)^{\alpha-5/2}}}{1-e^{-1}}\right]")
-S_PRIME_SSA_TWO = (r"S_i'(\nu)=\left(\dfrac{\nu}{\nu_{0,i}}\right)^{5/2}"
+I_PRIME_SSA_TWO = (r"I_i'(\nu)=\left(\dfrac{\nu}{\nu_{0,i}}\right)^{5/2}"
                     r"\left[\dfrac{1-e^{-(\nu/\nu_{0,i})^{\alpha_i-5/2}}}{1-e^{-1}}\right]\ \ (i=1,2)")
-S_PRIME_THERMAL_ONE = (r"S'(\nu)=\dfrac{B_\nu(T)\left[1-e^{-(\nu/\nu_0)^{-2.1}}\right]}"
+I_PRIME_THERMAL_ONE = (r"I'(\nu)=\dfrac{B_\nu(T)\left[1-e^{-(\nu/\nu_0)^{-2.1}}\right]}"
                         r"{B_{\nu_0}(T)\left(1-e^{-1}\right)}")
-S_PRIME_THERMAL_TWO = (r"S_i'(\nu)=\dfrac{B_\nu(T_i)\left[1-e^{-(\nu/\nu_{0,i})^{-2.1}}\right]}"
+I_PRIME_THERMAL_TWO = (r"I_i'(\nu)=\dfrac{B_\nu(T_i)\left[1-e^{-(\nu/\nu_{0,i})^{-2.1}}\right]}"
                         r"{B_{\nu_{0,i}}(T_i)\left(1-e^{-1}\right)}\ \ (i=1,2)")
 # Log-parabola shares 'powerlaw''s own shared band nu_0 (no per-component
-# turnover), so -- like S_PRIME_POWERLAW -- one template serves both the
+# turnover), so -- like I_PRIME_POWERLAW -- one template serves both the
 # single- and two-component (shared-shape) cases; only the mixed-shape
-# per-component branch (_s_prime_component_latex) ever needs alpha_i/beta_i.
-S_PRIME_LOGPARABOLA = r"S'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha+\beta\ln(\nu/\nu_0)}"
+# per-component branch (_i_prime_component_latex) ever needs alpha_i/beta_i.
+I_PRIME_LOGPARABOLA = r"I'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha+\beta\ln(\nu/\nu_0)}"
 
 
-def _s_prime_component_latex(idx, shape):
-    """S_i'(nu) LaTeX for one two-component model's own component `idx`
-    (1 or 2) under its own `shape` -- used by s_prime_latex only when the
+def _i_prime_component_latex(idx, shape):
+    """I_i'(nu) LaTeX for one two-component model's own component `idx`
+    (1 or 2) under its own `shape` -- used by i_prime_latex only when the
     two components don't share one shape, so each needs its own explicit
     line rather than the combined i-subscripted templates above."""
     if shape == 'ssa':
-        return (r"S_{%d}'(\nu)=\left(\dfrac{\nu}{\nu_{0,%d}}\right)^{5/2}"
+        return (r"I_{%d}'(\nu)=\left(\dfrac{\nu}{\nu_{0,%d}}\right)^{5/2}"
                  r"\left[\dfrac{1-e^{-(\nu/\nu_{0,%d})^{\alpha_{%d}-5/2}}}{1-e^{-1}}\right]"
                  % (idx, idx, idx, idx))
     if shape == 'thermal':
-        return (r"S_{%d}'(\nu)=\dfrac{B_\nu(T_{%d})\left[1-e^{-(\nu/\nu_{0,%d})^{-2.1}}\right]}"
+        return (r"I_{%d}'(\nu)=\dfrac{B_\nu(T_{%d})\left[1-e^{-(\nu/\nu_{0,%d})^{-2.1}}\right]}"
                  r"{B_{\nu_{0,%d}}(T_{%d})\left(1-e^{-1}\right)}" % (idx, idx, idx, idx, idx))
     if shape == 'logparabola':
-        return (r"S_{%d}'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha_{%d}+\beta_{%d}\ln(\nu/\nu_0)}"
+        return (r"I_{%d}'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha_{%d}+\beta_{%d}\ln(\nu/\nu_0)}"
                  % (idx, idx, idx))
-    return r"S_{%d}'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha_{%d}}" % (idx, idx)
+    return r"I_{%d}'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha_{%d}}" % (idx, idx)
 
 
-def s_prime_latex(n_components, shape1, shape2):
-    """LaTeX (no surrounding '$') for the S'(nu) source-function
+def i_prime_latex(n_components, shape1, shape2):
+    """LaTeX (no surrounding '$') for the I'(nu) normalized-intensity-shape
     definition(s) given `shape1`/`shape2`
     ('powerlaw'/'ssa'/'thermal'/'logparabola') -- `shape2` is ignored for a
     single-component model (n_components==1: `shape1` is that model's own,
     only, shape)."""
-    templates = {'ssa': (S_PRIME_SSA_ONE, S_PRIME_SSA_TWO),
-                 'thermal': (S_PRIME_THERMAL_ONE, S_PRIME_THERMAL_TWO),
-                 'logparabola': (S_PRIME_LOGPARABOLA, S_PRIME_LOGPARABOLA)}
+    templates = {'ssa': (I_PRIME_SSA_ONE, I_PRIME_SSA_TWO),
+                 'thermal': (I_PRIME_THERMAL_ONE, I_PRIME_THERMAL_TWO),
+                 'logparabola': (I_PRIME_LOGPARABOLA, I_PRIME_LOGPARABOLA)}
     if n_components == 1:
-        one, _ = templates.get(shape1, (S_PRIME_POWERLAW, None))
+        one, _ = templates.get(shape1, (I_PRIME_POWERLAW, None))
         return one
     if shape1 == shape2:
-        _, two = templates.get(shape1, (None, S_PRIME_POWERLAW))
+        _, two = templates.get(shape1, (None, I_PRIME_POWERLAW))
         return two
-    return _s_prime_component_latex(1, shape1) + r"\ \ " + _s_prime_component_latex(2, shape2)
+    return _i_prime_component_latex(1, shape1) + r"\ \ " + _i_prime_component_latex(2, shape2)
 
 
 def weights_latex(shape1, shape2):
     """LaTeX (no surrounding '$') for a two-component model's w1/w2/epsilon
-    line: how S'(nu) combines into each component's weight w_i and the
+    line: how I'(nu) combines into each component's weight w_i and the
     epsilon that sets w1 vs w2 (Polvista paper Eq. 9-11). Each component's
     own reference frequency in the epsilon definition follows its own
     shape -- nu_0 (shared) under 'powerlaw', nu_{0,i} (its own) under
@@ -809,7 +820,7 @@ def weights_latex(shape1, shape2):
     nu0_1 = r'\nu_{0,1}' if shape1 in ('ssa', 'thermal') else r'\nu_0'
     nu0_2 = r'\nu_{0,2}' if shape2 in ('ssa', 'thermal') else r'\nu_0'
     eps_def = r"\varepsilon=\dfrac{I_1(%s)}{I_1(%s)+I_2(%s)}" % (nu0_1, nu0_1, nu0_2)
-    return r"w_1=\varepsilon\,S_1'(\nu),\ \ w_2=(1-\varepsilon)\,S_2'(\nu),\ \ " + eps_def
+    return r"w_1=\varepsilon\,I_1'(\nu),\ \ w_2=(1-\varepsilon)\,I_2'(\nu),\ \ " + eps_def
 
 
 def _insert_opacity_factor(latex):
@@ -827,19 +838,19 @@ def _insert_opacity_factor(latex):
 def full_equation(spec, shape1, shape2):
     """The full (centered, possibly multi-line) equation-card LaTeX for
     `spec` at the given spectral shape(s): its own P(lambda) equation, plus
-    the S'(nu) definition(s) `shape1`/`shape2` imply. `shape2` is ignored
+    the I'(nu) definition(s) `shape1`/`shape2` imply. `shape2` is ignored
     for a single-component model.
 
-    Single-component model: one line, S'(nu) to the left of P(lambda)
-    (S'(nu) shapes only the Stokes I spectrum there, not p=P/I itself, but
+    Single-component model: one line, I'(nu) to the left of P(lambda)
+    (I'(nu) shapes only the Stokes I spectrum there, not p=P/I itself, but
     the choice is still shown) -- except a *custom* model with SSA/thermal
     `shape1` (see _insert_opacity_factor), where selecting that shape adds
     a genuine e^{-tau_lambda(z)} attenuation into P(lambda) itself (see
     _custom_P_raw), shown here so the choice's effect on P(lambda), not
-    just S'(nu), is visible.
+    just I'(nu), is visible.
 
     Two-component model: the w1/w2/epsilon definition on its own line
-    first, then S'(nu) to the left of P(lambda) on the line below (matching
+    first, then I'(nu) to the left of P(lambda) on the line below (matching
     the single-component layout, since P(lambda) itself is written in
     terms of w1/w2 -- see each two-component model's own `equation`).
     Custom models are always single-component, so the opacity factor above
@@ -849,13 +860,13 @@ def full_equation(spec, shape1, shape2):
     already be more than one line -- e.g. its own phi(z)=... definition
     above the main P(lambda) integral -- in which case every line but the
     last is shown as-is, unchanged, and only the *last* line combines with
-    S'(nu) (exactly like a plain single-line equation would on its own)."""
-    s_prime = s_prime_latex(spec.n_components, shape1, shape2)
+    I'(nu) (exactly like a plain single-line equation would on its own)."""
+    i_prime = i_prime_latex(spec.n_components, shape1, shape2)
     lines = spec.equation.strip().split('\n')
     inner = lines[-1].strip()[1:-1]  # strip that line's own surrounding '$...$'
     if getattr(spec.func, 'is_custom', False) and shape1 in ('ssa', 'thermal'):
         inner = _insert_opacity_factor(inner)
-    main_line = f'${s_prime}\\qquad\\quad {inner}$'
+    main_line = f'${i_prime}\\qquad\\quad {inner}$'
     extra_lines = lines[:-1]  # e.g. a custom model's own phi(z)=... line, if any
     if spec.n_components == 1:
         return '\n'.join(extra_lines + [main_line])
@@ -884,8 +895,9 @@ def full_equation(spec, shape1, shape2):
 # unit-magnitude phase emiss(z) might carry, e.g. a position-dependent
 # intrinsic EVPA) already has |...|=1 and so can't survive an abs() anyway,
 # while integrating a merely-chi0-zeroed expression that still carries some
-# *other* complex structure could leave J itself complex -- and dividing
-# P(lambda) by a complex J would wrongly rotate it, not just rescale it.
+# *other* complex structure could leave I_lambda itself complex -- and
+# dividing P(lambda) by a complex I_lambda would wrongly rotate it, not
+# just rescale it.
 #
 # p0 (fractional polarization amplitude), chi0 (EVPA) and phi0 (Faraday-depth
 # scale) are ordinary symbols emiss(z)/phi'(z) can reference directly, not
@@ -1379,9 +1391,10 @@ def _custom_opacity_attenuation(emiss_fn, consts, chi0_val, phi0_val, j_lo, j_hi
     """exp(-tau(z,nu)) -- the per-z opacity attenuation envelope
     _custom_P_raw's own SSA/thermal case multiplies onto both j_p(z) and
     j(z) before they're integrated (see there), built via Kirchhoff's law
-    alpha'(z) = j(z)/S(nu) with S(nu) the *bare* local source function
-    (source_function(..., apply_escape=False) -- see its own docstring for
-    why the default, already-escaped S'(nu) can't be reused here without
+    alpha'(z) = j(z)/S(nu) with S(nu) the *bare* local source function --
+    the true, classical-radiative-transfer-sense j_nu/alpha_nu, not I'(nu)
+    (intensity_shape(..., apply_escape=False) -- see its own docstring for
+    why the default, already-escaped I'(nu) can't be reused here without
     double-applying the same escape-probability physics this per-z
     integral is itself computing).
 
@@ -1393,13 +1406,13 @@ def _custom_opacity_attenuation(emiss_fn, consts, chi0_val, phi0_val, j_lo, j_hi
     (z=j_lo, the model's own *total* column depth) equals 1 exactly at
     nu=nu0 -- preserving the same "nu0 is where the model turns over"
     meaning every other SSA/thermal model already has (see
-    source_function's own docstring). That requires j(z) evaluated at
+    intensity_shape's own docstring). That requires j(z) evaluated at
     exactly nu=nu0 too (`emiss_den_z_nu0` below), independent of whatever
     wavelengths `nu`/`lam` this call actually needs -- mirrors stokes_I's
     own raw_ref pattern (re-evaluating at a fixed reference frequency)."""
     prefix_j = _cumtrapz0(emiss_den_zw, z[:, 0])
     w_zw = prefix_j[-1:, :] - prefix_j            # W(z,nu): (n_grid, n_lambda)
-    s_bare_nu = source_function(nu, nu0, alpha_val, shape, T=T_val, beta=beta_val,
+    s_bare_nu = intensity_shape(nu, nu0, alpha_val, shape, T=T_val, beta=beta_val,
                                  apply_escape=False)                          # (1, n_lambda)
 
     nu0_arr = np.array([[nu0]])
@@ -1407,7 +1420,7 @@ def _custom_opacity_attenuation(emiss_fn, consts, chi0_val, phi0_val, j_lo, j_hi
     emiss_den_z_nu0 = np.abs(_eval_zw(emiss_fn, z, nu0_arr, lam0_arr, 1.0, chi0_val, phi0_val, consts))
     emiss_den_z_nu0 = np.where((z >= j_lo) & (z <= j_hi), emiss_den_z_nu0, 0.0)
     w_total_nu0 = np.trapz(emiss_den_z_nu0[:, 0], z[:, 0])
-    s_bare_nu0 = source_function(nu0_arr, nu0, alpha_val, shape, T=T_val, beta=beta_val,
+    s_bare_nu0 = intensity_shape(nu0_arr, nu0, alpha_val, shape, T=T_val, beta=beta_val,
                                   apply_escape=False)[0, 0]
 
     with np.errstate(divide='ignore', invalid='ignore'):
@@ -1521,7 +1534,7 @@ def preview_los_profiles(emiss_expr, phi_expr, const_names, const_values,
     complex (see _eval_zw -- a profile using 'i' for a position-dependent
     intrinsic EVPA). The denominator's own j(z) (p0->1, chi0->0
     substituted, see build_custom_model) isn't previewed here at all --
-    it only ever collapses to one number, J (see build_model.py's own
+    it only ever collapses to one number, I_lambda (see build_model.py's own
     intro text for what that is), which doesn't change P(lambda)'s own
     *shape*, only its overall normalization, so there's nothing about it
     a per-z preview plot would usefully show. `phi_prime_z` (`phi_expr`
@@ -1821,16 +1834,16 @@ def custom_model_equation_lines(emiss_expr, phi_expr, j_lo_expr, j_hi_expr, p_lo
     Faraday-depth density the user actually types, possibly referencing
     phi0 directly, see the module comment above -- with z renamed to the
     dummy integration variable z' for display only), and the normalized
-    P(lambda) = (1/J) * integral j_p(z) dz, with j_p(z) shown concretely
-    (its own form is the whole point of a custom model, so it's shown
-    explicitly rather than hidden behind a placeholder symbol) but phi(z)
-    referenced only by name in the phase term -- its own concrete form is
-    given by the other line, so restating it again here would be
-    redundant. J itself is *not* defined anywhere in either line -- see
-    build_model.py's own intro text for that (the one place it's spelled
-    out), so this card reads as "P(lambda) is this shape, normalized"
-    without cluttering the one line that matters most (what j_p(z) itself
-    looks like) with J's own derivation.
+    P(lambda) = (1/I_lambda) * integral j_p(z) dz, with j_p(z) shown
+    concretely (its own form is the whole point of a custom model, so it's
+    shown explicitly rather than hidden behind a placeholder symbol) but
+    phi(z) referenced only by name in the phase term -- its own concrete
+    form is given by the other line, so restating it again here would be
+    redundant. I_lambda itself is *not* defined anywhere in either line --
+    see build_model.py's own intro text for that (the one place it's
+    spelled out), so this card reads as "P(lambda) is this shape,
+    normalized" without cluttering the one line that matters most (what
+    j_p(z) itself looks like) with I_lambda's own derivation.
 
     j_p(z)'s own integral runs over [j_lo,j_hi] (it's 0 outside it, so
     integrating past there would add nothing); phi(z)'s own integral
@@ -1857,7 +1870,7 @@ def custom_model_equation_lines(emiss_expr, phi_expr, j_lo_expr, j_hi_expr, p_lo
     phi_line = (r"$\phi(z)=\int_{\max(z,\,%s)}^{%s} %s\,dz'$"
                 % (sympy.latex(p_lo_expr), sympy.latex(p_hi_expr),
                    sympy.latex(phi_expr.subs(Z_SYMBOL, z_prime))))
-    p_line = (r'$P(\lambda)=\dfrac{1}{J}\int_{%s}^{%s} %s\,e^{\,2i\phi(z)\lambda^2}\,dz$'
+    p_line = (r'$P(\lambda)=\dfrac{1}{I_\lambda}\int_{%s}^{%s} %s\,e^{\,2i\phi(z)\lambda^2}\,dz$'
               % (sympy.latex(j_lo_expr), sympy.latex(j_hi_expr), sympy.latex(emiss_expr)))
     return phi_line, p_line
 

@@ -77,7 +77,7 @@ from polvista.fitting import (
 from polvista.latex_stuff import latex_pixmap, fit_equation_pixmap, TexViewerDialog
 from polvista.widgets import (
     ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDEST_UNIT, ModelPlot, StokesPlot, RMSynthPlot)
-from polvista.sampling import SamplingMixin
+from polvista.sampling import SamplingMixin, warm_up_sampling_imports
 from polvista.measurements import MeasurementsMixin
 from polvista.rm_synthesis import compute_faraday_spectrum, phi_axis_half_width, FaradaySpectrumError
 
@@ -487,6 +487,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # build_corner_tab, run_multinest_fit, load_samples_action.
         self.mn_worker = None
         self.ls_worker = None      # background worker for load_samples_action, see LoadSamplesWorker
+        self.corner_build_worker = None  # background worker for build_corner_tab, see CornerBuildWorker
         self.mn_model = None       # model func the most recent MultiNest run/load was for
         self.posterior_samples = None
         self.posterior_model = None
@@ -588,8 +589,8 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.spectral_box = QGroupBox()
         self.spectral_layout = QVBoxLayout(self.spectral_box)
 
-        # Dropdown(s) selecting the source function S'(nu) used to weight
-        # each component's spectral contribution (see
+        # Dropdown(s) selecting the normalized intensity shape I'(nu) used to
+        # weight each component's spectral contribution (see
         # models.set_spectral_shape). A single-component model only ever
         # needs one, shown as a "Spectrum" header at the top of the box
         # (shape_header_single/shape_combo); a two-component model instead
@@ -1226,7 +1227,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.beta_slider_1.name_label.setPixmap(
             latex_pixmap(r'$\beta_1$' if two_comp else r'$\beta$'))
         # A thermal component's own spectral index is emergent from T, not
-        # a free parameter (see source_function/thermal_source) -- hide
+        # a free parameter (see intensity_shape/thermal_intensity_shape) -- hide
         # its alpha slider rather than show an inert control (log-parabola
         # still uses alpha directly, alongside its own beta, so its alpha
         # slider stays visible). alpha_indices follows spec.params' own
@@ -1688,13 +1689,13 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             fit_nu0_2 = shape2 == 'ssa' and not self.nu0_slider_2.is_fixed()
             # A 'thermal' component's own T is never fit (see
             # build_temp_slider) -- just its current slider value, passed
-            # through so estimate_shape_2comp's internal source_function
-            # calls don't crash on a missing T (see thermal_source).
+            # through so estimate_shape_2comp's internal intensity_shape
+            # calls don't crash on a missing T (see thermal_intensity_shape).
             T1 = self.temp_slider_1.value() if shape1 == 'thermal' else None
             T2 = self.temp_slider_2.value() if shape2 == 'thermal' else None
             # Same reasoning for a 'logparabola' component's own beta --
             # never fit (see build_beta_slider), just passed through so
-            # estimate_shape_2comp's internal source_function calls don't
+            # estimate_shape_2comp's internal intensity_shape calls don't
             # crash on a missing beta.
             beta1 = self.beta_slider_1.value() if shape1 == 'logparabola' else None
             beta2 = self.beta_slider_2.value() if shape2 == 'logparabola' else None
@@ -2147,6 +2148,10 @@ def main():
     QLocale.setDefault(QLocale(QLocale.C))
     win = MainWindow()
     win.show()
+    # Off the critical path of the user's first Fit!/Load samples/family
+    # pick -- see warm_up_sampling_imports's own docstring for why that
+    # first use would otherwise pay this cost instead, uninterruptibly.
+    warm_up_sampling_imports()
     sys.exit(app.exec_())
 
 
