@@ -1426,7 +1426,7 @@ class SamplingMixin:
         self.load_data_button.setEnabled(False)
         self.clear_data_button.setEnabled(False)
         self.sampling_load_button.setEnabled(False)
-        if hasattr(self, 'corner_family_combo'):
+        if getattr(self, 'corner_family_combo', None) is not None:
             self.corner_family_combo.setEnabled(False)
         self.sampling_progress.setVisible(True)
         self.sampling_progress_label.setVisible(True)
@@ -1447,7 +1447,7 @@ class SamplingMixin:
         self.load_data_button.setEnabled(True)
         self.clear_data_button.setEnabled(True)
         self.sampling_load_button.setEnabled(True)
-        if hasattr(self, 'corner_family_combo'):
+        if getattr(self, 'corner_family_combo', None) is not None:
             self.corner_family_combo.setEnabled(True)
         self.sampling_progress.setVisible(False)
         self.sampling_progress_label.setVisible(False)
@@ -1617,6 +1617,11 @@ class SamplingMixin:
             self.plot_tabs.removeTab(idx)
         tab.deleteLater()
         self.corner_tab = None
+        # corner_family_combo is a child of `tab` (see _on_corner_figure_ready)
+        # and so is destroyed along with it above -- drop this reference too,
+        # or the hasattr/getattr guards elsewhere would still find a Python
+        # attribute pointing at an already-deleted C/C++ QComboBox.
+        self.corner_family_combo = None
 
     def load_samples_action(self):
         """Load a previous MultiNest run's output (picked via a directory
