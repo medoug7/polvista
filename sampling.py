@@ -27,9 +27,75 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 
 from polvista.models import MODELS, MODELS_BY_NAME
-from polvista.fitting import multinest_fit, load_previous_run, expand_pars_errs
+from polvista.fitting import multinest_fit, load_previous_run, expand_pars_errs, estimate_alpha, pol_idx, wrap_pm_halfpi
 from polvista.latex_stuff import latex_pixmap
 from polvista.widgets import ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDEST_UNIT
+
+
+# ── qu_fit.py sample import (load_samples_action's fallback for a directory
+# with no mn_polvista_meta.npz sidecar) ─────────────────────────────────────
+# ~/Downloads/pipe/qu_fit.py -- the reference MultiNest pipeline this app's
+# own Sampling tab was distilled from (see fitting.py's module docstring) --
+# names each model's own MultiNest output directory after its own dropdown
+# label (see its _corner_filename(): label.replace(' ', '_').replace('+',
+# '_')), and for its "no dep"/"mid" two-component variants (e.g. '2 Ext',
+# '2 Ext dep1'), reuses one of *this app's own* full 11-param *_legacy
+# models' formula (models.comp2RMdep_legacy/comp2mixdep_legacy -- qu_fit.py's
+# own plain-sum two-component convention, not this app's own eps-weighted
+# spectral_combine, see comp2RMdep_legacy's own docstring for why a plain
+# comp2RMdep/comp2mixdep reload visibly offsets the drawn curve from the
+# loaded samples) with one or both dphi slots hardcoded to 0 rather than
+# sampled -- never registering separate models per dphi-reduced variant.
+# QU_FIT_MODEL_MAP maps each such directory name to (this app's own model
+# name, the indices -- within that model's own params list -- qu_fit.py
+# held fixed at 0 rather than sampling, and a fitting.load_previous_run
+# degenerate_pair override -- see its docstring; None keeps the default).
+#
+# 'Int_Ext_dep' overrides to True even though comp2mixdep/comp2mixdep_legacy
+# aren't in fitting.DEGENERATE_PAIR_MODELS (int_term and ext_term are
+# genuinely different functions, not an exact exchange symmetry): when the
+# internal component's own dphi is large enough, int_term's decay becomes
+# numerically close to ext_term's over the fitted wavelength range, and
+# MultiNest's raw modes/marginal stats need the same swap-aware
+# merge/relabel treatment as an exact DEGENERATE_PAIR_MODELS member to avoid
+# averaging across both component-1/component-2 labelings. 'Int_Ext_dep1'/
+# 'Int_Ext_dep2' hold exactly one component's dphi fixed at 0, which breaks
+# that near-symmetry, so they're forced False instead (mirrors
+# load_previous_run's own docstring on asymmetric sampled_idx overrides).
+#
+# qu_fit.py's own models never sample alpha/epsilon themselves (QU-only
+# data can't constrain either -- see fitting.estimate_alpha's docstring),
+# so these were never part of the MultiNest run being loaded to begin with;
+# _load_qu_fit_samples re-derives them the same "standard spectral
+# parameters" way a fresh Sampling-tab fit's own pre-fit would (app.py's
+# fit_spectrum_lsq): epsilon fixed at app.FIT_FIXED_EPSILON, alpha (shared
+# by both components, for a two-component model) from a direct regression
+# against the source's own I(nu) data (fitting.estimate_alpha) -- both
+# inert for the *_legacy models' own P(lambda) formula (legacy_sum_combine
+# ignores them), kept only so stokes_I()'s I(nu) display shape, and
+# everything else assuming a two-component model always has these 3
+# trailing params, still works.
+#
+# '2 Int' (comp2intern) is deliberately omitted: qu_fit.py's own MODELS
+# registration for it lists only 6 params while its raw function needs 8,
+# an internal inconsistency (and one this app's own comp2intern has no
+# matching "no dep" reduction -- or *_legacy variant -- for) that makes it
+# impossible to tell, from qu_fit.py's source alone, which convention any
+# real '2_Int' output directory would actually use -- so it's left
+# unsupported here rather than risk silently mis-reading it.
+QU_FIT_MODEL_MAP = {
+    'Burn':          ('burn',               [],     None),
+    'Internal':      ('intern',             [],     None),
+    'Partial':       ('partial',            [],     None),
+    'Tribble':       ('tribble',            [],     None),
+    '2_Ext':         ('comp2RMdep_legacy',  [3, 7], None),
+    '2_Ext_dep':     ('comp2RMdep_legacy',  [],     None),
+    '2_Ext_dep1':    ('comp2RMdep_legacy',  [7],    False),
+    'Int_Ext':       ('comp2mixdep_legacy', [3, 7], None),
+    'Int_Ext_dep':   ('comp2mixdep_legacy', [],     True),
+    'Int_Ext_dep1':  ('comp2mixdep_legacy', [7],    False),
+    'Int_Ext_dep2':  ('comp2mixdep_legacy', [3],    False),
+}
 
 
 def warm_up_sampling_imports():
@@ -600,6 +666,36 @@ class LoadSamplesWorker(QThread):
         self.finished_ok.emit(best_pars, errs, info)
 
 
+def unwrap_x_samples(samples, pars, kinds_pol):
+    """Copy of `samples` (N, ndim, pol_idx-local order) with every X-kind
+    (EVPA) column shifted by its own period (pi) onto the branch centered
+    on that same family's own `pars[i]` (its circular median, from
+    fitting.circular_median_pctl/best_family) instead of the fixed
+    (-pi/2, pi/2] domain every raw MultiNest sample is drawn in.
+
+    Needed before handing samples to corner.corner(): X has no natural
+    "zero" -- a family whose true EVPA sits near the domain's own hard
+    +-90 deg edge has samples split across that seam (e.g. some near
+    -89 deg, some near +89 deg, the *same* physical angle mod pi) even
+    though fitting.best_family()'s own circular_median_pctl already
+    reports the correct, unbiased point estimate for it. Left as-is,
+    corner.corner() -- which has no notion of X's periodicity -- plots
+    that single physical cluster as two disconnected blobs (looking
+    exactly like a genuine second solution) and computes its own
+    diagonal-panel title from plain (non-circular) percentiles of the
+    raw column, which for a seam-split column comes out nonsensically
+    wide (spanning nearly the whole +-90 deg domain) and inconsistent
+    with `pars`/`errs`'s own correct value. Shifting each family's own
+    X columns onto *that family's* median first makes both the plotted
+    cluster and corner's own auto-computed title agree with the number
+    already used everywhere else (sliders, results box, model curve)."""
+    samples = samples.copy()
+    for i, k in enumerate(kinds_pol):
+        if k == 'X':
+            samples[:, i] = pars[i] + wrap_pm_halfpi(samples[:, i] - pars[i])
+    return samples
+
+
 def render_corner_figure(kinds_pol, labels, families, dropped, selected_idx, ndim):
     """Draw `selected_idx`'s family's own pooled posterior (blue, opaque,
     with titled diagonal panels) plus every other surviving mode family
@@ -647,7 +743,7 @@ def render_corner_figure(kinds_pol, labels, families, dropped, selected_idx, ndi
         for i, lbl in enumerate(labels)]
     plot_labels = [fr'${lbl}$' for lbl in plot_labels]
 
-    sel_samples = sel['samples'] * scales[np.newaxis, :]
+    sel_samples = unwrap_x_samples(sel['samples'], sel['pars'], kinds_pol) * scales[np.newaxis, :]
     truths = [p * s for p, s in zip(sel['pars'], scales)]
 
     # A bare (non-pyplot) Figure -- corner.corner() builds its KxK axes
@@ -706,7 +802,7 @@ def render_corner_figure(kinds_pol, labels, families, dropped, selected_idx, ndi
     draw_order = sorted(non_selected_desc, key=lambda k: families[k]['evidence_share'])
 
     for k in draw_order:
-        fam_samples = families[k]['samples'] * scales[np.newaxis, :]
+        fam_samples = unwrap_x_samples(families[k]['samples'], families[k]['pars'], kinds_pol) * scales[np.newaxis, :]
         color = color_by_k[k]
         faded_color = mcolors.to_rgba(color, alpha=0.5)
         corner.corner(
@@ -825,7 +921,7 @@ def render_corner_figure(kinds_pol, labels, families, dropped, selected_idx, ndi
             suffix = f" ({', '.join(bits)})" if bits else ''
             legend_handles.append(mpatches.Patch(
                 color=color_by_k[k], alpha=(1.0 if k == selected_idx else 0.5),
-                label=fr"mass={family['evidence_share']:.1f}%, $\ln Z$={family['lnZ']:.2f}, "
+                label=fr"mass={family['evidence_share']:.1f}%, $\ln L$={family['lnZ']:.2f}, "
                       fr"$\chi_\nu^2$={family['chi2']:.2f}{suffix}"))
         if dropped['count'] > 0:
             legend_handles.append(mpatches.Patch(
@@ -1012,7 +1108,7 @@ class SamplingMixin:
         # them separately. Spectral params (alpha, eps) are excluded --
         # QU data alone can't constrain them, so fitting holds epsilon
         # fixed at 0.5 instead of sampling it (see app.FIT_FIXED_EPSILON).
-        sampling_layout.addWidget(QLabel('<b>Parameter bounds</b>'))
+        sampling_layout.addWidget(QLabel('<b>Parameter priors</b>'))
         self.sampling_bounds_box = QWidget()
         self.sampling_bounds_layout = QVBoxLayout(self.sampling_bounds_box)
         self.sampling_bounds_layout.setSpacing(8)
@@ -1267,8 +1363,12 @@ class SamplingMixin:
         used. The winning-family share and a combined other-families/
         dropped-modes line come first (mode-family information -- not
         applicable to least-squares -- grouped together right below the
-        winner line, ahead of the shared stats), and MultiNest's own
-        global evidence trails at the end."""
+        winner line, ahead of the shared stats), then the winning family's
+        own evidence ln Z (its share of the total, volume-integrated --
+        see fitting.best_family's 'evidence_lnZ'), and finally MultiNest's
+        own global evidence (the *same* number for every family, since
+        it's integrated over all of them -- shown alongside the family's
+        own evidence_lnZ so the two aren't mistaken for each other)."""
         others = info['other_families']
         dropped = info['dropped']
         aicc = f"{info['aicc']:.4g}" if np.isfinite(info['aicc']) else 'n/a (dof ≤ 1)'
@@ -1289,7 +1389,8 @@ class SamplingMixin:
             f"ln L = {info['loglike']:.4g}",
             f"AIC = {info['aic']:.4g}   AICc = {aicc}",
             f"BIC = {info['bic']:.4g}",
-            f"global ln Z = {info['global_evidence']:.4g} ± {info['global_evidence_err']:.3g}",
+            f"evidence ln Z (this family) = {info['winner_evidence_lnZ']:.4g}",
+            f"global ln Z (whole model) = {info['global_evidence']:.4g} ± {info['global_evidence_err']:.3g}",
         ]
         return '\n'.join(lines)
 
@@ -1359,16 +1460,22 @@ class SamplingMixin:
         one is actually the winner. Removed by Reset model or Clear data
         (see remove_corner_tab).
 
-        The actual drawing (render_corner_figure -- every corner.corner()
-        call plus the margin/title/label-pad refit passes) runs in a
-        background CornerBuildWorker rather than here: for a many-parameter
-        model with several surviving families that's several seconds of
-        pure-Python/numpy/matplotlib work, long enough to freeze the whole
-        UI if run inline -- this returns immediately once that worker is
-        started, and _on_corner_figure_ready finishes the (fast, genuinely
-        Qt-bound) job of embedding its finished Figure once it's done. The
-        previous corner tab, if any, is left in place and interactive until
-        then, rather than torn down up front."""
+        `selected_idx`'s own Figure is cached (_corner_fig_cache, keyed by
+        selected_idx, reset whenever `info` itself changes -- a genuinely
+        new result, not just a family switch) -- so flipping the family
+        picker back to one already seen for this same result just
+        re-embeds that Figure instead of rebuilding it from scratch.
+
+        Otherwise, the actual drawing (render_corner_figure -- every
+        corner.corner() call plus the margin/title/label-pad refit passes)
+        runs in a background CornerBuildWorker rather than here: for a
+        many-parameter model with several surviving families that's
+        several seconds of pure-Python/numpy/matplotlib work, long enough
+        to freeze the whole UI if run inline -- this returns immediately
+        once that worker is started, and _on_corner_figure_ready finishes
+        the (fast, genuinely Qt-bound) job of embedding its finished
+        Figure once it's done. The previous corner tab, if any, is left in
+        place and interactive until then, rather than torn down up front."""
         try:
             import corner  # noqa: F401 -- availability probe; render_corner_figure does the real import
         except ImportError:
@@ -1389,16 +1496,26 @@ class SamplingMixin:
         # the docstring above for why index 0 is special. families[1:] are
         # info['other_families'] verbatim -- both already carry the same
         # 'pars'/'errs' (pol_idx-local, (2,ndim) lo/hi errs)/'samples'/
-        # 'evidence_share'/'chi2'/'lnZ' shape (see fitting.best_family).
+        # 'evidence_share'/'chi2'/'lnZ'/'evidence_lnZ' shape (see
+        # fitting.best_family).
         winner_errs_pol = np.array([[errs[i][0] for i in pol_idx],
                                      [errs[i][1] for i in pol_idx]])
         winner_family = dict(
             pars=[best_pars[i] for i in pol_idx], errs=winner_errs_pol,
             samples=info['winner_samples'], evidence_share=info['evidence_share'],
-            chi2=info['winner_chi2'], lnZ=info['winner_lnZ'])
+            chi2=info['winner_chi2'], lnZ=info['winner_lnZ'],
+            evidence_lnZ=info['winner_evidence_lnZ'])
         families = [winner_family] + info['other_families']
         dropped = info['dropped']
         selected_idx = max(0, min(selected_idx, len(families) - 1))
+
+        if info is not self._corner_info:
+            # A genuinely new result (fresh fit/Load samples), not just
+            # on_corner_family_selected re-requesting a different
+            # selected_idx of the *same* one (it passes this same `info`
+            # object straight through) -- _corner_fig_cache's Figures are
+            # for the old result and no longer apply.
+            self._corner_fig_cache = {}
 
         # Cached so on_corner_family_selected (the dropdown's own handler)
         # can rebuild this tab and the Visualization-tab model curves for
@@ -1419,8 +1536,22 @@ class SamplingMixin:
             # was building, so let it run to completion (Agg rendering
             # isn't cheaply interruptible) but drop its result on arrival
             # instead of embedding a stale figure over this newer request.
+            # Cleared (not just disconnected) so a *second* still-cache-hit
+            # request right behind this one doesn't try to disconnect an
+            # already-disconnected worker below (PyQt raises on that).
             self.corner_build_worker.finished_ok.disconnect(self._on_corner_figure_ready)
             self.corner_build_worker.failed.disconnect(self._on_corner_figure_failed)
+            self.corner_build_worker = None
+
+        # selected_idx already rendered for this same result (a family the
+        # user switched to before, e.g. switching back to the winner) --
+        # reuse that Figure instead of re-running CornerBuildWorker (whose
+        # corner.corner() calls plus the margin/title refit passes take
+        # several seconds for a many-parameter model) from scratch.
+        cached_fig = self._corner_fig_cache.get(selected_idx)
+        if cached_fig is not None:
+            self._on_corner_figure_ready(cached_fig)
+            return
 
         self.fit_button.setEnabled(False)
         self.load_data_button.setEnabled(False)
@@ -1487,6 +1618,7 @@ class SamplingMixin:
         self.remove_corner_tab()
         self._corner_info = info
         self._corner_families = families
+        self._corner_fig_cache[selected_idx] = fig  # see build_corner_tab's own cache-hit check
 
         canvas = FigureCanvas(fig)
 
@@ -1580,7 +1712,12 @@ class SamplingMixin:
         recomputed from `family`'s own chi2/lnZ instead (dof/n_free/n_data
         are shared across every family of the same model/run, so those
         come straight from `info`). Clearly marked as not the winner, so
-        it's never mistaken for one at a glance."""
+        it's never mistaken for one at a glance. Also reports this
+        family's own evidence ln Z (`family['evidence_lnZ']` -- its share
+        of the total, volume-integrated evidence; see
+        fitting.best_family), alongside MultiNest's global evidence
+        (the *same* number for every family, since it's integrated over
+        all of them), matching format_mn_stats()."""
         dof, n_free, n_data = info['dof'], info['n_free'], info['n_data']
         chi2 = family['chi2'] * dof
         aic = 2 * n_free - 2 * family['lnZ']
@@ -1595,6 +1732,8 @@ class SamplingMixin:
             f"ln L = {family['lnZ']:.4g}",
             f"AIC = {aic:.4g}   AICc = {aicc_str}",
             f"BIC = {bic:.4g}",
+            f"evidence ln Z (this family) = {family['evidence_lnZ']:.4g}",
+            f"global ln Z (whole model) = {info['global_evidence']:.4g} ± {info['global_evidence_err']:.3g}",
         ])
 
     def remove_corner_tab(self):
@@ -1630,40 +1769,42 @@ class SamplingMixin:
         MultiNest fit would (sliders, posterior overlay, Corner plot tab --
         see apply_posterior_result).
 
-        The chosen directory must contain the 'mn_polvista_meta.npz' sidecar
-        run_multinest_fit saves alongside its own MultiNest output (model
-        name, the alpha/epsilon values held fixed during that run, and the
-        exact q/u data it was fit against) -- this makes Load samples fully
-        self-contained, independent of whatever data (if any) happens to be
-        currently loaded via Load data."""
+        The chosen directory ideally contains the 'mn_polvista_meta.npz'
+        sidecar run_multinest_fit saves alongside its own MultiNest output
+        (model name, the alpha/epsilon values held fixed during that run,
+        and the exact q/u data it was fit against) -- this makes Load
+        samples fully self-contained, independent of whatever data (if
+        any) happens to be currently loaded via Load data. Failing that,
+        falls back to _load_qu_fit_samples: a plain ~/Downloads/pipe/
+        qu_fit.py MultiNest run (no polvista sidecar at all) recognized by
+        its own directory name -- see QU_FIT_MODEL_MAP."""
         start_dir = self.sampling_outdir_edit.text() or os.getcwd()
         directory = QFileDialog.getExistingDirectory(self, 'Load MultiNest samples', start_dir)
         if not directory:
             return
 
         meta_path = os.path.join(directory, 'mn_polvista_meta.npz')
-        if not os.path.exists(meta_path):
-            QMessageBox.warning(
-                self, 'Load samples',
-                f'No polvista metadata found in:\n{directory}\n\n'
-                "(expected 'mn_polvista_meta.npz', written by this app's own Sampling-tab "
-                'Fit! runs -- pick the folder one was saved to.)')
-            return
-
-        try:
-            meta = np.load(meta_path)
-            model_name = str(meta['model'])
-            if model_name not in MODELS_BY_NAME:
-                raise ValueError(f"unknown model '{model_name}' in metadata")
-            model = MODELS_BY_NAME[model_name]
-            spectral_pars = {int(i): float(v) for i, v in zip(meta['spectral_idx'], meta['spectral_val'])}
-            wl, q, q_err, u, u_err = meta['wl'], meta['q'], meta['q_err'], meta['u'], meta['u_err']
-        except (Exception, SystemExit) as e:
-            # SystemExit included: see MultiNestWorker.run -- this runs on
-            # the main thread, so letting it escape uncaught would exit the
-            # whole app instead of just reporting the failure here.
-            QMessageBox.warning(self, 'Load samples', f'Failed to load samples:\n{e}')
-            return
+        sampled_idx = degenerate_pair = None
+        if os.path.exists(meta_path):
+            try:
+                meta = np.load(meta_path)
+                model_name = str(meta['model'])
+                if model_name not in MODELS_BY_NAME:
+                    raise ValueError(f"unknown model '{model_name}' in metadata")
+                model = MODELS_BY_NAME[model_name]
+                spectral_pars = {int(i): float(v) for i, v in zip(meta['spectral_idx'], meta['spectral_val'])}
+                wl, q, q_err, u, u_err = meta['wl'], meta['q'], meta['q_err'], meta['u'], meta['u_err']
+            except (Exception, SystemExit) as e:
+                # SystemExit included: see MultiNestWorker.run -- this runs on
+                # the main thread, so letting it escape uncaught would exit the
+                # whole app instead of just reporting the failure here.
+                QMessageBox.warning(self, 'Load samples', f'Failed to load samples:\n{e}')
+                return
+        else:
+            result = self._load_qu_fit_samples(directory)
+            if result is None:
+                return
+            model, spectral_pars, wl, q, q_err, u, u_err, sampled_idx, degenerate_pair = result
 
         basename = os.path.join(directory, 'mn_')
 
@@ -1679,10 +1820,115 @@ class SamplingMixin:
         self.ls_worker = LoadSamplesWorker(dict(
             wl=wl, q=q, q_err=q_err, u=u, u_err=u_err, model=model,
             spectral_pars=spectral_pars, outputfiles_basename=basename,
+            sampled_idx=sampled_idx, degenerate_pair=degenerate_pair,
         ))
         self.ls_worker.finished_ok.connect(self.on_load_samples_finished)
         self.ls_worker.failed.connect(self.on_load_samples_failed)
         self.ls_worker.start()
+
+    def _load_qu_fit_samples(self, directory):
+        """Fall back for a directory that's a *plain* qu_fit.py MultiNest
+        run -- no mn_polvista_meta.npz sidecar, e.g. anything produced by
+        ~/Downloads/pipe/qu_fit.py's own multinest_fit() rather than this
+        app's own Sampling tab. Recognized by its own directory name (see
+        QU_FIT_MODEL_MAP, and this module's own comment above it) and
+        reconstructed into the same (model, spectral_pars, wl, q, q_err, u,
+        u_err) shape load_samples_action's sidecar path already provides,
+        plus (sampled_idx, degenerate_pair) for fitting.load_previous_run's
+        own same-named overrides. A two-component directory maps to one of
+        this app's own *_legacy models (see QU_FIT_MODEL_MAP and
+        models.comp2RMdep_legacy's own docstring) precisely so the p1/p2
+        samples read back off disk need no rescaling to mean what they did
+        in qu_fit.py's own run.
+
+        wl/q/q_err/u/u_err are read directly off `directory`'s own parent
+        folder's plot_inputs.npz -- qu_fit.py's own record of exactly the
+        data a whole source/epoch's models were all fit against (qu_fit.py's
+        write_results_txt reads the very same file to report its own chi2)
+        -- rather than re-derived from a Stokes I/Q/U CSV: re-deriving q/u
+        uncertainties from scratch (even off the *same* underlying
+        measurements) doesn't reproduce qu_fit.py's own error propagation
+        closely enough for chi2 to come out right. A CSV (this app's own
+        Load Data format -- see app.load_vapola_csv) is still needed for
+        the Stokes I(nu) values plot_inputs.npz itself doesn't carry (just
+        for this run's own alpha estimate, see below) -- first tried at the
+        conventional assets/data/<source>_<year>_VAPOLA.csv path this
+        app's own bundled data uses (<source>/<year> parsed off
+        `directory`'s own two parent folders, e.g. .../PKS1335-127/2021/
+        Int_Ext_dep -> source='PKS1335-127', year='2021'), falling back to
+        a file-picker if that's not found.
+
+        Returns None (after warning the user) on any recognized failure;
+        otherwise (model, spectral_pars, wl, q, q_err, u, u_err,
+        sampled_idx, degenerate_pair)."""
+        name = os.path.basename(os.path.normpath(directory))
+        entry = QU_FIT_MODEL_MAP.get(name)
+        if entry is None or not os.path.exists(os.path.join(directory, 'mn_.txt')):
+            QMessageBox.warning(
+                self, 'Load samples',
+                f'No polvista metadata found in:\n{directory}\n\n'
+                "(expected 'mn_polvista_meta.npz', written by this app's own Sampling-tab "
+                "Fit! runs -- pick the folder one was saved to. This folder also isn't a "
+                "recognized qu_fit.py model output directory.)")
+            return None
+        model_name, fixed_zero_idx, degenerate_pair = entry
+        model = MODELS_BY_NAME[model_name]
+        spec = MODELS[model]
+
+        parent = os.path.dirname(os.path.normpath(directory))
+        plot_inputs_path = os.path.join(parent, 'plot_inputs.npz')
+        if not os.path.exists(plot_inputs_path):
+            QMessageBox.warning(
+                self, 'Load samples',
+                f"No plot_inputs.npz found in:\n{parent}\n\n"
+                "(qu_fit.py's own record of the q/u data this directory's model was "
+                'fit against -- needed to re-read it.)')
+            return None
+        plot_inputs = np.load(plot_inputs_path)
+        wl, q, q_err, u, u_err = (plot_inputs['wl'], plot_inputs['qs'], plot_inputs['qers'],
+                                    plot_inputs['us'], plot_inputs['uers'])
+
+        year = os.path.basename(parent)
+        source = os.path.basename(os.path.dirname(parent))
+        default_csv = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'assets', 'data',
+            f'{source}_{year}_VAPOLA.csv')
+        csv_path = default_csv if os.path.isfile(default_csv) else None
+        if csv_path is None:
+            csv_path, _ = QFileDialog.getOpenFileName(
+                self, f'Stokes I/Q/U data for {source} {year}', parent, 'CSV files (*.csv)')
+            if not csv_path:
+                return None
+
+        # Deferred: app.py imports this module (SamplingMixin) at module
+        # load time, so importing app.py back at *this* module's own top
+        # level would be circular -- safe here since by call time (a user
+        # actually clicking Load samples) app.py is already fully loaded.
+        from polvista.app import load_vapola_csv, FIT_FIXED_EPSILON
+        try:
+            freq, I, _Q, _U, _I_err, _Q_err, _U_err = load_vapola_csv(csv_path)
+        except (OSError, ValueError, KeyError) as e:
+            QMessageBox.warning(self, 'Load samples', f'Failed to load data CSV:\n{csv_path}\n\n{e}')
+            return None
+
+        # Standard spectral parameters, same as a fresh Sampling-tab fit's
+        # own pre-fit (app.fit_spectrum_lsq) would default to: powerlaw
+        # alpha estimated from this source's own I(nu) data (shared by both
+        # components for a two-component model -- see estimate_alpha's own
+        # docstring for why only one shared value is ever recoverable from
+        # QU-only fitting), epsilon fixed at FIT_FIXED_EPSILON. Both inert
+        # for a *_legacy model's own P(lambda) (legacy_sum_combine ignores
+        # them) -- only stokes_I()'s own I(nu) display shape still uses them.
+        alpha_val = estimate_alpha(freq, I)
+        spectral_pars = {i: alpha_val for i in spec.indices('alpha')}
+        eps_indices = spec.indices('eps')
+        if eps_indices:
+            spectral_pars[eps_indices[0]] = FIT_FIXED_EPSILON
+        for i in fixed_zero_idx:
+            spectral_pars[i] = 0.0
+        sampled_idx = [i for i in pol_idx(spec) if i not in fixed_zero_idx]
+
+        return model, spectral_pars, wl, q, q_err, u, u_err, sampled_idx, degenerate_pair
 
     def on_load_samples_finished(self, best_pars, errs, info):
         self.sampling_progress.setVisible(False)
@@ -1694,8 +1940,17 @@ class SamplingMixin:
 
         model = self.mn_model
         index = self.model_combo.findData(model)
-        if index != -1:
-            self.model_combo.setCurrentIndex(index)  # triggers rebuild_sliders if it changed
+        if index == -1:
+            # A hidden model (ModelSpec.hidden -- currently only the
+            # *_legacy qu_fit.py-import variants, see QU_FIT_MODEL_MAP)
+            # isn't in the dropdown yet; insert it just above the "Custom
+            # model..." sentinel row, same as a freshly-built custom model
+            # (see app.MainWindow.open_custom_model_dialog), so
+            # setCurrentIndex below can select it and rebuild_sliders picks
+            # it up like any other model from then on.
+            index = self.model_combo.count() - 1
+            self.model_combo.insertItem(index, MODELS[model].label, model)
+        self.model_combo.setCurrentIndex(index)  # triggers rebuild_sliders if it changed
         for sl, val in zip(self.sliders, best_pars):
             sl.set_value(val)
         self.results_label.setText(self.format_mn_stats(info))

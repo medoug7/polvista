@@ -239,6 +239,73 @@ def find_error_column(fieldnames, base):
                          f'd{base}', f'sigma_{base}', f'sig{base}', f'{base}_error')
 
 
+def load_vapola_csv(path):
+    """Parse a Stokes I/Q/U-vs-frequency CSV (the format Load Data's own
+    load_data_action reads) into (freq [Hz], I, Q, U, I_err, Q_err, U_err),
+    sorted by frequency -- error arrays are None where the CSV has no
+    matching column. Raises ValueError on a missing required column or an
+    empty file.
+
+    Shared by load_data_action (interactive) and
+    sampling.SamplingMixin's qu_fit.py sample import
+    (_load_qu_fit_samples), which needs this same data to re-derive a
+    spectral alpha estimate (see fitting.estimate_alpha) for a run that
+    predates this app's own metadata sidecar and so never recorded one."""
+    with open(path, newline='') as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        freq_col = find_freq_column(fieldnames)
+        i_col = find_column(fieldnames, 'i')
+        q_col = find_column(fieldnames, 'q')
+        u_col = find_column(fieldnames, 'u')
+        if not (freq_col and i_col and q_col and u_col):
+            raise ValueError('CSV needs a Frequency column and I, Q, U columns.')
+        i_err_col = find_error_column(fieldnames, 'i')
+        q_err_col = find_error_column(fieldnames, 'q')
+        u_err_col = find_error_column(fieldnames, 'u')
+        rows = list(reader)
+    if not rows:
+        raise ValueError('CSV has no data rows.')
+
+    freq = np.array([float(r[freq_col]) for r in rows]) * freq_unit_hz_multiplier(freq_col)
+    I = np.array([float(r[i_col]) for r in rows])
+    Q = np.array([float(r[q_col]) for r in rows])
+    U = np.array([float(r[u_col]) for r in rows])
+    I_err = np.array([float(r[i_err_col]) for r in rows]) if i_err_col else None
+    Q_err = np.array([float(r[q_err_col]) for r in rows]) if q_err_col else None
+    U_err = np.array([float(r[u_err_col]) for r in rows]) if u_err_col else None
+
+    order = np.argsort(freq)
+    freq, I, Q, U = freq[order], I[order], Q[order], U[order]
+    if I_err is not None:
+        I_err = I_err[order]
+    if Q_err is not None:
+        Q_err = Q_err[order]
+    if U_err is not None:
+        U_err = U_err[order]
+    return freq, I, Q, U, I_err, Q_err, U_err
+
+
+def fractional_qu(freq, I, Q, U, I_err, Q_err, U_err):
+    """(wl, q, q_err, u, u_err) -- the quantities Fitting compares against
+    (see MainWindow.fit_data) -- derived from load_vapola_csv()'s raw
+    columns: fractional q=Q/I, u=U/I (per-point I, so unaffected by any
+    separate I0 normalization a caller applies for display). Falls back to
+    uniform weighting only if no error column at all was present."""
+    wl = C / freq  # m
+    q, u = Q / I, U / I
+    if Q_err is None and U_err is None and I_err is None:
+        return wl, q, np.ones_like(q), u, np.ones_like(u)
+
+    def frac_err(val, val_err, denom, denom_err):
+        val_err = val_err if val_err is not None else 0.0
+        denom_err = denom_err if denom_err is not None else 0.0
+        return np.sqrt((val_err / denom) ** 2 + (val * denom_err / denom ** 2) ** 2)
+    q_err = frac_err(Q, Q_err, I, I_err)
+    u_err = frac_err(U, U_err, I, I_err)
+    return wl, q, q_err, u, u_err
+
+
 class ParamSlider(QWidget):
     """One labeled slider per model parameter.
 
@@ -496,6 +563,13 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # SamplingMixin.build_corner_tab/on_corner_family_selected.
         self._corner_info = None
         self._corner_families = None
+        # selected_idx -> already-rendered Figure, for the current
+        # _corner_info's own result only -- lets switching the family
+        # picker back to an already-seen family reuse that Figure instead
+        # of re-running CornerBuildWorker from scratch. Reset whenever
+        # _corner_info itself changes (a fresh fit/Load samples, not just a
+        # family switch) -- see build_corner_tab.
+        self._corner_fig_cache = {}
 
         # See PLOT_THROTTLE_MS/request_update_plot and DRAG_N_POINTS_CAP/
         # on_slider_drag_started for what these back.
@@ -572,6 +646,8 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # (here the model function) retrievable later via currentData().
         self.model_combo = QComboBox()
         for func, spec in MODELS.items():
+            if spec.hidden:
+                continue
             self.model_combo.addItem(spec.label, func)
         # "Custom model..." always stays the last row (see
         # open_custom_model_dialog, which inserts newly-built custom models
@@ -1963,41 +2039,10 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         if not path:
             return
         try:
-            with open(path, newline='') as f:
-                reader = csv.DictReader(f)
-                fieldnames = reader.fieldnames or []
-                freq_col = find_freq_column(fieldnames)
-                i_col = find_column(fieldnames, 'i')
-                q_col = find_column(fieldnames, 'q')
-                u_col = find_column(fieldnames, 'u')
-                if not (freq_col and i_col and q_col and u_col):
-                    raise ValueError('CSV needs a Frequency column and I, Q, U columns.')
-                i_err_col = find_error_column(fieldnames, 'i')
-                q_err_col = find_error_column(fieldnames, 'q')
-                u_err_col = find_error_column(fieldnames, 'u')
-                rows = list(reader)
-            if not rows:
-                raise ValueError('CSV has no data rows.')
-
-            freq = np.array([float(r[freq_col]) for r in rows]) * freq_unit_hz_multiplier(freq_col)
-            I = np.array([float(r[i_col]) for r in rows])
-            Q = np.array([float(r[q_col]) for r in rows])
-            U = np.array([float(r[u_col]) for r in rows])
-            I_err = np.array([float(r[i_err_col]) for r in rows]) if i_err_col else None
-            Q_err = np.array([float(r[q_err_col]) for r in rows]) if q_err_col else None
-            U_err = np.array([float(r[u_err_col]) for r in rows]) if u_err_col else None
+            freq, I, Q, U, I_err, Q_err, U_err = load_vapola_csv(path)
         except (OSError, ValueError, KeyError) as e:
             QMessageBox.warning(self, 'Load Data', f'Could not load data file:\n{e}')
             return
-
-        order = np.argsort(freq)
-        freq, I, Q, U = freq[order], I[order], Q[order], U[order]
-        if I_err is not None:
-            I_err = I_err[order]
-        if Q_err is not None:
-            Q_err = Q_err[order]
-        if U_err is not None:
-            U_err = U_err[order]
 
         # p and EVPA are scale-invariant ratios of I/Q/U, so they're computed
         # from the raw values -- unaffected by the I0 normalization below.
@@ -2041,21 +2086,11 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
 
         # Fractional q=Q/I, u=U/I (per-point I, not the I0-normalized Q_n/U_n
         # above) -- the quantity the models themselves return, so it's what
-        # Fitting compares against. Falls back to uniform weighting only if
-        # no error columns at all were present in the CSV.
-        q, u = Q / I, U / I
-        if Q_err is None and U_err is None and I_err is None:
-            q_err, u_err = np.ones_like(q), np.ones_like(u)
-        else:
-            def frac_err(val, val_err, denom, denom_err):
-                val_err = val_err if val_err is not None else 0.0
-                denom_err = denom_err if denom_err is not None else 0.0
-                return np.sqrt((val_err / denom) ** 2 + (val * denom_err / denom ** 2) ** 2)
-            q_err = frac_err(Q, Q_err, I, I_err)
-            u_err = frac_err(U, U_err, I, I_err)
-        # freq, I (raw, not I0-normalized) ride along for Fitting's alpha
-        # estimate (see run_fit / estimate_alpha) -- computed there, not
-        # here, since it should only take effect once the user clicks Fitting.
+        # Fitting compares against. freq, I (raw, not I0-normalized) ride
+        # along for Fitting's alpha estimate (see run_fit / estimate_alpha)
+        # -- computed there, not here, since it should only take effect once
+        # the user clicks Fitting.
+        wl, q, q_err, u, u_err = fractional_qu(freq, I, Q, U, I_err, Q_err, U_err)
         self.fit_data = (wl, q, q_err, u, u_err, freq, I)
         self.fit_button.setEnabled(True)
         self.rmsynth_data_button.setEnabled(True)
