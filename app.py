@@ -295,7 +295,7 @@ def fractional_qu(freq, I, Q, U, I_err, Q_err, U_err):
     wl = C / freq  # m
     q, u = Q / I, U / I
     if Q_err is None and U_err is None and I_err is None:
-        return wl, q, np.ones_like(q), u, np.ones_like(u)
+        return wl, q, 1e-3*np.ones_like(q), u, 1e-3*np.ones_like(u)
 
     def frac_err(val, val_err, denom, denom_err):
         val_err = val_err if val_err is not None else 0.0

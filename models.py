@@ -1020,17 +1020,34 @@ def full_equation(spec, shape1, shape2):
 # expression the user types into that field (not to be confused with the
 # unrelated epsilon/eps already used elsewhere for a two-component model's
 # own spectral blend weight, see spectral_weights/spectral_params). j(z), the
-# plain (unpolarized) emissivity used for the denominator, is that same
-# emiss(z) expression with p0 forced to 1, then |...| taken of whatever's
-# left (see CUSTOM_P0_SYMBOL below, _custom_P_raw and build_custom_model) --
-# a magnitude rather than also substituting chi0 to 0 and integrating the
-# result directly, since chi0's own e^{2i*chi0} factor (and any other
-# unit-magnitude phase emiss(z) might carry, e.g. a position-dependent
-# intrinsic EVPA) already has |...|=1 and so can't survive an abs() anyway,
-# while integrating a merely-chi0-zeroed expression that still carries some
-# *other* complex structure could leave I_lambda itself complex -- and
-# dividing P(lambda) by a complex I_lambda would wrongly rotate it, not
-# just rescale it.
+# plain (unpolarized) emissivity used for the denominator, is simply 1 across
+# the emitting region [j_lo, j_hi] (0 outside it) for an optically-thin
+# ('powerlaw'/'logparabola') model -- *not* derived from emiss(z) (an
+# earlier design forced p0->1 in emiss(z) and took |...| of what was left,
+# but that only ever strips out the literal p0 symbol: any other magnitude
+# dependence emiss(z) carries -- a spatial envelope, a bare 'nu'/'lambda'
+# factor meant to reshape P(lambda)'s own spectrum -- would reappear
+# identically in that derived j(z) too and cancel out of the ratio exactly,
+# leaving it with zero effect on P(lambda) besides a spurious EVPA rotation
+# wherever it went negative, since only the magnitude survives an abs()
+# while the numerator keeps the sign). emiss(z) is instead taken to mean
+# the local complex fractional-polarization factor m(z)=j_p(z)/j(z)
+# outright (degree and phase together, e.g. its default
+# 'p0*exp(2*i*chi0)'), so any magnitude dependence typed into it reshapes
+# P(lambda) directly instead of being divided back out -- it's only ever
+# clipped to |m(z)|<=1 pointwise (see _custom_P_raw), never rescaled by a
+# second, independently-derived j(z). I_lambda (j(z)'s own integral) is
+# accordingly just the emitting region's rectangular area, j_hi-j_lo,
+# computed directly rather than by a second numerical emiss(z) evaluation.
+#
+# An 'ssa'/'thermal' model is the one exception: Kirchhoff's law ties the
+# per-z opacity directly to the *actual* local emissivity (see
+# _custom_opacity_attenuation), so there's no way to compute a physically
+# meaningful attenuation from a flat j(z)=1 -- self-absorption has to know
+# where the source's own material really is. For that case only, j(z) falls
+# back to the earlier emiss(z)-with-p0-forced-to-1 derivation (real
+# numerical integration, not the rectangle shortcut), same as it always
+# has -- see _custom_P_raw's own shape branch.
 #
 # p0 (fractional polarization amplitude), chi0 (EVPA) and phi0 (Faraday-depth
 # scale) are ordinary symbols emiss(z)/phi'(z) can reference directly, not
@@ -1569,14 +1586,23 @@ def _custom_P_raw(emiss_fn, phi_fn, consts, p0_val, chi0_val, phi0_val,
     the LOS integral custom_func actually needs, evaluated on an n-point z
     grid -- j_p(z) = emiss_fn(z) * e^{2i*phi(z)*lambda^2} (`emiss_fn` is the
     user's own emiss(z) expression, referencing p0/chi0/phi0 exactly as
-    typed) and j(z) = |emiss_fn(z) with p0 forced to 1| -- the *magnitude*
-    of that same expression once its own polarization amplitude is removed
-    (see build_custom_model's own module comment for why a magnitude,
-    rather than also substituting chi0->0 and integrating the result
-    directly). Both are integrated over the same masked region so the
-    result only depends on emiss(z)'s own *shape*, not the raw bounds it
-    happens to be evaluated over (see the module comment above for why
-    that normalization matters). Pulled out of custom_func as its own
+    typed), taken to mean the local complex fractional-polarization factor
+    m(z)=j_p(z)/j(z) outright. For an optically-thin ('powerlaw'/
+    'logparabola') `shape`, j(z) is simply 1 across [j_lo,j_hi] (0 outside
+    it) rather than derived from emiss_fn, so any magnitude dependence
+    emiss_fn carries reshapes P(lambda) directly instead of canceling out
+    of the ratio (see build_custom_model's own module comment for the
+    problem that fixes). For 'ssa'/'thermal', where Kirchhoff's law ties
+    the per-z opacity directly to the *actual* local emissivity, j(z)
+    falls back to the earlier derivation instead -- emiss_fn evaluated
+    again with p0 forced to 1, then |...| taken of whatever's left (see
+    the module comment for why a magnitude, not also substituting
+    chi0->0). Either way, j_p(z) is then clipped pointwise to
+    |j_p(z)| <= j(z) (phase preserved) before either integral runs, since a
+    user-typed emiss(z) is under no obligation to keep its own local
+    polarization fraction physical -- see the comment at that clip below
+    for why that's enough to guarantee |P(lambda)|<=1 everywhere. Pulled
+    out of custom_func as its own
     function purely to keep that already-long resolution/masking logic
     readable -- `x` there is only ever the subset of wavelengths
     custom_func has already determined are worth resolving (see its own
@@ -1598,19 +1624,51 @@ def _custom_P_raw(emiss_fn, phi_fn, consts, p0_val, chi0_val, phi0_val,
     z = np.linspace(-1.0, 1.0, n)[:, None]      # (n_grid, 1) -- full LOS
     lam = x[None, :]                            # (1, n_lambda)
     nu = (C / x / 1e6)[None, :]                 # (1, n_lambda) MHz
+    in_region = (z >= j_lo) & (z <= j_hi)       # (n_grid, 1)
     # emiss_num_zw is left complex -- j_p(z) may use 'i' for a
     # position-dependent intrinsic EVPA (e.g. 'exp(2*i*chi_z*z)'), and that
     # phase needs to survive into the integral below.
     emiss_num_zw = _eval_zw(emiss_fn, z, nu, lam, p0_val, chi0_val, phi0_val, consts)
-    emiss_num_zw = np.where((z >= j_lo) & (z <= j_hi), emiss_num_zw, 0.0)
-    # j(z): `emiss_fn` evaluated again with p0 forced to 1.0 (chi0 left at
-    # its real value -- see build_custom_model's own module comment for why
-    # that's fine), then |...| taken of the (possibly still complex)
-    # result -- a second, independent numeric call rather than something
-    # derived algebraically from emiss_num_zw above, since a user-typed
-    # expression need not be linear in p0 (e.g. 'p0**2*exp(2*i*chi0)+w').
-    emiss_den_zw = np.abs(_eval_zw(emiss_fn, z, nu, lam, 1.0, chi0_val, phi0_val, consts))
-    emiss_den_zw = np.where((z >= j_lo) & (z <= j_hi), emiss_den_zw, 0.0)
+    emiss_num_zw = np.where(in_region, emiss_num_zw, 0.0)
+    if shape in ('ssa', 'thermal'):
+        # Kirchhoff's law ties the per-z opacity directly to the *actual*
+        # local emissivity (see _custom_opacity_attenuation) -- a flat
+        # j(z)=1 gives self-absorption no shape to track, so only this
+        # branch still needs the real, numerically-derived j(z): emiss_fn
+        # evaluated again with p0 forced to 1.0 (chi0 left at its real
+        # value -- see build_custom_model's own module comment for why
+        # that's fine), then |...| taken of the (possibly still complex)
+        # result -- a second, independent numeric call rather than
+        # something derived algebraically from emiss_num_zw above, since a
+        # user-typed expression need not be linear in p0 (e.g.
+        # 'p0**2*exp(2*i*chi0)+w').
+        emiss_den_zw = np.abs(_eval_zw(emiss_fn, z, nu, lam, 1.0, chi0_val, phi0_val, consts))
+        emiss_den_zw = np.where(in_region, emiss_den_zw, 0.0)
+    else:
+        # No opacity to tie j(z) to anything physical -- emiss(z) is taken
+        # to mean the local complex fractional-polarization factor m(z)
+        # outright (see the module comment above build_custom_model), so
+        # j(z) is fixed at 1 across the emitting region instead of being
+        # re-derived from emiss(z) itself, which would cancel any of its
+        # own magnitude dependence right back out of P(lambda) -- no
+        # second emiss_fn evaluation needed at all.
+        emiss_den_zw = np.broadcast_to(np.where(in_region, 1.0, 0.0), emiss_num_zw.shape)
+    # Physically, a patch of plasma can't emit more polarized flux than it
+    # emits total flux -- |j_p(z)| <= j(z) at every point -- but a
+    # user-typed j_p(z) is under no obligation to respect that (e.g. an
+    # extra magnitude factor that pushes the local polarization fraction
+    # above 1 somewhere). Rescaling emiss_num_zw down to emiss_den_zw's own
+    # magnitude wherever it's exceeded (phase left untouched) enforces that
+    # bound pointwise, before the LOS integral below ever runs, rather than
+    # clamping the integrated P(lambda) after the fact -- P(lambda) is a
+    # j(z)-weighted average of j_p(z)/j(z), and a weighted average (with
+    # j(z)>=0 weights) of points already inside the unit disk can't leave
+    # it, so clipping here is enough to guarantee |P(lambda)|<=1 everywhere,
+    # while leaving any already-physical j_p(z) (the common case) untouched.
+    num_mag = np.abs(emiss_num_zw)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        clip_scale = np.where(num_mag > emiss_den_zw, emiss_den_zw / num_mag, 1.0)
+    emiss_num_zw = emiss_num_zw * np.nan_to_num(clip_scale, nan=1.0)
     if shape in ('ssa', 'thermal'):
         atten_zw = _custom_opacity_attenuation(
             emiss_fn, consts, chi0_val, phi0_val, j_lo, j_hi, z, nu, lam, emiss_den_zw,
@@ -1639,7 +1697,12 @@ def _custom_P_raw(emiss_fn, phi_fn, consts, p0_val, chi0_val, phi0_val,
     phi_zw = prefix_zw[-1:, :] - prefix_zw
     phase = 2.0 * phi_zw * lam ** 2              # (n_grid, n_lambda) via broadcasting
     numerator = np.trapz(emiss_num_zw * np.exp(1j * phase), z[:, 0], axis=0)
-    denominator = np.trapz(emiss_den_zw, z[:, 0], axis=0)
+    if shape in ('ssa', 'thermal'):
+        denominator = np.trapz(emiss_den_zw, z[:, 0], axis=0)
+    else:
+        # emiss_den_zw is just the rectangle mask here -- its own LOS
+        # integral is exactly the emitting region's area, no trapz needed.
+        denominator = j_hi - j_lo
     with np.errstate(divide='ignore', invalid='ignore'):
         return numerator / denominator
 
