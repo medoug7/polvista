@@ -42,6 +42,10 @@ def rmsf(lambda2, weights, phi, lambda2_0):
 
 
 def briggs_weights(lambda2, noise_weights, robust, cell_width):
+    """Briggs-robust per-channel weights: `noise_weights` down-weighted in
+    proportion to how crowded their `cell_width`-wide lambda^2 bin is,
+    tuned by `robust` (very negative ~ uniform weighting, very positive ~
+    natural/noise-only weighting)."""
     bin_idx = np.floor((lambda2 - lambda2.min()) / cell_width).astype(int)
     cell_weight = np.zeros(bin_idx.max() + 1)
     np.add.at(cell_weight, bin_idx, noise_weights)
@@ -68,6 +72,13 @@ def phi_axis_half_width(lambda2_min, lambda2_max, phi_max_mult=PHI_MAX_ALIAS_MUL
 
 
 def default_phi_grid(lambda2, phi_max_mult=PHI_MAX_ALIAS_MULT, phi_max_cap=None):
+    """Search/preview phi grid for this channel set: spacing `dphi` from
+    the RMSF FWHM (15x-oversampled), half-width capped by whichever is
+    smaller of the Nyquist limit set by the finest channel spacing
+    (`phi_max_sampling`) and the alias-scale cap `phi_max_cap` (same
+    [PHI_HALF_WIDTH_MIN, PHI_HALF_WIDTH_MAX]-clipped value
+    phi_axis_half_width uses, unless overridden).
+    Returns (phi, dphi, fwhm_rmsf, phi_max_sampling, phi_alias)."""
     l2_sorted = np.sort(lambda2)
     steps = np.diff(l2_sorted)
     steps = steps[steps > 0]
@@ -91,8 +102,15 @@ def default_phi_grid(lambda2, phi_max_mult=PHI_MAX_ALIAS_MULT, phi_max_cap=None)
 
 
 def rm_clean(dirty, phi, R, phi_r, gain=0.1, niter=1000, threshold=0.0):
+    """Greedy CLEAN (Heald 2009): repeatedly subtract `gain` times the
+    RMSF `R` centered on the residual's current peak until it drops to
+    `threshold` or `niter` iterations are used. `phi_r` must be `R`'s own
+    (twice-as-wide, zero-centered) phi axis. Returns
+    (components, residual, iterations_used)."""
     n_phi = len(phi)
-    assert len(phi_r) == 2 * n_phi - 1
+    if len(phi_r) != 2 * n_phi - 1:
+        raise ValueError('phi_r must span twice the phi grid (R\'s own axis), '
+                          f'got len(phi_r)={len(phi_r)}, expected {2 * n_phi - 1}.')
     center_r = n_phi - 1
 
     residual = dirty.copy()
@@ -113,6 +131,10 @@ def rm_clean(dirty, phi, R, phi_r, gain=0.1, niter=1000, threshold=0.0):
 
 
 def measure_fwhm(x, amp, center_idx, fallback, max_offset=None):
+    """FWHM of the `amp` peak at `center_idx` by linear interpolation
+    between samples straddling half-max on each side (searching at most
+    `max_offset` samples out); `fallback` if either side never crosses
+    half-max."""
     max_offset = len(amp) if max_offset is None else max_offset
     half = amp[center_idx]
 
@@ -161,19 +183,12 @@ def parabolic_peak(phi, amp, i):
 
 
 def sci_latex(value, err=None, unit=r'rad\,m^{-2}'):
-    """Format `value` (optionally with `err`) as LaTeX scientific notation:
-    ``(1.23 \\pm 0.04)\\times 10^{5}\\ \\mathrm{rad\\,m^{-2}}`` -- or just
-    ``1.23\\times 10^{5}\\ \\mathrm{rad\\,m^{-2}}`` if no error is given.
-    The common exponent is chosen from whichever of `value`/`err` is
-    larger in magnitude (just `value` if no error is given), so a value
-    consistent with 0 (e.g. no real Faraday rotation detected) still gets
-    an exponent tied to its own error bar's actual size, rather than
-    collapsing to whatever tiny floating-point residue `value` happens to
-    be -- which would otherwise blow up the error's own mantissa (and,
-    via decimals below, the number of digits shown) by that same
-    many-orders-of-magnitude mismatch. The error's precision sets how many
-    decimal places are shown (2 significant figures of the error).
-    """
+    """Format `value` +/- `err` (or just `value`) as LaTeX scientific
+    notation, e.g. ``(1.23 \\pm 0.04)\\times 10^{5}\\ \\mathrm{rad\\,m^{-2}}``.
+    The exponent is set by whichever of `value`/`err` is larger in
+    magnitude, so a near-zero value with a real error bar doesn't collapse
+    to a spurious exponent; the error's own precision sets the decimals
+    shown (2 significant figures)."""
     ref = max(abs(value), abs(err)) if err is not None and np.isfinite(err) else abs(value)
     if ref == 0 or not np.isfinite(ref):
         exponent = 0

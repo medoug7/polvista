@@ -123,24 +123,13 @@ def format_band_result_latex(band_label, alpha, alpha_err, dep, dep_err, rm, rm_
 
 def model_fit_pinned(model_func, wl_arr, pars, wl_pivot):
     """model_func(wl_arr, pars), with any two-component spectral-mixing
-    pivot (see models.spectral_weights: the reference frequency
-    alpha1/alpha2 weight I1/I2 relative to) pinned to `wl_pivot` instead
-    of each call silently deriving its own pivot from min(wl_arr).
-
-    Model functions take no explicit pivot/nu_min argument -- they always
-    use the lowest frequency (longest wavelength) present in whatever
-    array they're called on. Evaluating a handful of SPW frequencies
-    on their own therefore picks a different pivot than the model curves
-    themselves do (which are evaluated across the whole plotted
-    wavelength range at once), and the two silently diverge whenever
-    alpha1 != alpha2. Appending `wl_pivot` as an extra sample -- the
-    longest wavelength in the *plotted* range, so also the longest here,
-    as long as no band's own frequency falls outside that range -- forces
-    the model's own np.min() to resolve to the same pivot the curves use;
-    that extra sample is then dropped from the result.
-
-    No-op (beyond one wasted extra evaluation) for single-component
-    models, which don't reference any pivot at all."""
+    pivot (models.spectral_weights' own alpha1/alpha2 reference frequency)
+    pinned to `wl_pivot` instead of each call deriving its own from
+    min(wl_arr) -- otherwise a handful of SPW frequencies evaluated alone
+    would silently diverge from the model curves' own pivot (evaluated
+    across the whole plotted range) whenever alpha1 != alpha2. Appends
+    `wl_pivot` as an extra sample to force that resolution, then drops it
+    from the result. No-op for single-component models."""
     wl_extended = np.concatenate([np.asarray(wl_arr, dtype=float), [wl_pivot]])
     return model_func(wl_extended, pars)[:-1]
 
@@ -191,14 +180,14 @@ ALMA_ALL_BANDS = [ALMA_BAND1, ALMA_BAND2, ALMA_BAND3, ALMA_BAND4, ALMA_BAND5,
                     ALMA_BAND6, ALMA_BAND7, ALMA_BAND8, ALMA_BAND9, ALMA_BAND10]
 
 # VLA -- L through Q band, https://science.nrao.edu/facilities/vla/docs/manuals/propvla/frequency-bands-and-samplers
-VLA_L = (1.4, 0.6, 4)       # L band:  1-2 GHz
-VLA_S = (2.8, 1.2, 4)       # S band:  2-4 GHz
-VLA_C = (5.7, 2.0, 4)       # C band:  4-8 GHz
-VLA_X = (9.8, 2.0, 4)       # X band:  8-12 GHz
-VLA_KU = (14.7, 2.0, 4)     # Ku band: 12-18 GHz
-VLA_K = (21.8, 2.0, 4)      # K band:  18-26.5 GHz
-VLA_KA = (32.5, 2.0, 4)     # Ka band: 26.5-40 GHz
-VLA_Q = (44.7, 2.0, 4)      # Q band:  40-50 GHz
+VLA_L = (1.4, 0.6, 50)       # L band:  1-2 GHz
+VLA_S = (2.8, 1.2, 50)       # S band:  2-4 GHz
+VLA_C = (5.7, 2.0, 50)       # C band:  4-8 GHz
+VLA_X = (9.8, 2.0, 50)       # X band:  8-12 GHz
+VLA_KU = (14.7, 2.0, 50)     # Ku band: 12-18 GHz
+VLA_K = (21.8, 2.0, 50)      # K band:  18-26.5 GHz
+VLA_KA = (32.5, 2.0, 50)     # Ka band: 26.5-40 GHz
+VLA_Q = (44.7, 2.0, 50)      # Q band:  40-50 GHz
 VLA_LOW_BANDS = [VLA_L, VLA_S, VLA_C, VLA_X]
 VLA_HIGH_BANDS = [VLA_K, VLA_KA, VLA_Q]
 VLA_ALL_BANDS = [VLA_L, VLA_S, VLA_C, VLA_X, VLA_KU, VLA_K, VLA_KA, VLA_Q]
@@ -210,18 +199,18 @@ MEERKAT_S = (2.47, 1.75, 4)     # S band:   1750-3499 MHz
 MEERKAT_ALL_BANDS = [MEERKAT_UHF, MEERKAT_L, MEERKAT_S]
 
 # LOFAR -- LBA and HBA band, https://www.aanda.org/articles/aa/full_html/2013/08/aa20873-12/aa20873-12.html
-LOFAR_LBA = (0.05, 0.08, 4)   # 10 - 90 MHz
-LOFAR_HBA = (0.18, 0.12, 4)     # 120 - 240 MHz
+LOFAR_LBA = (0.05, 0.08, 50)   # 10 - 90 MHz
+LOFAR_HBA = (0.18, 0.12, 50)     # 120 - 240 MHz
 LOFAR_ALL_BANDS = [LOFAR_LBA, LOFAR_HBA]
 
 # SDSS-like optical filters (g, r, i, z) -- SPARC4's own 4 simultaneous
 # channels, per its instrument papers -- using the same round-number
 # Fukugita et al. 1996 band edges as app.WAVELENGTH_PRESETS; center is
 # the geometric mean of each band's own nu_min/nu_max, bw = nu_max - nu_min.
-SDSS_G = (639200.0, 204400.0, 4)   # g band: 400-550 nm / 545-749 THz
-SDSS_R = (483200.0, 116800.0, 4)   # r band: 550-700 nm / 428-545 THz
-SDSS_I = (388700.0, 75600.0, 4)    # i band: 700-850 nm / 353-428 THz
-SDSS_Z = (325200.0, 52900.0, 4)    # z band: 850-1000 nm / 300-353 THz
+SDSS_G = (639200.0, 204400.0, 1)   # g band: 400-550 nm / 545-749 THz
+SDSS_R = (483200.0, 116800.0, 1)   # r band: 550-700 nm / 428-545 THz
+SDSS_I = (388700.0, 75600.0, 1)    # i band: 700-850 nm / 353-428 THz
+SDSS_Z = (325200.0, 52900.0, 1)    # z band: 850-1000 nm / 300-353 THz
 SDSS_ALL_BANDS = [SDSS_G, SDSS_R, SDSS_I, SDSS_Z]
 
 # SOFIA/HAWC+'s far-IR bands, per Harper et al. 2018 (center_um, bw_um):
@@ -236,21 +225,21 @@ HAWC_D = (1958.7, 435.1, 4)     # Band D: 154 um (137-171 um)
 HAWC_E = (1408.4, 291.1, 4)     # Band E: 214 um (192-236 um)
 HAWC_ALL_BANDS = [HAWC_A, HAWC_C, HAWC_D, HAWC_E]
 
+# ALMA Bands 2-10 (67 GHz up), shared by both lists below -- Band 1
+# (35-50 GHz) is deliberately excluded there, see FULL_GHZ_BANDS.
+ALMA_BANDS_2_10 = [ALMA_BAND2, ALMA_BAND3, ALMA_BAND4, ALMA_BAND5, ALMA_BAND6,
+                    ALMA_BAND7, ALMA_BAND8, ALMA_BAND9, ALMA_BAND10]
+
 # Full radio combines ALMA + VLA (its own two lowest-frequency facilities
 # above) into one default list. ALMA Band 1 (35-50 GHz) and VLA's Q band
 # (40-50 GHz) overlap 40-50 GHz -- Band 1 is dropped and VLA_Q kept for
 # that stretch, per the rest of ALMA (Bands 2-10, from 67 GHz up) never
 # overlapping VLA's own top end.
-FULL_GHZ_BANDS = VLA_ALL_BANDS + [ALMA_BAND2, ALMA_BAND3, ALMA_BAND4,
-                                     ALMA_BAND5, ALMA_BAND6, ALMA_BAND7,
-                                     ALMA_BAND8, ALMA_BAND9, ALMA_BAND10]
+FULL_GHZ_BANDS = VLA_ALL_BANDS + ALMA_BANDS_2_10
 
 FULL_MHZ_BANDS = LOFAR_ALL_BANDS + MEERKAT_ALL_BANDS
 
-
-FULL_RADIO_BANDS = FULL_MHZ_BANDS + VLA_ALL_BANDS + [ALMA_BAND2, ALMA_BAND3, ALMA_BAND4,
-                                     ALMA_BAND5, ALMA_BAND6, ALMA_BAND7,
-                                     ALMA_BAND8, ALMA_BAND9, ALMA_BAND10]
+FULL_RADIO_BANDS = FULL_MHZ_BANDS + VLA_ALL_BANDS + ALMA_BANDS_2_10
 
 # Curated (center_ghz, bw_ghz, n_spw) defaults, keyed by the wavelength-
 # preset label they belong to -- auto-populated into the Bands box when
@@ -342,7 +331,6 @@ class BandRow(QWidget):
         center_label.setToolTip(center_tip)
         bw_label.setPixmap(latex_pixmap(r'$\Delta \nu$'))
         bw_label.setToolTip(bw_tip)
-        #spw_label.setPixmap(latex_pixmap('SPW'))
         spw_label.setToolTip(spw_tip)
 
         layout.addWidget(center_label)
@@ -612,32 +600,15 @@ class MeasurementsMixin:
         rainbow = band_colors(len(self.band_rows))
         row_colors = [rainbow[r] for r in freq_rank]
 
-        # Pin every band's own pivot -- both the Stokes I/Q/U amplitude
-        # normalization (models.stokes_I's nu_min) and, for two-component
-        # models, the alpha1/alpha2 spectral-mixing weight (see
-        # model_fit_pinned) -- to the exact same pivot the currently
-        # displayed model curves themselves use. Without this, each band
-        # would derive its own local pivot from just its own handful of
-        # frequencies, which silently diverges from the curves' own (in
-        # both Stokes I and, whenever alpha1 != alpha2, p/EVPA too) -- see
-        # model_fit_pinned's docstring.
-        #
-        # Real loaded data (MainWindow.load_data_action) has priority for
-        # that shared pivot: its own I(nu_min)=1 normalization is computed
-        # once at load time and never rescales, so if any data is loaded,
-        # the pivot must stay anchored to *its* own nu_min, not whatever
-        # frequencies these freshly-generated bands happen to span --
-        # otherwise a band reaching below the loaded data's own lowest
-        # frequency would drag self.data_nu_min down with it and visibly
-        # desync the model curves from the already-plotted real points.
-        # Only derive a fresh pivot from the currently plotted wavelength
-        # range (wl_ext's own lowest frequency) when there's no loaded data
-        # to defer to.
-        #
-        # Either way this overwrites self.data_nu_min the same way a real
-        # Fit! anchors it (see MainWindow.fit_spectrum_lsq), so the Stokes
-        # I/Q/U curve itself keeps using this pivot on every redraw, not
-        # just for the points generated right now.
+        # Pin every band's pivot (Stokes I normalization + two-component
+        # alpha1/alpha2 mixing weight, see model_fit_pinned) to the same
+        # one the displayed model curves use, so a band's own handful of
+        # frequencies can't silently derive a different pivot than the
+        # curves do. Real loaded data takes priority (its own I(nu_min)=1
+        # normalization is fixed at load time), otherwise the pivot comes
+        # from the currently plotted wavelength range. Either way this
+        # overwrites self.data_nu_min the same way a real Fit! does, so
+        # the Stokes I/Q/U curve keeps using it on every later redraw too.
         if self.fit_data is not None:
             freq_loaded = self.fit_data[5]  # (wl, q, q_err, u, u_err, freq, I)
             nu_min = float(np.min(freq_loaded)) / 1e6  # MHz
@@ -677,20 +648,20 @@ class MeasurementsMixin:
             Q_obs = Q_true + rng.normal(0, Q_err, n)
             U_obs = U_true + rng.normal(0, U_err, n)
 
-            p_frac, p_frac_err, X_obs_rad, X_err_rad = propagate_pol_errors(
+            p_frac, p_frac_err, evpa_rad, evpa_err_rad = propagate_pol_errors(
                 I_obs, Q_obs, U_obs, I_err, Q_err, U_err)
             p_obs, p_err = 100.0 * p_frac, 100.0 * p_frac_err
-            X_obs_deg, X_err_deg = np.degrees(X_obs_rad), np.degrees(X_err_rad)
+            evpa_deg, evpa_err_deg = np.degrees(evpa_rad), np.degrees(evpa_err_rad)
 
             color = row_colors[b]
             w2 = wl_arr ** 2 * 1e6  # mm^2, matches ModelPlot's own convention
             p_bands.append(dict(color=color, w2=w2, p=p_obs, p_err=p_err,
-                                 evpa=X_obs_deg, evpa_err=X_err_deg))
+                                 evpa=evpa_deg, evpa_err=evpa_err_deg))
             i_bands.append(dict(color=color, nu=freqs_ghz, I=I_obs, I_err=I_err,
                                  Q=Q_obs, Q_err=Q_err, U=U_obs, U_err=U_err))
             for i in range(n):
                 export_rows.append([b + 1, freqs_ghz[i], I_obs[i], I_err[i], Q_obs[i], Q_err[i],
-                                     U_obs[i], U_err[i], p_obs[i], p_err[i], X_obs_deg[i], X_err_deg[i]])
+                                     U_obs[i], U_err[i], p_obs[i], p_err[i], evpa_deg[i], evpa_err_deg[i]])
 
             band_label = f'Band {b + 1} ({row.center.value():.3g} GHz, {n} SPW)'
             if n < 2:
@@ -704,7 +675,7 @@ class MeasurementsMixin:
             # actually measure from just this band's own noisy I points.
             alpha_fit = weighted_linfit(np.log(freqs_ghz), np.log(np.abs(I_obs)), I_err / np.abs(I_obs))
             dep_fit = weighted_linfit(freqs_ghz, p_frac, p_frac_err)
-            rm_fit = weighted_linfit(lam2, X_obs_rad, X_err_rad)
+            rm_fit = weighted_linfit(lam2, evpa_rad, evpa_err_rad)
             if alpha_fit is None or dep_fit is None or rm_fit is None:
                 results_lines.append((color, f'{band_label}\n  fit failed (degenerate points)'))
                 continue

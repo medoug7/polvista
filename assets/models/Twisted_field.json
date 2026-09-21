@@ -1,0 +1,36 @@
+{
+  "model": "Twisted field",
+  "parameters": {
+    "p0": 0.10003000000000001,
+    "X_0": 0.0,
+    "phi0": 0.0,
+    "Delta_chi": 0.0,
+    "sigma_phi": 0.259215323458839,
+    "alpha": -0.5
+  },
+  "spectral_shape": "powerlaw",
+  "custom_definition": {
+    "label": "Twisted field",
+    "title": "Twisted field",
+    "emiss_expr": "p0 * exp(2 * i * (chi0+Delta_chi*(z)))",
+    "phi_expr": "phi0*(1-z)+i*sigma_phi**2*lambda**2",
+    "param_specs": {
+      "Delta_chi": [
+        "X",
+        -3.141592653589793,
+        3.141592653589793,
+        "Rate of how much EVPAs change across source due to field twisting"
+      ],
+      "sigma_phi": [
+        "dphi",
+        0.0,
+        5000000.0,
+        "Faraday dispersion from turbulent magnetic field"
+      ]
+    },
+    "j_lo": "-1",
+    "j_hi": "1",
+    "p_lo": "-1",
+    "p_hi": "1"
+  }
+}

@@ -304,35 +304,31 @@ def estimate_shape_2comp(freq, I, eps, nu0_1_init, nu0_2_init, alpha_init,
 
     lo_nu0, hi_nu0 = nu0_bounds
 
-    if not fit_nu0_1 and not fit_nu0_2:
-        result = least_squares(
-            lambda p: shape_log_ratio(nu0_1_init, nu0_2_init, p[0]) - target, x0=[alpha_init])
-        alpha_est = float(result.x[0]) if result.success else alpha_init
-        return alpha_est, nu0_1_init, nu0_2_init
+    # Build the free-parameter vector dynamically: whichever of nu0_1/nu0_2
+    # is free gets its own slot (boxed to nu0_bounds); alpha is always free.
+    free_names, x0, lo, hi = [], [], [], []
+    if fit_nu0_1:
+        free_names.append('nu0_1'); x0.append(nu0_1_init); lo.append(lo_nu0); hi.append(hi_nu0)
+    if fit_nu0_2:
+        free_names.append('nu0_2'); x0.append(nu0_2_init); lo.append(lo_nu0); hi.append(hi_nu0)
+    free_names.append('alpha')
+    x0.append(alpha_init)
+    lo.append(-np.inf)
+    hi.append(np.inf)
 
-    if fit_nu0_1 and not fit_nu0_2:
-        result = least_squares(
-            lambda p: shape_log_ratio(p[0], nu0_2_init, p[1]) - target,
-            x0=[nu0_1_init, alpha_init], bounds=([lo_nu0, -np.inf], [hi_nu0, np.inf]))
-        if not result.success:
-            return alpha_init, nu0_1_init, nu0_2_init
-        return float(result.x[1]), float(result.x[0]), nu0_2_init
+    def residual(p):
+        values = dict(zip(free_names, p))
+        return shape_log_ratio(values.get('nu0_1', nu0_1_init),
+                                values.get('nu0_2', nu0_2_init),
+                                values['alpha']) - target
 
-    if fit_nu0_2 and not fit_nu0_1:
-        result = least_squares(
-            lambda p: shape_log_ratio(nu0_1_init, p[0], p[1]) - target,
-            x0=[nu0_2_init, alpha_init], bounds=([lo_nu0, -np.inf], [hi_nu0, np.inf]))
-        if not result.success:
-            return alpha_init, nu0_1_init, nu0_2_init
-        return float(result.x[1]), nu0_1_init, float(result.x[0])
-
-    result = least_squares(
-        lambda p: shape_log_ratio(p[0], p[1], p[2]) - target,
-        x0=[nu0_1_init, nu0_2_init, alpha_init],
-        bounds=([lo_nu0, lo_nu0, -np.inf], [hi_nu0, hi_nu0, np.inf]))
+    result = least_squares(residual, x0=x0, bounds=(lo, hi))
     if not result.success:
         return alpha_init, nu0_1_init, nu0_2_init
-    nu0_1_est, nu0_2_est, alpha_est = float(result.x[0]), float(result.x[1]), float(result.x[2])
+    values = dict(zip(free_names, result.x))
+    alpha_est = float(values['alpha'])
+    nu0_1_est = float(values['nu0_1']) if fit_nu0_1 else nu0_1_init
+    nu0_2_est = float(values['nu0_2']) if fit_nu0_2 else nu0_2_init
     return alpha_est, nu0_1_est, nu0_2_est
 
 
@@ -559,39 +555,22 @@ def relabel_swap_symmetric(pooled, id_idx, kinds, swap_perm, rng, n_iter=10, n_r
     whichever rows need it. Returns the relabeled (N, ndim) array.
 
     Needed because MultiNest's own mode-finding isn't symmetry-aware: it
-    can (and, for a family with near-comparable/overlapping components,
-    often does) lump both label-swapped branches of an exact component-
-    swap-degenerate posterior into one raw mode instead of splitting them
-    -- so `pooled` (built by weight-resampling each family member mode
-    as-is) may itself be an even direct/swapped mix, not one labeling.
+    can lump both label-swapped branches of an exact component-swap-
+    degenerate posterior into one raw mode, so `pooled` may itself be an
+    even direct/swapped mix rather than one consistent labeling.
 
-    A single fixed reference point can't reliably split such a mix: the
-    "identifying" params (mode_id_indices()) span wildly different scales
-    and constraint strengths -- e.g. Faraday depth (phi/dphi) is often only
-    weakly constrained (large, noisy per-sample scatter) while EVPA (X) is
-    tight -- and naively combining per-sample deviations in quadrature lets
-    the noisy dimensions swamp the one or two dimensions that actually
-    carry the direct/swap signal for any single point. Comparing to a
-    running *centroid* instead, refit from the currently-assigned rows'
-    own mean each pass (like Lloyd's algorithm for k=2, constrained to a
-    swap-symmetric pair of clusters), denoises the same way a whole-mode
-    weighted mean does -- but from a self-consistently-labeled subset
-    instead of the raw mixture.
-
-    Lloyd's algorithm (this is k=2, constrained to a swap-symmetric pair of
-    clusters) is only guaranteed to converge to *a* fixed point, not *the*
-    globally best one -- a single random starting pivot can lock onto a
-    self-consistent but spurious split (observed in practice on a pool
-    built from several raw MultiNest modes spanning widely different
-    phi/dphi scales, where it stabilized on an ~54/46 split indistinguishable
-    from noise instead of the family's real, cleanly-separable labeling).
-    `n_restarts` independent random pivots are tried and the converged split
-    with the lowest total per-sample assignment distance (summed
-    min(direct, swapped) at each restart's own final centroid -- directly
-    comparable across restarts since `sigma` is fixed once, up front, from
-    the whole unswapped pool) is kept; only which side ends up called
-    "swapped" is arbitrary, downstream stats only need every row on one
-    consistent side (see best_family())."""
+    Uses constrained Lloyd's-algorithm clustering (k=2, one swap-symmetric
+    pair of clusters): each pass reassigns every row to whichever of a
+    running direct/swapped centroid it's closer to (by normalized
+    per-parameter distance over the "identifying" params, mode_id_indices()),
+    then refits the centroid from its own newly-assigned rows, denoising
+    the same way a whole-mode weighted mean does but from a self-
+    consistently-labeled subset. Since this only converges to *a* fixed
+    point, not necessarily the best one, `n_restarts` independent random
+    starting pivots are tried and the split with the lowest total
+    per-sample assignment distance is kept; only which side ends up called
+    "swapped" is arbitrary (downstream stats only need one consistent
+    labeling, see best_family())."""
     n = len(pooled)
     ndim = pooled.shape[1]
 
@@ -635,32 +614,20 @@ def relabel_swap_symmetric(pooled, id_idx, kinds, swap_perm, rng, n_iter=10, n_r
 
 
 def union_find_merge(modes, threshold, id_idx, kinds, swap_perm=None):
-    """Group raw mode indices [0, len(modes)) into families.
-
-    No proximity-based merging: every raw MultiNest mode is its own
-    family. Pooling nearby-but-distinct raw modes together used to give
-    that family a broad/multi-peaked posterior whose own marginal median
-    could sit in a low-density gap between its sub-peaks -- a poor-fitting
-    reported curve even though the family's total evidence_share looked
-    fine. The only merge is for DEGENERATE_PAIR_MODELS (`swap_perm`
-    given): two raw modes that are the same physical solution under the
-    component-swap symmetry are merged, since those are the same
-    solution, not two distinct ones -- just labeled 1<->2 the other way
-    around.
-
-    That swap merge is deliberately NOT transitive union-find over a
-    `swapped_distance < threshold` graph: on a real run that graph can
-    chain unrelated modes together -- A close to B, B close to C, but A
-    nowhere near C -- and plain union-find would still lump A/B/C into one
-    family, reintroducing the same broad/multi-peaked-posterior problem
-    the proximity merge above was removed for, just reached a different
-    way. Instead, two modes merge only if each is the OTHER's single
-    closest match by swapped distance (a strict mutual pairing, not a
-    chain) and that distance clears `threshold`. Since a real
-    exact-symmetry solution has exactly one label-swapped twin, this caps
-    every merged group at 2 raw modes -- a solution and its one genuine
-    counterpart -- and makes chaining structurally impossible.
-    """
+    """Group raw mode indices [0, len(modes)) into families. Every raw
+    mode is its own family by default (no proximity-based merging -- a
+    broad/multi-peaked pooled posterior would poorly represent its family
+    even with a fine total evidence_share). The only merge is for
+    DEGENERATE_PAIR_MODELS (`swap_perm` given): two raw modes are the same
+    physical solution under the component-swap symmetry, merged since
+    they're one solution labeled 1<->2 the other way, not two distinct
+    ones. This merge is a strict mutual-nearest-neighbor pairing by
+    swapped distance (each mode merges only with the one mode that is
+    *also* its own nearest match, and only below `threshold`), not
+    transitive union-find over a distance graph -- a real exact-symmetry
+    solution has exactly one label-swapped twin, so this caps every merged
+    group at 2 raw modes and makes chaining (A-B-C lumped together despite
+    A/C being unrelated) structurally impossible."""
     n = len(modes)
     parent = list(range(n))
 
@@ -800,71 +767,37 @@ def filter_fd_lines(fd_num, block_substrings, hold_substrings=()):
 
 
 def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
-                  pol_idx, cube_order, threshold=2.0, prob=0.68, degenerate_pair=None):
+                  idx_pol, order_cube, threshold=2.0, prob=0.68, degenerate_pair=None):
     """Identify the raw-MultiNest-mode family for `model`'s already-
-    completed run at `outputfiles_basename` (a '<dir>/mn_'-style prefix,
-    matching multinest_fit()'s outputfiles_basename convention), and
-    return (pooled_samples, pars, errs, evidence_share, winner_chi2,
-    winner_lnZ, other_families, dropped, winner_evidence_lnZ): the winning
-    family's own pooled samples / point-estimate (pol_idx-local order) /
-    evidence share / chi2 / point-lnZ, plus the other surviving families
-    with at least `MIN_FAMILY_EVIDENCE_SHARE`% evidence share (capped to
-    the top 4) and a summary of everything else excluded, and finally the
-    winning family's own *volume-integrated* log-evidence (see
-    `evidence_lnZ` below -- distinct from `winner_lnZ`, the point
-    log-likelihood). Each `other_families` entry carries the same shape of
-    information as the winner -- 'samples' (pooled, pol_idx-local),
-    'pars'/'errs' (its own marginal-median point estimate, pol_idx-local,
-    same (2,ndim) errs convention as median_pctl_errs), 'evidence_share',
-    'chi2', 'lnZ' (point log-likelihood), 'evidence_lnZ' (this family's
-    own volume-integrated log-evidence -- logsumexp of its member raw
-    modes' local log-evidence, on the same absolute scale as MultiNest's
-    own `global_evidence`, i.e. logsumexp'ing evidence_lnZ across every
-    family/mode -- significant or dropped -- reproduces global_evidence.
-    Unlike `global_evidence`, which is the *same* number for every family
-    since it's integrated over all of them, this is the piece of that
-    total attributable to just this one family/mode-group) -- so a caller
-    can treat any of them (not just the winner) as a fully-fledged
-    candidate result; see app.SamplingMixin's Corner-tab family switcher.
+    completed run at `outputfiles_basename` (matching multinest_fit()'s
+    own outputfiles_basename convention), and return (pooled_samples,
+    pars, errs, evidence_share, winner_chi2, winner_lnZ, other_families,
+    dropped, winner_evidence_lnZ): the winning family's own pooled samples
+    / point-estimate (pol_idx-local order) / evidence share / chi2 /
+    point-lnZ, plus other surviving families with at least
+    `MIN_FAMILY_EVIDENCE_SHARE`% evidence share (top 4) and a summary of
+    everything else dropped, and the winner's own volume-integrated
+    log-evidence (`evidence_lnZ`, distinct from `winner_lnZ`, the point
+    log-likelihood -- logsumexp'ing every family/mode's own evidence_lnZ,
+    including dropped ones, reproduces MultiNest's global_evidence). Each
+    `other_families` entry has the same shape as the winner ('samples',
+    'pars'/'errs', 'evidence_share', 'chi2', 'lnZ', 'evidence_lnZ') so a
+    caller can treat any of them as a fully-fledged candidate result (see
+    app.SamplingMixin's Corner-tab family switcher).
 
-    - Parses `outputfiles_basename + 'post_separate.dat'` (raw per-mode
-      blocks: weight, -2*loglike, params-in-cube-order) and
-      analyzer.get_mode_stats() (per-mode local log-evidence -- only
-      meaningful with importance_nested_sampling=False, which
-      multinest_fit() always uses).
-    - Undoes the cube reordering (`cube_order`) so each mode's samples are
-      back in pol_idx-local order.
-    - Groups raw modes into families via union-find (union_find_merge()).
-      No proximity-based merging: every raw mode is its own family. The
-      only merge is for models in DEGENERATE_PAIR_MODELS (or, if
-      `degenerate_pair` is given, whichever way it says): two modes that
-      are the same physical solution under the label-swap comparison
-      (swap_perm()) collapse into one family, since that's the exact
-      component-swap symmetry, not two distinct solutions -- see
-      union_find_merge()'s own docstring for why that merge is a strict
-      mutual-nearest-neighbor pairing rather than transitive union-find.
-    - Every family's member modes are pooled by weight-proportional
-      resampling. For DEGENERATE_PAIR_MODELS, the whole pooled family is
-      then relabeled onto one consistent labeling by
-      relabel_swap_symmetric() -- an iterative (Lloyd's-algorithm-style)
-      per-sample swap decision, not a once-per-member-mode one -- needed
-      because MultiNest's own mode-finding isn't symmetry-aware, and can
-      lump both label-swapped branches of a component-swap-degenerate
-      posterior into a single raw mode (an even direct/swapped mix within
-      that one mode's own rows) instead of splitting them; a swap decision
-      made once per whole mode can't fix that, since the mode's own rows
-      aren't all one labeling to begin with.
-    - Among families with at least `MIN_FAMILY_EVIDENCE_SHARE`%
-      integrated evidence_share (every candidate, if none clear that
-      floor), the winner is whichever has the highest point-based
-      "evidence" -- log-likelihood at that family's own marginal median
-      (`bayesian_loglike`) -- not the same quantity as `evidence_share`
-      (each family's %-of-total volume-integrated evidence): a family
-      whose raw-mode group is internally broad or multi-peaked can
-      accumulate a large evidence_share while its own marginal median sits
-      in a low-density gap between sub-peaks (a poor representative
-      point). Scoring by the median's own point-lnZ instead picks
-      whichever family's *reported point* best explains the data.
+    Parses `outputfiles_basename + 'post_separate.dat'` and
+    analyzer.get_mode_stats() for each raw mode's samples/local evidence,
+    undoes the cube reordering (`order_cube`), groups modes into families
+    (union_find_merge() -- one family per raw mode, except
+    DEGENERATE_PAIR_MODELS pairs merged under the component-swap symmetry;
+    see its own docstring), pools each family's members by weight and, for
+    a swap-symmetric family, relabels the pool onto one consistent side
+    (relabel_swap_symmetric()), then picks the winner among families
+    clearing `MIN_FAMILY_EVIDENCE_SHARE`% (or every candidate, if none do)
+    by highest point log-likelihood at its own marginal median
+    (`bayesian_loglike`) -- not the same as `evidence_share`, since a
+    broad/multi-peaked family can have a large evidence_share while its
+    marginal median sits in a low-density gap between sub-peaks.
 
     Raises FileNotFoundError if post_separate.dat is missing (e.g. the run
     wasn't sampled with multimodal=True) rather than silently degrading.
@@ -873,12 +806,12 @@ def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
 
     spec = MODELS[model]
     ndim_full = len(spec.params)
-    kinds_pol = [spec.params[i].kind for i in pol_idx]
-    ndim = len(pol_idx)
+    kinds_pol = [spec.params[i].kind for i in idx_pol]
+    ndim = len(idx_pol)
 
     def expand(pol_pars):
         full = [0.0] * ndim_full
-        for i, v in zip(pol_idx, pol_pars):
+        for i, v in zip(idx_pol, pol_pars):
             full[i] = v
         for i, v in spectral_pars.items():
             full[i] = v
@@ -905,7 +838,7 @@ def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
         weight = rows[:, 0]
         pars_cube_order = rows[:, 2:2 + ndim]
         pars_pol = np.zeros_like(pars_cube_order)
-        pars_pol[:, cube_order] = pars_cube_order
+        pars_pol[:, order_cube] = pars_cube_order
         modes.append(mode_summary(pars_pol, weight, logz, kinds_pol, rng))
 
     id_idx = mode_id_indices(kinds_pol)

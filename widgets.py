@@ -32,7 +32,7 @@ SLIDER_STEPS = 10000  # integer resolution backing each QSlider
 QU_POLAR_MAX_SEGMENTS = 500
 
 # Physical unit shown next to each slider's readout, keyed by Param.kind.
-UNITS = {'p': '%', 'X': '°', 'phi': 'rad/m²', 'dphi': 'rad/m²', 'scale': '', 'alpha': '', 'eps': '',
+UNITS = {'p': '%', 'X': '°', 'phi': 'rad/m²', 'Dphi':'rad/m²', 'dphi': 'rad/m²', 'scale': '', 'alpha': '', 'eps': '',
          'nu0': 'GHz', 'temp': 'K', 'freq': 'MHz', 'wave': 'm'}
 # Widest unit string, used to fix every slider's unit label to the same
 # width so the value boxes above/below each other line up regardless of
@@ -109,47 +109,60 @@ def apply_fixed_margins(fig, canvas, extra_adjust=None, margins=PLOT_MARGINS_PX)
 
 
 def _bound_yaxis_ticklabels(ax):
-    """Force the y-axis into matplotlib's compact offset/scientific form
-    (a single shared '10^n' multiplier, not per-tick scientific notation)
-    once its values fall outside [0.01, 1000) -- e.g. a weak-polarization
-    model/source whose p or |F(phi)| peaks at, say, 1e-4 would otherwise
-    get plain-decimal ticks like '0.00014': wide enough to push the
-    auto-positioned ylabel past PLOT_MARGINS_PX's fixed left budget and
-    off the edge of the canvas entirely (that budget assumes ordinary-
-    looking numbers, not open-ended decimal precision). Bounding the
-    format keeps tick-label width -- and therefore the auto-computed
-    ylabel position -- within what the fixed margins were sized for,
-    regardless of how small/large the data actually gets."""
+    """Force compact '10^n'-multiplier y-tick formatting once values fall
+    outside [0.01, 1000) -- keeps tick-label width (and the auto-computed
+    ylabel position) within PLOT_MARGINS_PX's fixed budget regardless of
+    how small/large the data gets."""
     ax.ticklabel_format(style='sci', axis='y', scilimits=(-2, 3), useMathText=True)
 
 
 def _finite_bounds(arr, fallback):
-    """(min, max) of the finite entries of `arr`, or `fallback` (an
-    explicit (lo, hi) pair) if `arr` has none.
-
-    A custom model (models.build_custom_model) can divide by one of its
-    own user-defined constants -- if that constant's bounds/slider let it
-    reach 0 (or any other pathological input), the model's output goes to
-    inf/nan. ModelPlot/StokesPlot.update_plot below take a seed min/max
-    straight off such an array before widening it with reference/
-    measurement data (already real, finite numbers) to compute each axis's
-    set_xlim/set_ylim -- an unfiltered np.min/np.max would carry that
-    inf/nan straight into those, and set_xlim/set_ylim raise ValueError:
-    Axis limits cannot be NaN or Inf the moment they see it. Only the
-    initial seed needs this filter; every later min()/max() combines
-    already-finite scalars, so nothing downstream can reintroduce inf/nan.
-
-    A curve that's non-finite everywhere (e.g. the offending constant sits
-    at exactly 0) falls back to `fallback` instead -- the line itself
-    still isn't drawn (matplotlib silently skips inf/nan points), so this
-    only decides the degenerate axis range in that case, matching how the
-    existing zero-signal fallbacks (e.g. `max(p_max, 1e-6)`, the EVPA
-    panel's own <2 deg minimum span) already handle an all-zero curve."""
+    """(min, max) of the finite entries of `arr`, or `fallback` (lo, hi)
+    if none are finite -- guards the axis-limit seed taken straight off a
+    model curve (a custom model can divide by zero and go inf/nan) before
+    set_xlim/set_ylim, which raise on a non-finite value."""
     arr = np.asarray(arr)
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
         return fallback
     return float(finite.min()), float(finite.max())
+
+
+def _clear_artists(artists):
+    """Remove every artist in `artists` and return [] for reassignment --
+    the tear-down-and-redraw-from-scratch pattern each draw_reference()
+    below uses for its errorbar overlays."""
+    for artist in artists:
+        artist.remove()
+    return []
+
+
+# Errorbar styles shared by ModelPlot/StokesPlot's own draw_reference()
+# methods: a filled black circle for a real Load Data... point, and a
+# colored marker (fmt overridable to match the axis's own per-series
+# marker) for a Measurements-tab simulated point.
+REF_POINT_STYLE = dict(fmt='o', ms=4, color='black', ecolor='0.5', capsize=2, zorder=5)
+
+
+def _meas_point_style(color, fmt='o'):
+    return dict(fmt=fmt, ms=4, mew=0.5, mec='k', color=color, ecolor=color, alpha=0.85, capsize=2, zorder=6)
+
+
+def _draw_errorbar_overlay(ax, x, y, style, xerr=None, yerr=None):
+    return ax.errorbar(x, y, xerr=xerr, yerr=yerr, **style)
+
+
+def _widen_range(lo, hi, values, err=None):
+    """Widen (lo, hi) to also cover `values` (optionally +/- `err`)."""
+    values = np.asarray(values)
+    if err is not None:
+        err = np.asarray(err)
+        lo = min(lo, float(np.min(values - err)))
+        hi = max(hi, float(np.max(values + err)))
+    else:
+        lo = min(lo, float(np.min(values)))
+        hi = max(hi, float(np.max(values)))
+    return lo, hi
 
 
 class ModelPlot(FigureCanvas):
@@ -165,20 +178,14 @@ class ModelPlot(FigureCanvas):
         self.ax_x.yaxis.set_label_position('right')
         self.fig.text(0.5, 0.02, r'$\lambda^2$ [ mm$^2$ ]', ha='center', fontsize=16)
 
-        # Static per-axes config set once here, not on every update_plot()
-        # call: Axes.clear() is expensive (it tears down and rebuilds the
-        # whole axis/spine/tick machinery -- profiling showed it dominates
-        # redraw time), so slider drags reuse these Line2D objects via
-        # set_data() instead of clear()+replot(), and everything that
-        # doesn't change between frames (labels, grid) is set only once.
+        # Labels/grid set once here (not in update_plot()): Axes.clear() is
+        # expensive, so slider drags reuse these Line2D objects via
+        # set_data() instead of clear()+replot().
         self.ax_p.set_ylabel(r'$p$ [ % ]')
         self.ax_p.grid(True)
         _bound_yaxis_ticklabels(self.ax_p)
-        # labelpad=25 (not the default ~4): rotation=270 + tick_right()
-        # above put this ylabel right next to its own tick labels rather
-        # than the usual comfortable gap a left-side ylabel gets "for
-        # free" from the tick marks sitting between it and the axis --
-        # the default pad reads as touching/crowded against them.
+        # labelpad=25: rotation=270 + tick_right() above put this ylabel
+        # right against its own tick labels at the default pad.
         self.ax_x.set_ylabel(r'$\chi$ [ deg ]', rotation=270, labelpad=25)
         self.ax_x.grid(True)
         _bound_yaxis_ticklabels(self.ax_x)
@@ -187,46 +194,32 @@ class ModelPlot(FigureCanvas):
         self.xscale = None  # forces the first set_xscale('log') call to actually apply
         self.ref_data = None  # (w2, p, p_err, evpa, evpa_err) from the Load Data... button, or None
         self.ref_artists = []
-        # Simulated points from the Measurements tab's Generate button --
-        # a list of per-band dicts (color, w2, p, p_err, evpa, evpa_err), or
-        # None. Kept separate from ref_data (Load Data's real reference
-        # points) so the two overlays never clobber each other.
+        # Simulated points from the Measurements tab's Generate button (list
+        # of per-band dicts) or None; kept separate from ref_data so the two
+        # overlays never clobber each other.
         self.meas_bands = None
         self.meas_artists = []
-        # draw_reference() removes and recreates every errorbar artist from
-        # scratch (there's no cheaper set_data()-style update for errorbar's
-        # multi-artist output) -- expensive enough to matter when it ran on
-        # every slider-driven update_plot() call regardless of whether
-        # ref_data/meas_bands themselves had changed since the last draw.
-        # Only set_reference_data/clear_reference_data/set_measurement_data/
-        # clear_measurement_data actually change what needs drawing, so they
-        # mark this dirty and update_plot() only calls draw_reference() when
-        # it's set (axis limits, which do need refreshing every frame to
-        # track a data-loaded curve, are computed straight from ref_data/
-        # meas_bands in update_plot() itself -- independent of the artists).
+        # draw_reference() rebuilds every errorbar artist from scratch (no
+        # cheaper set_data() update exists for errorbar) -- too expensive to
+        # run on every slider-driven update_plot() unconditionally, so this
+        # flag (set by set/clear_reference_data and set/clear_measurement_
+        # data) gates when update_plot() actually calls it.
         self._ref_dirty = True
 
-        # Posterior-sample "spaghetti" overlay (see set_posterior_samples) --
-        # a fixed pool of faint Line2D artists, created only when the
-        # sample set itself changes (a MultiNest fit/Load samples/Reset
-        # model), then refreshed via set_data() on every update_plot() call
-        # like the main curve, so a slider drag repaints them at the
-        # current wavelength range without the cost of recreating them.
+        # Posterior-sample "spaghetti" overlay (see set_posterior_samples):
+        # a fixed pool of faint Line2D artists, (re)created only when the
+        # sample set itself changes, then refreshed via set_data() alongside
+        # the main curve on every update_plot() call.
         self.posterior_samples = None  # (n, ndim_full) array, model's full param order, or None
         self.posterior_model = None    # the model func these samples belong to
         self.sample_lines_p = []
         self.sample_lines_x = []
-        # The sample lines only ever depend on wl_ext and the (fixed, until
-        # the next set_posterior_samples) posterior_samples/posterior_model,
-        # never on whichever slider actually triggered this update_plot() --
-        # a parameter-slider drag redraws the main curve every tick but
-        # can't change these at all. _samples_cache_key tracks the inputs
-        # they were last computed from so update_plot() can skip redoing
-        # that work (up to N_POSTERIOR_DRAWS full model evaluations) on
-        # every such tick; _samples_version (bumped on every
-        # set_posterior_samples call) invalidates it instead of comparing
-        # posterior_samples by identity, which an old, already-replaced
-        # array could in principle alias via id() reuse.
+        # A parameter-slider drag can't change the sample lines (they only
+        # depend on wl_ext and the fixed posterior_samples/posterior_model),
+        # so _samples_cache_key skips recomputing them when neither has
+        # changed since the last update_plot() call; _samples_version
+        # (bumped by set_posterior_samples) invalidates it rather than
+        # comparing posterior_samples by identity.
         self._samples_cache_key = _SAMPLES_CACHE_UNSET
         self._samples_version = 0
 
@@ -251,28 +244,20 @@ class ModelPlot(FigureCanvas):
 
     # how data is plotted
     def draw_reference(self):
-        for artist in self.ref_artists:
-            artist.remove()
-        self.ref_artists = []
+        self.ref_artists = _clear_artists(self.ref_artists)
         if self.ref_data is not None:
             w2, p, p_err, evpa, evpa_err = self.ref_data
-            self.ref_artists.append(self.ax_p.errorbar(
-                                    w2, p, yerr=p_err, fmt='o', ms=4, color='black', ecolor='0.5', capsize=2, zorder=5))
-            self.ref_artists.append(self.ax_x.errorbar(
-                                    w2, evpa, yerr=evpa_err, fmt='o', ms=4, color='black', ecolor='0.5', capsize=2, zorder=5))
+            self.ref_artists.append(_draw_errorbar_overlay(self.ax_p, w2, p, REF_POINT_STYLE, yerr=p_err))
+            self.ref_artists.append(_draw_errorbar_overlay(self.ax_x, w2, evpa, REF_POINT_STYLE, yerr=evpa_err))
 
-        for artist in self.meas_artists:
-            artist.remove()
-        self.meas_artists = []
+        self.meas_artists = _clear_artists(self.meas_artists)
         if self.meas_bands:
             for band in self.meas_bands:
-                c = band['color']
-                self.meas_artists.append(self.ax_p.errorbar(
-                    band['w2'], band['p'], yerr=band['p_err'], fmt='D', ms=4, mew=0.5, mec='k',
-                    color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
-                self.meas_artists.append(self.ax_x.errorbar(
-                    band['w2'], band['evpa'], yerr=band['evpa_err'], fmt='D', ms=4, mew=0.5, mec='k',
-                    color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
+                style = _meas_point_style(band['color'], fmt='D')
+                self.meas_artists.append(_draw_errorbar_overlay(
+                    self.ax_p, band['w2'], band['p'], style, yerr=band['p_err']))
+                self.meas_artists.append(_draw_errorbar_overlay(
+                    self.ax_x, band['w2'], band['evpa'], style, yerr=band['evpa_err']))
 
     def set_posterior_samples(self, samples, model_func):
         """(Re)build the posterior-sample line pool for `samples` (an (n,
@@ -295,9 +280,12 @@ class ModelPlot(FigureCanvas):
         self.draw_idle()
 
     def update_plot(self, wl_ext, model_func, pars, log_xscale=False):
+        """Recompute p/EVPA vs lambda^2 from the model and redraw: main
+        curve, posterior-sample overlay (if any), and axis limits widened
+        to cover any loaded reference/measurement data."""
         fit = model_func(wl_ext, pars)
         p = pol(fit)
-        X = evpa(fit)
+        evpa_vals = evpa(fit)
         w2 = wl_ext ** 2 * 1e6  # lambda^2 [mm^2]
 
         # Posterior-sample overlay: only actually drawn while the
@@ -326,27 +314,26 @@ class ModelPlot(FigureCanvas):
         xlo, xhi = np.min(w2) * 0.9, np.max(w2) * 1.05
         _, p_seed_max = _finite_bounds(p, fallback=(0.0, 1e-6))
         p_max = max(p_seed_max, 1e-6)
-        x_lo, x_hi = _finite_bounds(X, fallback=(0.0, 0.0))
+        x_lo, x_hi = _finite_bounds(evpa_vals, fallback=(0.0, 0.0))
         # Widen the autoscale to also cover any reference data loaded via
         # the Load Data... button, so it isn't silently clipped out of view.
         if self.ref_data is not None:
             ref_w2, ref_p, _, ref_evpa, _ = self.ref_data
             xlo, xhi = min(xlo, np.min(ref_w2) * 0.9), max(xhi, np.max(ref_w2) * 1.05)
             p_max = max(p_max, np.max(ref_p))
-            x_lo, x_hi = min(x_lo, float(np.min(ref_evpa))), max(x_hi, float(np.max(ref_evpa)))
+            x_lo, x_hi = _widen_range(x_lo, x_hi, ref_evpa)
         if self.meas_bands:
             for band in self.meas_bands:
                 xlo = min(xlo, np.min(band['w2']) * 0.9)
                 xhi = max(xhi, np.max(band['w2']) * 1.05)
                 p_max = max(p_max, np.max(band['p'] + band['p_err']))
-                x_lo = min(x_lo, float(np.min(band['evpa'] - band['evpa_err'])))
-                x_hi = max(x_hi, float(np.max(band['evpa'] + band['evpa_err'])))
+                x_lo, x_hi = _widen_range(x_lo, x_hi, band['evpa'], band['evpa_err'])
 
         self.line_p.set_data(w2, p)
         self.ax_p.set_xlim(xlo, xhi)
         self.ax_p.set_ylim(0, 1.3 * p_max)
 
-        self.line_x.set_data(w2, X)
+        self.line_x.set_data(w2, evpa_vals)
         self.ax_x.set_xlim(xlo, xhi)
 
         # Enforce a minimum 2 deg y-span so a near-flat EVPA curve (small
@@ -389,32 +376,15 @@ def stokes_to_frac_qu(I, Q, U, I_err=None, Q_err=None, U_err=None):
 
 class StokesPlot(FigureCanvas):
     """Stokes I (left subplot) and Q, U (right subplot) vs frequency nu
-    [GHz] -- the model's own trailing spectral params (alpha for a
-    single component, eps/alpha1/alpha2 for two) double as a real
-    (normalized, I_0=1) Stokes I(nu) model; Q(nu), U(nu) are then
-    just I(nu) scaled by the same fractional-polarization complex number
-    p*e^(2i*EVPA) already used for the p/EVPA plot.
-
-    The two subplots sit flush against each other, no gap, matching
-    ModelPlot's own p/EVPA pair -- ax_QU's y-axis is mirrored onto its
-    right spine (see build_qu_mode) so its tick labels don't collide with
-    ax_I's across the shared middle seam.
-
-    The right subplot has two interchangeable views, picked via the
-    dropdown above it (see stokes_mode_combo): 'Spectra' plots Q(nu) and
-    U(nu) like the left subplot; 'Polar' instead plots the fractional
-    (q=Q/I, u=U/I) trajectory traced out as nu varies, u vs q, colored
-    along its length as a continuous red(low nu)->violet(high nu) rainbow
-    (see stokes_to_frac_qu and QU_RAINBOW_CMAP) matching the Measurements
-    tab's own per-band coloring. Its limits are square (equal q/u numeric
-    span) but the axes box itself stays whatever rectangular shape the
-    flush layout gives
-    it -- forcing a literal square box would fight the shared wspace=0
-    layout with ax_I. Switching modes rebuilds the right axis from
-    scratch (ax_QU.clear() + fresh artists) -- only happens on a rare,
-    user-initiated dropdown change, not per-frame, so it doesn't need the
-    set_data()-only treatment the rest of this canvas uses to keep slider
-    drags cheap."""
+    [GHz], flush against each other like ModelPlot's p/EVPA pair. The
+    right subplot has two interchangeable views (`stokes_mode_combo`):
+    'Spectra' plots Q(nu)/U(nu) like the left subplot; 'Polar' instead
+    plots the fractional (q=Q/I, u=U/I) trajectory traced out as nu
+    varies, colored red(low nu)->violet(high nu) (see stokes_to_frac_qu,
+    QU_RAINBOW_CMAP) to match the Measurements tab's own band coloring.
+    Switching modes rebuilds the right axis from scratch (build_qu_mode);
+    everything else uses set_data()-only updates to keep slider drags
+    cheap."""
 
     def __init__(self, parent=None):
         self.fig = Figure(figsize=(10, 4))
@@ -581,74 +551,52 @@ class StokesPlot(FigureCanvas):
 
     # draw data
     def draw_reference(self):
-        for artist in self.ref_artists_I:
-            artist.remove()
-        self.ref_artists_I = []
-        for artist in self.ref_artists_QU:
-            artist.remove()
-        self.ref_artists_QU = []
+        self.ref_artists_I = _clear_artists(self.ref_artists_I)
+        self.ref_artists_QU = _clear_artists(self.ref_artists_QU)
         if self.ref_data is not None:
             nu, I, I_err, Q, Q_err, U, U_err = self.ref_data
-            self.ref_artists_I.append(self.ax_I.errorbar(
-                nu, I, yerr=I_err, fmt='o', ms=4, color='black', ecolor='0.5', capsize=2, zorder=5))
+            self.ref_artists_I.append(_draw_errorbar_overlay(self.ax_I, nu, I, REF_POINT_STYLE, yerr=I_err))
             if self.mode == 'Polar':
                 q, u, q_err, u_err = stokes_to_frac_qu(I, Q, U, I_err, Q_err, U_err)
-                self.ref_artists_QU.append(self.ax_QU.errorbar(
-                    q, u, xerr=q_err, yerr=u_err, fmt='o', ms=4, color='black', ecolor='0.5', capsize=2, zorder=5))
+                self.ref_artists_QU.append(_draw_errorbar_overlay(
+                    self.ax_QU, q, u, REF_POINT_STYLE, xerr=q_err, yerr=u_err))
             else:
                 self.ref_artists_QU.append(self.ax_QU.errorbar(
                     nu, Q, yerr=Q_err, fmt='s', ms=4, color='darkgreen', ecolor='0.5', capsize=2, zorder=5))
                 self.ref_artists_QU.append(self.ax_QU.errorbar(
                     nu, U, yerr=U_err, fmt='^', ms=4, color='darkorange', ecolor='0.5', capsize=2, zorder=5))
 
-        for artist in self.meas_artists_I:
-            artist.remove()
-        self.meas_artists_I = []
-        for artist in self.meas_artists_QU:
-            artist.remove()
-        self.meas_artists_QU = []
+        self.meas_artists_I = _clear_artists(self.meas_artists_I)
+        self.meas_artists_QU = _clear_artists(self.meas_artists_QU)
         if self.meas_bands:
             for band in self.meas_bands:
                 c = band['color']
-                self.meas_artists_I.append(self.ax_I.errorbar(
-                    band['nu'], band['I'], yerr=band['I_err'], fmt='o', ms=4, mew=0.5, mec='k',
-                    color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
+                self.meas_artists_I.append(_draw_errorbar_overlay(
+                    self.ax_I, band['nu'], band['I'], _meas_point_style(c), yerr=band['I_err']))
                 if self.mode == 'Polar':
                     q, u, q_err, u_err = stokes_to_frac_qu(
                         band['I'], band['Q'], band['U'], band['I_err'], band['Q_err'], band['U_err'])
-                    self.meas_artists_QU.append(self.ax_QU.errorbar(
-                        q, u, xerr=q_err, yerr=u_err, fmt='o', ms=4, mew=0.5,
-                        mec='k', color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
+                    self.meas_artists_QU.append(_draw_errorbar_overlay(
+                        self.ax_QU, q, u, _meas_point_style(c), xerr=q_err, yerr=u_err))
                 else:
-                    self.meas_artists_QU.append(self.ax_QU.errorbar(
-                        band['nu'], band['Q'], yerr=band['Q_err'], fmt='s', ms=4, mew=0.5, mec='k',
-                        color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
-                    self.meas_artists_QU.append(self.ax_QU.errorbar(
-                        band['nu'], band['U'], yerr=band['U_err'], fmt='^', ms=4, mew=0.5, mec='k',
-                        color=c, ecolor=c, alpha=0.85, capsize=2, zorder=6))
+                    self.meas_artists_QU.append(_draw_errorbar_overlay(
+                        self.ax_QU, band['nu'], band['Q'], _meas_point_style(c, fmt='s'), yerr=band['Q_err']))
+                    self.meas_artists_QU.append(_draw_errorbar_overlay(
+                        self.ax_QU, band['nu'], band['U'], _meas_point_style(c, fmt='^'), yerr=band['U_err']))
 
     def update_plot(self, wl_ext, model_func, n_components, pars, log_xscale=False, nu_min=None, mode='Spectra'):
+        """Recompute and redraw Stokes I (left) and Q/U-or-polar (right)
+        from the model for the current mode/log_xscale/wavelength grid,
+        refresh the posterior-sample overlay, and widen/apply axis limits
+        to cover any loaded reference/measurement data. Called on every
+        parameter-slider tick, so hot-path cost matters (see class
+        docstring)."""
         if mode != self.mode:
             self.mode = mode
             self.build_qu_mode()
 
-        I = stokes_I(wl_ext, n_components, pars, nu_min=nu_min)
-        Q, U = stokes_QU(wl_ext, model_func, n_components, pars, nu_min=nu_min, I=I)
-        nu_ghz = C / wl_ext / 1e9
-
-        order = np.argsort(nu_ghz)
-        nu_s, I_s, Q_s, U_s = nu_ghz[order], I[order], Q[order], U[order]
-
-        two_comp = n_components == 2
-        if two_comp:
-            (I1, Q1, U1), (I2, Q2, U2) = stokes_components(wl_ext, model_func, pars, nu_min=nu_min)
-            I1_s, Q1_s, U1_s = I1[order], Q1[order], U1[order]
-            I2_s, Q2_s, U2_s = I2[order], Q2[order], U2[order]
-
-        if two_comp != self.ax_I_two_comp:
-            self.ax_I_two_comp = two_comp
-            handles = [self.line_I, self.line_I1, self.line_I2] if two_comp else [self.line_I]
-            self.ax_I.legend(handles, [h.get_label() for h in handles], loc='lower right')
+        arrays = self._update_stokes_arrays(wl_ext, model_func, n_components, pars, nu_min)
+        order, nu_s = arrays['order'], arrays['nu_s']
 
         xscale = 'log' if log_xscale else 'linear'
         if xscale != self.xscale:
@@ -657,20 +605,67 @@ class StokesPlot(FigureCanvas):
                 self.ax_QU.set_xscale(xscale)
             self.xscale = xscale
 
-        self.line_I.set_data(nu_s, I_s)
-        if two_comp:
-            self.line_I1.set_data(nu_s, I1_s)
-            self.line_I2.set_data(nu_s, I2_s)
+        self.line_I.set_data(nu_s, arrays['I_s'])
+        if arrays['two_comp']:
+            self.line_I1.set_data(nu_s, arrays['I1_s'])
+            self.line_I2.set_data(nu_s, arrays['I2_s'])
         else:
             self.line_I1.set_data([], [])
             self.line_I2.set_data([], [])
 
         show_samples = self.posterior_samples is not None and self.posterior_model is model_func
-        # sample_lines_I (always) and sample_lines_Q/U (Spectra mode only,
-        # below) share these same inputs -- see ModelPlot's own
-        # _samples_cache_key for why this is worth skipping on a parameter-
-        # slider drag. Updated once here (rather than separately at each
-        # loop) so both stay gated by the same comparison.
+        samples_changed = self._refresh_sample_lines_I(
+            wl_ext, model_func, n_components, nu_min, order, nu_s, show_samples)
+
+        if self.mode == 'Polar':
+            q_s, u_s = self._draw_polar_mode(wl_ext, model_func, n_components, pars, nu_min, show_samples)
+        else:
+            q_s = u_s = None
+            self._draw_spectra_mode(arrays, samples_changed, show_samples,
+                                     wl_ext, model_func, n_components, nu_min, order)
+
+        self._apply_axis_limits(arrays, q_s, u_s)
+
+        if self._ref_dirty:
+            self.draw_reference()
+            self._ref_dirty = False
+        self.draw_idle()
+
+    def _update_stokes_arrays(self, wl_ext, model_func, n_components, pars, nu_min):
+        """Evaluate Stokes I/Q/U (total, plus per-component for a two-
+        component model) on wl_ext and sort by ascending frequency;
+        returns them in a dict keyed by 'order'/'nu_s'/'I_s'/'Q_s'/'U_s'/
+        'two_comp'/'I1_s'/'Q1_s'/'U1_s'/'I2_s'/'Q2_s'/'U2_s' (the *_s
+        component keys are None unless two_comp). Also keeps ax_I's
+        legend (I vs I/I1/I2) in sync with whether this is two-component."""
+        I = stokes_I(wl_ext, n_components, pars, nu_min=nu_min)
+        Q, U = stokes_QU(wl_ext, model_func, n_components, pars, nu_min=nu_min, I=I)
+        nu_ghz = C / wl_ext / 1e9
+
+        order = np.argsort(nu_ghz)
+        nu_s, I_s, Q_s, U_s = nu_ghz[order], I[order], Q[order], U[order]
+
+        two_comp = n_components == 2
+        arrays = dict(order=order, nu_s=nu_s, I_s=I_s, Q_s=Q_s, U_s=U_s, two_comp=two_comp,
+                      I1_s=None, Q1_s=None, U1_s=None, I2_s=None, Q2_s=None, U2_s=None)
+        if two_comp:
+            (I1, Q1, U1), (I2, Q2, U2) = stokes_components(wl_ext, model_func, pars, nu_min=nu_min)
+            arrays.update(I1_s=I1[order], Q1_s=Q1[order], U1_s=U1[order],
+                          I2_s=I2[order], Q2_s=Q2[order], U2_s=U2[order])
+
+        if two_comp != self.ax_I_two_comp:
+            self.ax_I_two_comp = two_comp
+            handles = [self.line_I, self.line_I1, self.line_I2] if two_comp else [self.line_I]
+            self.ax_I.legend(handles, [h.get_label() for h in handles], loc='lower right')
+        return arrays
+
+    def _refresh_sample_lines_I(self, wl_ext, model_func, n_components, nu_min, order, nu_s, show_samples):
+        """Refresh the sample_lines_I posterior overlay if wl_ext/
+        n_components/nu_min/model_func or the sample set itself changed
+        since the last call (see ModelPlot's own _samples_cache_key for
+        why this is worth skipping on a parameter-slider drag). Returns
+        whether they changed -- sample_lines_Q/U share these same inputs
+        (see _draw_spectra_mode), so callers reuse this to gate them too."""
         samples_key = (wl_ext.tobytes(), n_components, nu_min, self._samples_version, model_func) \
             if show_samples else None
         samples_changed = samples_key != self._samples_cache_key
@@ -682,77 +677,97 @@ class StokesPlot(FigureCanvas):
                     ln_I.set_data(nu_s, s_I)
                 else:
                     ln_I.set_data([], [])
+        return samples_changed
 
-        if self.mode == 'Polar':
-            # Resample evenly in lambda^2 -- not in lambda/log-lambda like
-            # wl_ext itself (that spacing stays as-is for the I panel and
-            # Spectra mode, driven by the log_xscale toggle) -- since
-            # lambda^2 is the physically relevant variable for Faraday
-            # rotation (same convention as ModelPlot's own p/EVPA-vs-
-            # lambda^2 axis). Descending w2 <=> ascending nu, so the grid
-            # walks low nu (red) -> high nu (violet) just like band_colors().
-            w2_max, w2_min = wl_ext.max() ** 2, wl_ext.min() ** 2
-            n_qu = min(len(wl_ext), QU_POLAR_MAX_SEGMENTS)
-            w2_grid = np.linspace(w2_max, w2_min, n_qu)
-            wl_qu = np.sqrt(w2_grid)
-            I_qu = stokes_I(wl_qu, n_components, pars, nu_min=nu_min)
-            Q_qu, U_qu = stokes_QU(wl_qu, model_func, n_components, pars, nu_min=nu_min, I=I_qu)
-            q_s, u_s = Q_qu / I_qu, U_qu / I_qu
-            points = np.column_stack([q_s, u_s]).reshape(-1, 1, 2)
-            segments = np.concatenate([points[:-1], points[1:]], axis=1)
-            self.line_QU.set_segments(segments)
-            # Color by each point's own log10(lambda^2) position within
-            # [w2_min, w2_max] -- not linearly in lambda^2 like the point
-            # spacing above -- since real receiver bands (see
-            # measurements.band_colors) are themselves roughly log-spaced
-            # in frequency; a linear-lambda^2 color scale squeezes most of
-            # a wide range's high-frequency (small lambda^2) bands into a
-            # sliver near one end of the rainbow, visibly desyncing the
-            # curve's color from same-band measurement points' own
-            # rank-assigned color. w2_grid descends as index increases
-            # (large lambda^2/low nu first), so this still walks low nu
-            # (red) -> high nu (violet) like band_colors() itself.
-            log_w2 = np.log10(w2_grid)
-            span = log_w2[0] - log_w2[-1] if len(log_w2) else 0.0
-            t = (log_w2[0] - log_w2) / span if span > 0 else np.zeros_like(log_w2)
-            self.line_QU.set_array(t[:-1])
-            # Own cache key -- evaluated on wl_qu, not wl_ext, so it can't
-            # share samples_key/samples_changed above.
-            polar_key = (wl_qu.tobytes(), n_components, nu_min, self._samples_version, model_func) \
-                if show_samples else None
-            polar_changed = polar_key != self._samples_polar_cache_key
-            self._samples_polar_cache_key = polar_key
-            if polar_changed:
-                for i, ln_QU in enumerate(self.sample_lines_QU):
-                    if show_samples:
-                        s_I = stokes_I(wl_qu, n_components, self.posterior_samples[i], nu_min=nu_min)
-                        s_Q, s_U = stokes_QU(wl_qu, model_func, n_components, self.posterior_samples[i], nu_min=nu_min, I=s_I)
-                        ln_QU.set_data(s_Q / s_I, s_U / s_I)
-                    else:
-                        ln_QU.set_data([], [])
+    def _draw_polar_mode(self, wl_ext, model_func, n_components, pars, nu_min, show_samples):
+        """Resample the model evenly in lambda^2, draw the fractional
+        (q, u) trajectory as a rainbow-colored LineCollection, and refresh
+        its own posterior-sample overlay. Returns (q_s, u_s), the total
+        curve's own fractional q/u (needed by _apply_axis_limits's Polar
+        branch)."""
+        # Resample evenly in lambda^2 -- not in lambda/log-lambda like
+        # wl_ext itself (that spacing stays as-is for the I panel and
+        # Spectra mode, driven by the log_xscale toggle) -- since
+        # lambda^2 is the physically relevant variable for Faraday
+        # rotation (same convention as ModelPlot's own p/EVPA-vs-
+        # lambda^2 axis). Descending w2 <=> ascending nu, so the grid
+        # walks low nu (red) -> high nu (violet) just like band_colors().
+        w2_max, w2_min = wl_ext.max() ** 2, wl_ext.min() ** 2
+        n_qu = min(len(wl_ext), QU_POLAR_MAX_SEGMENTS)
+        w2_grid = np.linspace(w2_max, w2_min, n_qu)
+        wl_qu = np.sqrt(w2_grid)
+        I_qu = stokes_I(wl_qu, n_components, pars, nu_min=nu_min)
+        Q_qu, U_qu = stokes_QU(wl_qu, model_func, n_components, pars, nu_min=nu_min, I=I_qu)
+        q_s, u_s = Q_qu / I_qu, U_qu / I_qu
+        points = np.column_stack([q_s, u_s]).reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+        self.line_QU.set_segments(segments)
+        # Color by each point's own log10(lambda^2) position within
+        # [w2_min, w2_max] -- not linearly in lambda^2 like the point
+        # spacing above -- since real receiver bands (see
+        # measurements.band_colors) are themselves roughly log-spaced
+        # in frequency; a linear-lambda^2 color scale squeezes most of
+        # a wide range's high-frequency (small lambda^2) bands into a
+        # sliver near one end of the rainbow, visibly desyncing the
+        # curve's color from same-band measurement points' own
+        # rank-assigned color. w2_grid descends as index increases
+        # (large lambda^2/low nu first), so this still walks low nu
+        # (red) -> high nu (violet) like band_colors() itself.
+        log_w2 = np.log10(w2_grid)
+        span = log_w2[0] - log_w2[-1] if len(log_w2) else 0.0
+        t = (log_w2[0] - log_w2) / span if span > 0 else np.zeros_like(log_w2)
+        self.line_QU.set_array(t[:-1])
+        # Own cache key -- evaluated on wl_qu, not wl_ext, so it can't
+        # share sample_lines_I's own cache key.
+        polar_key = (wl_qu.tobytes(), n_components, nu_min, self._samples_version, model_func) \
+            if show_samples else None
+        polar_changed = polar_key != self._samples_polar_cache_key
+        self._samples_polar_cache_key = polar_key
+        if polar_changed:
+            for i, ln_QU in enumerate(self.sample_lines_QU):
+                if show_samples:
+                    s_I = stokes_I(wl_qu, n_components, self.posterior_samples[i], nu_min=nu_min)
+                    s_Q, s_U = stokes_QU(wl_qu, model_func, n_components, self.posterior_samples[i], nu_min=nu_min, I=s_I)
+                    ln_QU.set_data(s_Q / s_I, s_U / s_I)
+                else:
+                    ln_QU.set_data([], [])
+        return q_s, u_s
+
+    def _draw_spectra_mode(self, arrays, samples_changed, show_samples,
+                            wl_ext, model_func, n_components, nu_min, order):
+        """Draw the raw Q(nu)/U(nu) curves (total + per-component) and
+        refresh their posterior-sample overlay."""
+        nu_s = arrays['nu_s']
+        self.line_Q.set_data(nu_s, arrays['Q_s'])
+        self.line_U.set_data(nu_s, arrays['U_s'])
+        if arrays['two_comp']:
+            self.line_Q1.set_data(nu_s, arrays['Q1_s'])
+            self.line_U1.set_data(nu_s, arrays['U1_s'])
+            self.line_Q2.set_data(nu_s, arrays['Q2_s'])
+            self.line_U2.set_data(nu_s, arrays['U2_s'])
         else:
-            self.line_Q.set_data(nu_s, Q_s)
-            self.line_U.set_data(nu_s, U_s)
-            if two_comp:
-                self.line_Q1.set_data(nu_s, Q1_s)
-                self.line_U1.set_data(nu_s, U1_s)
-                self.line_Q2.set_data(nu_s, Q2_s)
-                self.line_U2.set_data(nu_s, U2_s)
-            else:
-                self.line_Q1.set_data([], [])
-                self.line_U1.set_data([], [])
-                self.line_Q2.set_data([], [])
-                self.line_U2.set_data([], [])
-            if samples_changed:
-                for i, (ln_Q, ln_U) in enumerate(zip(self.sample_lines_Q, self.sample_lines_U)):
-                    if show_samples:
-                        s_Q, s_U = (a[order] for a in stokes_QU(
-                            wl_ext, model_func, n_components, self.posterior_samples[i], nu_min=nu_min))
-                        ln_Q.set_data(nu_s, s_Q)
-                        ln_U.set_data(nu_s, s_U)
-                    else:
-                        ln_Q.set_data([], [])
-                        ln_U.set_data([], [])
+            self.line_Q1.set_data([], [])
+            self.line_U1.set_data([], [])
+            self.line_Q2.set_data([], [])
+            self.line_U2.set_data([], [])
+        if samples_changed:
+            for i, (ln_Q, ln_U) in enumerate(zip(self.sample_lines_Q, self.sample_lines_U)):
+                if show_samples:
+                    s_Q, s_U = (a[order] for a in stokes_QU(
+                        wl_ext, model_func, n_components, self.posterior_samples[i], nu_min=nu_min))
+                    ln_Q.set_data(nu_s, s_Q)
+                    ln_U.set_data(nu_s, s_U)
+                else:
+                    ln_Q.set_data([], [])
+                    ln_U.set_data([], [])
+
+    def _apply_axis_limits(self, arrays, q_s, u_s):
+        """Widen and apply ax_I/ax_QU x/y limits to cover the model
+        curve(s) plus any loaded reference/measurement data, following
+        this.mode's own axis convention (Polar: square fractional q/u;
+        Spectra: raw Q/U symmetric about 0). `q_s`/`u_s` (Polar only,
+        from _draw_polar_mode) are None in Spectra mode."""
+        nu_s, I_s, two_comp = arrays['nu_s'], arrays['I_s'], arrays['two_comp']
 
         xlo, xhi = nu_s.min() * 0.9, nu_s.max() * 1.05
         i_seed_min, i_seed_max = _finite_bounds(I_s, fallback=(1e-6, 1e-6))
@@ -764,11 +779,11 @@ class StokesPlot(FigureCanvas):
         # artists) would make its square limits depend on lines it never
         # shows. q_min_spectra/q_max_spectra etc. are the Spectra view's
         # own (component-widened) counterpart.
-        q_min, q_max = _finite_bounds(Q_s, fallback=(0.0, 0.0))
-        u_min, u_max = _finite_bounds(U_s, fallback=(0.0, 0.0))
+        q_min, q_max = _finite_bounds(arrays['Q_s'], fallback=(0.0, 0.0))
+        u_min, u_max = _finite_bounds(arrays['U_s'], fallback=(0.0, 0.0))
         if two_comp:
-            i1_seed_min, i1_seed_max = _finite_bounds(I1_s, fallback=(1e-6, 1e-6))
-            i2_seed_min, i2_seed_max = _finite_bounds(I2_s, fallback=(1e-6, 1e-6))
+            i1_seed_min, i1_seed_max = _finite_bounds(arrays['I1_s'], fallback=(1e-6, 1e-6))
+            i2_seed_min, i2_seed_max = _finite_bounds(arrays['I2_s'], fallback=(1e-6, 1e-6))
             i_min = min(i_min, max(i1_seed_min, 1e-6), max(i2_seed_min, 1e-6))
             i_max = max(i_max, i1_seed_max, i2_seed_max)
         # Widen the autoscale to also cover any reference data loaded via
@@ -778,26 +793,24 @@ class StokesPlot(FigureCanvas):
             xlo, xhi = min(xlo, ref_nu.min() * 0.9), max(xhi, ref_nu.max() * 1.05)
             i_min = min(i_min, max(ref_I.min(), 1e-6))
             i_max = max(i_max, ref_I.max())
-            q_min, q_max = min(q_min, ref_Q.min()), max(q_max, ref_Q.max())
-            u_min, u_max = min(u_min, ref_U.min()), max(u_max, ref_U.max())
+            q_min, q_max = _widen_range(q_min, q_max, ref_Q)
+            u_min, u_max = _widen_range(u_min, u_max, ref_U)
         if self.meas_bands:
             for band in self.meas_bands:
                 xlo = min(xlo, band['nu'].min() * 0.9)
                 xhi = max(xhi, band['nu'].max() * 1.05)
                 i_min = min(i_min, max((band['I'] - band['I_err']).min(), 1e-6))
                 i_max = max(i_max, (band['I'] + band['I_err']).max())
-                q_min = min(q_min, (band['Q'] - band['Q_err']).min())
-                q_max = max(q_max, (band['Q'] + band['Q_err']).max())
-                u_min = min(u_min, (band['U'] - band['U_err']).min())
-                u_max = max(u_max, (band['U'] + band['U_err']).max())
+                q_min, q_max = _widen_range(q_min, q_max, band['Q'], band['Q_err'])
+                u_min, u_max = _widen_range(u_min, u_max, band['U'], band['U_err'])
 
         q_min_spectra, q_max_spectra = q_min, q_max
         u_min_spectra, u_max_spectra = u_min, u_max
         if two_comp:
-            q1_seed_min, q1_seed_max = _finite_bounds(Q1_s, fallback=(0.0, 0.0))
-            q2_seed_min, q2_seed_max = _finite_bounds(Q2_s, fallback=(0.0, 0.0))
-            u1_seed_min, u1_seed_max = _finite_bounds(U1_s, fallback=(0.0, 0.0))
-            u2_seed_min, u2_seed_max = _finite_bounds(U2_s, fallback=(0.0, 0.0))
+            q1_seed_min, q1_seed_max = _finite_bounds(arrays['Q1_s'], fallback=(0.0, 0.0))
+            q2_seed_min, q2_seed_max = _finite_bounds(arrays['Q2_s'], fallback=(0.0, 0.0))
+            u1_seed_min, u1_seed_max = _finite_bounds(arrays['U1_s'], fallback=(0.0, 0.0))
+            u2_seed_min, u2_seed_max = _finite_bounds(arrays['U2_s'], fallback=(0.0, 0.0))
             q_min_spectra = min(q_min_spectra, q1_seed_min, q2_seed_min)
             q_max_spectra = max(q_max_spectra, q1_seed_max, q2_seed_max)
             u_min_spectra = min(u_min_spectra, u1_seed_min, u2_seed_min)
@@ -819,16 +832,14 @@ class StokesPlot(FigureCanvas):
             if self.ref_data is not None:
                 ref_I, ref_Q, ref_U = self.ref_data[1], self.ref_data[3], self.ref_data[5]
                 ref_q, ref_u, _, _ = stokes_to_frac_qu(ref_I, ref_Q, ref_U)
-                frac_q_min, frac_q_max = min(frac_q_min, ref_q.min()), max(frac_q_max, ref_q.max())
-                frac_u_min, frac_u_max = min(frac_u_min, ref_u.min()), max(frac_u_max, ref_u.max())
+                frac_q_min, frac_q_max = _widen_range(frac_q_min, frac_q_max, ref_q)
+                frac_u_min, frac_u_max = _widen_range(frac_u_min, frac_u_max, ref_u)
             if self.meas_bands:
                 for band in self.meas_bands:
                     band_q, band_u, band_q_err, band_u_err = stokes_to_frac_qu(
                         band['I'], band['Q'], band['U'], band['I_err'], band['Q_err'], band['U_err'])
-                    frac_q_min = min(frac_q_min, (band_q - band_q_err).min())
-                    frac_q_max = max(frac_q_max, (band_q + band_q_err).max())
-                    frac_u_min = min(frac_u_min, (band_u - band_u_err).min())
-                    frac_u_max = max(frac_u_max, (band_u + band_u_err).max())
+                    frac_q_min, frac_q_max = _widen_range(frac_q_min, frac_q_max, band_q, band_q_err)
+                    frac_u_min, frac_u_max = _widen_range(frac_u_min, frac_u_max, band_u, band_u_err)
             # Square numeric limits (not a square axes box -- see class
             # docstring): +/-1.25 * the larger of q's and u's own max
             # absolute extent.
@@ -840,11 +851,6 @@ class StokesPlot(FigureCanvas):
             qu_max = max(abs(q_min_spectra), abs(q_max_spectra), abs(u_min_spectra), abs(u_max_spectra), 1e-6)
             self.ax_QU.set_xlim(xlo, xhi)
             self.ax_QU.set_ylim(-1.3 * qu_max, 1.3 * qu_max)
-
-        if self._ref_dirty:
-            self.draw_reference()
-            self._ref_dirty = False
-        self.draw_idle()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

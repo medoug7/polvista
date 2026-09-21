@@ -157,46 +157,23 @@ def reference_nu(nu, nu_min=None):
 def thermal_intensity_shape(ratio, nu0, T, apply_escape=True):
     """Normalized thermal free-free intensity shape
     I'(nu) = B_nu(T)*(1-e^-tau_nu) / [B_nu0(T)*(1-e^-tau0)], `ratio` =
-    nu/nu0, tau0 fixed to 1 and tau_nu = (nu/nu0)**-2.1 the free-free
-    opacity (folding the usual tau0 normalization into nu0, same
-    convention as 'ssa' -- nu0 is where tau_nu=1). `nu0` [MHz] is only
-    used to get the dimensionless Theta = h*nu0/(k_B*T) below; `T` [K] is
-    the electron temperature.
-
-    `apply_escape=False` returns the bare local Planck source function
-    (`planck_ratio` below) alone -- B_nu(T)/B_nu0(T), the true S_nu/S_nu0
-    of classical radiative-transfer notation, via Kirchhoff's law S_nu =
-    B_nu(T) in LTE -- without the `(1-e^-tau_nu)/(1-e^-tau0)`
-    escape-probability bracket -- see intensity_shape's own docstring for
-    why a caller (models.build_custom_model's own per-z opacity) would
-    want that bare source-function piece instead of this function's
-    default, already-escaped, whole-slab emergent intensity ratio.
-
-    This single expression has three asymptotes, set by Theta: optically
-    thick (ratio << 1) is the Rayleigh-Jeans blackbody, I' ~ ratio**2;
-    optically thin and still Rayleigh-Jeans (1 << ratio << 1/Theta) is the
-    classical thermal-bremsstrahlung index, I' ~ ratio**-0.1; and
-    ratio >> 1/Theta (h*nu >~ k_B*T) is an exponential Wien cutoff, from
-    B_nu(T) itself -- so the -0.1 window is only visible when Theta << 1,
-    i.e. nu0 well below k_B*T/h.
-
-    A nu0 placed deep in (or past) that Wien cutoff -- Theta >~ 700 -- is
-    unphysical for a real thermal source, but the sliders don't forbid it
-    (see app.TEMP_BOUNDS_K/NU0_BOUNDS_MULT), and QU-fitting's own nu_0
-    solve (fitting.estimate_shape_2comp) can wander there mid-search even
-    starting from a sane guess. planck(ratio)/planck0 = ratio**3 *
-    (e^Theta-1)/(e^(Theta*ratio)-1) is computed below via the algebraic
-    identity (e^a-1)/(e^b-1) = e^(a-b) * (1-e^-a)/(1-e^-b), which only ever
-    evaluates e^(-x) for x>=0 (safely in [0,1]) instead of the e^(+x) that
-    overflows straight to inf once Theta is that large -- and the exponent
-    is clipped before the final exp() so a genuinely out-of-float64-range
-    answer saturates at a large finite number instead of overflowing,
-    since an inf/nan intensity shape is a non-finite residual that
-    scipy's least_squares (used by estimate_shape_2comp) rejects outright,
-    aborting the fit."""
+    nu/nu0, tau0=1 and tau_nu=(nu/nu0)**-2.1 (nu0 is where tau_nu=1,
+    same convention as 'ssa'). `nu0` [MHz], `T` [K] electron temperature.
+    `apply_escape=False` returns the bare Planck ratio B_nu(T)/B_nu0(T)
+    (no escape-probability bracket) -- see intensity_shape for why a
+    caller would want that piece instead of the default emergent ratio.
+    Three asymptotic regimes depending on Theta=h*nu0/(k_B*T): Rayleigh-
+    Jeans blackbody (ratio<<1, I'~ratio^2), thermal bremsstrahlung
+    (1<<ratio<<1/Theta, I'~ratio^-0.1), and a Wien cutoff (ratio>>1/Theta)."""
     nu0_hz = nu0 * 1e6
     theta = H_PLANCK * nu0_hz / (K_BOLTZMANN * T)
     theta_ratio = theta * ratio
+    # (e^a-1)/(e^b-1) = e^(a-b)*(1-e^-a)/(1-e^-b) avoids overflow for a
+    # large Theta (nu0 deep in the Wien cutoff -- unphysical, but
+    # fitting.estimate_shape_2comp's own nu0 search can wander there);
+    # clipped before exp() so an out-of-float64-range answer saturates
+    # rather than overflowing, since scipy's least_squares (used there)
+    # rejects a non-finite residual outright.
     with np.errstate(over='ignore', invalid='ignore'):
         log_planck_ratio = (3 * np.log(ratio) + theta * (1 - ratio)
                              + np.log1p(-np.exp(-theta)) - np.log1p(-np.exp(-theta_ratio)))
@@ -211,47 +188,26 @@ def thermal_intensity_shape(ratio, nu0, T, apply_escape=True):
 
 
 def intensity_shape(nu, nu0, alpha, shape, T=None, beta=None, apply_escape=True):
-    """Normalized intensity shape I'(nu), I'(nu0)=1, in the given `shape`
-    ('powerlaw'/'ssa'/'thermal'/'logparabola' -- always passed explicitly
-    by the caller, e.g. a two-component model's own per-component
-    SPECTRAL_SHAPE/SPECTRAL_SHAPE_2, since the two components of a model
-    need not share one).
+    """Normalized intensity shape I'(nu), I'(nu0)=1, for `shape` in
+    ('powerlaw'/'ssa'/'thermal'/'logparabola' -- always passed explicitly,
+    since a two-component model's components need not share one):
     'powerlaw': (nu/nu0)**alpha.
-    'ssa': classic synchrotron self-absorbed spectrum (nu/nu0)**(5/2) *
-    (1-e^-tau_nu)/(1-e^-tau_0), tau_0 fixed to 1 and tau_nu = tau_0*
-    (nu/nu0)**(alpha-5/2) the frequency-dependent opacity -- the -5/2 offset
-    is what makes alpha the actual optically-thin spectral index (nu >>
-    nu0): I'(nu) there is ~ (nu/nu0)**(5/2) * tau_nu ~ (nu/nu0)**alpha.
-    'thermal': thermal free-free spectrum, see thermal_intensity_shape --
-    `alpha` is inert for this shape (its -0.1 optically-thin index is
-    emergent from `T`, not a free parameter); `T` [K] is required.
-    'logparabola': curved power law (nu/nu0)**(alpha+beta*ln(nu/nu0)) --
-    alpha is still the local spectral index at nu0 (as under 'powerlaw'),
-    and `beta` [dimensionless] is required; beta=0 reduces exactly to
-    'powerlaw'. beta<0 gives a spectrum that peaks near nu0 and falls off
-    on both sides (concave down in log-log); beta>0 diverges on both
-    sides instead (concave up) -- see MODELS/spec.params for typical
-    bounds. Unlike 'ssa'/'thermal', nu0 here is still the shared band edge
-    (see component_reference_nu), not a free turnover of its own.
+    'ssa': (nu/nu0)**(5/2) * (1-e^-tau_nu)/(1-e^-tau0), tau0=1,
+    tau_nu=tau0*(nu/nu0)**(alpha-5/2) (the -5/2 offset makes alpha the
+    optically-thin spectral index).
+    'thermal': see thermal_intensity_shape; `alpha` is inert, `T` [K] required.
+    'logparabola': (nu/nu0)**(alpha+beta*ln(nu/nu0)); beta=0 reduces to
+    'powerlaw', beta<0/beta>0 peaks/diverges on both sides of nu0 (unlike
+    'ssa'/'thermal', nu0 stays the shared band edge here, not its own
+    turnover); `beta` required.
 
-    `apply_escape=False` (only meaningful for 'ssa'/'thermal' -- a no-op
-    for 'powerlaw'/'logparabola', which have no tau_nu/escape-probability
-    concept at all) strips the `(1-e^-tau_nu)/(1-e^-tau0)` bracket,
-    returning the bare *local* source function shape alone (the true,
-    classical-radiative-transfer-sense S_nu/S_nu0 = j_nu/alpha_nu, not
-    I'(nu)) -- `ratio**2.5` for 'ssa' (notably alpha-independent: the
-    universal synchrotron self-absorption source-function shape doesn't
-    depend on the electron power-law index, only tau_nu's own
-    frequency-scaling does), or the bare Planck ratio for 'thermal' (see
-    thermal_intensity_shape). That bracket is the closed-form *emergent*-
-    intensity solution of a uniform, unresolved slab -- i.e. it already
-    *is* a line-of-sight integral, just collapsed algebraically for the
-    special case of z-independent source/absorption coefficients. A caller
-    building its own per-z optical depth (see build_custom_model's own
-    opacity term) needs the bare S(nu) alone for Kirchhoff's law
-    (alpha'(z)=j(z)/S(nu)) -- reusing the bracketed (I'(nu)) value there
-    would double-apply that same escape-probability physics, once via the
-    bracket and again via the newly-resolved per-z integral."""
+    `apply_escape=False` (meaningful only for 'ssa'/'thermal') strips the
+    escape-probability bracket, returning the bare local source-function
+    shape S_nu/S_nu0 alone (ratio**2.5 for 'ssa', the bare Planck ratio
+    for 'thermal') -- what build_custom_model's own per-z opacity term
+    needs for Kirchhoff's law, since the bracketed I'(nu) already is a
+    closed-form line-of-sight integral and would double-apply that escape
+    physics if reused there."""
     ratio = nu / nu0
     if shape == 'ssa':
         bare = ratio ** 2.5
@@ -313,6 +269,12 @@ def int_term(x, p, X, phi, dphi):
     """Single internal-Faraday-screen contribution -- the building block
     shared by both components of comp2intern/comp2mixdep."""
     return p * np.exp(2j * X) * (1 - np.exp(-(2 * dphi**2 * x**4 - 2j * phi * x**2))) / (2 * (dphi+1e-10)**2 * x**4 - 2j * phi * x**2)
+
+
+def field_gradient(x, params):
+    """one external screen with unresolved varying Faraday depth across the beam"""
+    p0, X0, phi, D_phi, dphi = params[:5]
+    return p0 * np.sin(D_phi * x**2 + 1e-10) / (D_phi * x**2 + 1e-10) * np.exp(-2 * dphi**2 * x**4 + 2j * (X0 + phi * x**2))
 
 
 def spectral_weights(x, eps, alpha1, alpha2, nu_min=None):
@@ -489,38 +451,14 @@ def two_component_ref_wl(nu, nu_min, shape1, shape2):
 
 
 def stokes_I(wl, n_components, pars, nu_min=None):
-    """Normalized Stokes I(nu) implied by a model's own trailing spectral
-    params (the last 1 for a single-component model: alpha; the last 3
-    for a two-component model: eps,alpha1,alpha2) -- no separate I_0
-    needed, this is a *display/export* shape with amplitude 1 at nu_min
-    (the lowest frequency spanned by wl, or an explicit override -- see
-    below) for 'powerlaw'/'logparabola'. For a single component the
-    spectral index has no effect on p=P/I, but it does shape the total
-    intensity spectrum itself, via I'(nu) (see intensity_shape/
-    set_spectral_shape); for two components this is the same w1+w2 total
-    weight that already governs how the polarization blends between them.
-
-    Anchoring at nu_min rather than at each component's own physics-level
-    reference frequency (nu0, which for 'powerlaw'/'logparabola' usually
-    *is* nu_min anyway) is deliberate: it keeps this normalization matched
-    to the Load Data path's own I(nu_min)=1 convention (see
-    MainWindow.load_data_action).
-
-    'ssa' and 'thermal' are the exception: each anchors at that
-    component's own turnover nu0 instead (see two_component_ref_wl for the
-    two-component case), not nu_min. Both intensity shapes are already
-    physically normalized to I'(nu0)=1 by construction (see
-    thermal_intensity_shape, and intensity_shape's 'ssa' branch at
-    ratio=1), so this is a genuine physical anchor rather than an
-    arbitrary one -- and
-    it means dragging that component's own turnover slider rescales the
-    displayed curve, since nu0 is exactly where it now reads 1. (Only
-    'powerlaw'/'logparabola' need the nu_min fallback: they have no
-    turnover of their own to anchor at.)
-
-    `nu_min` [MHz] defaults to the lowest frequency spanned by wl (the
-    longest wavelength currently plotted); pass an explicit value (e.g. the
-    loaded data's own nu_min) to anchor the normalization elsewhere."""
+    """Normalized Stokes I(nu) from a model's trailing spectral params
+    (alpha for one component; eps,alpha1,alpha2 for two), via I'(nu) (see
+    intensity_shape/set_spectral_shape) -- a display/export shape, not a
+    separate I_0. Normalized to 1 at `nu_min` [MHz] (default: the lowest
+    frequency spanned by `wl`; matches MainWindow.load_data_action's own
+    I(nu_min)=1 convention), except 'ssa'/'thermal' components, which
+    anchor at their own turnover nu0 instead (already I'(nu0)=1 by
+    construction -- see two_component_ref_wl for the two-component case)."""
     nu = C / wl / 1e6  # MHz
     if nu_min is None:
         nu_min = np.min(nu)
@@ -750,7 +688,7 @@ register(tribble,
 register(partial,
     label='Partial coverage external screen', title='Partial coverage external',
     params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
-            Param('X_0', r'$X_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
+            Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
             Param('phi', r'$\phi$', 'phi', 'Faraday depth (RM-like): sets how fast EVPA rotates with lambda^2.'),
             Param('dphi', r'$\sigma_{\phi}$', 'dphi', 'Faraday depth dispersion across the covering part of the external screen; drives depolarization at long wavelengths.'),
             Param('f', r'$f$', 'scale', 'Covering fraction of the depolarizing screen; the remaining (1-f) of the emission passes through unchanged.')] + spectral_param_single(),
@@ -758,6 +696,19 @@ register(partial,
             [0.7, np.pi / 2, 5e6, 5e6, 1] + SPECTRAL_BOUNDS_HI_SINGLE),
     n_components=1, n_live_points=700,
     equation=r'$P(\lambda)=p_0\left[f\,e^{-2\sigma_\phi^2\lambda^4}e^{\,2i(\chi_0+\phi\lambda^2)}+(1-f)\,e^{2i\chi_0}\right]$')
+
+register(field_gradient,
+    label='Field gradient', title='Field gradient external screen',
+    params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
+            Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
+            Param('phi', r'$\phi$', 'phi', 'Mean Faraday depth: sets how fast EVPA rotates with lambda^2.'),
+            Param('D_phi', r'$\Delta_\phi$', 'phi', 'Faraday depth gradient across the beam.'),
+            Param('dphi', r'$\sigma_{\phi}$', 'dphi', 'Faraday depth dispersion across the covering part of the internal screen; drives depolarization at long wavelengths.'),] + spectral_param_single(),
+    bounds=([0, -np.pi / 2, -5e6, -5e6, 0] + SPECTRAL_BOUNDS_LO_SINGLE,
+            [0.7, np.pi / 2, 5e6, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
+    n_components=1, n_live_points=1000,  # no qu_fit.py counterpart -- reuses partial's own value (see ModelSpec.n_live_points)
+    equation=r'$P(\lambda)=p_0\,\frac{\sin(\Delta_\phi\,\lambda^2)}{\Delta_\phi\,\lambda^2}\,e^{-2\sigma_\phi^2\lambda^4}e^{\,2i(\chi_0+\phi\lambda^2)}$')
+
 
 
 register(intern,
@@ -774,10 +725,10 @@ register(intern,
 register(partial2,
     label='Partial coverage internal screen', title='Partial coverage internal',
     params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
-            Param('X_0', r'$X_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
+            Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
             Param('phi', r'$\phi$', 'phi', 'Faraday depth (RM-like): sets how fast EVPA rotates with lambda^2.'),
             Param('dphi', r'$\sigma_{\phi}$', 'dphi', 'Faraday depth dispersion across the covering part of the internal screen; drives depolarization at long wavelengths.'),
-            Param('f', 'f', 'scale', 'Covering fraction of the depolarizing internal screen; the remaining (1-f) of the emission passes through unchanged.')] + spectral_param_single(),
+            Param('f', r'$f$', 'scale', 'Covering fraction of the depolarizing internal screen; the remaining (1-f) of the emission passes through unchanged.')] + spectral_param_single(),
     bounds=([0, -np.pi / 2, -5e6, 0, 0] + SPECTRAL_BOUNDS_LO_SINGLE,
             [0.7, np.pi / 2, 5e6, 5e6, 1] + SPECTRAL_BOUNDS_HI_SINGLE),
     n_components=1, n_live_points=1200,  # no qu_fit.py counterpart -- reuses partial's own value (see ModelSpec.n_live_points)
@@ -1008,129 +959,58 @@ def full_equation(spec, shape1, shape2):
 
 
 # ── Custom user-defined models ────────────────────────────────────────────────
-# Lets a user build a new single-component model at runtime straight from the
-# general, *normalized* Sokoloff et al. 1998 (eq. 1) / Burn 1966 line-of-sight
-# integral
+# Builds a new single-component model at runtime from the general,
+# normalized Sokoloff et al. 1998 (eq. 1) / Burn 1966 line-of-sight integral
 #     P(lambda) = integral_{-1}^{1} j_p(z) dz / integral_{-1}^{1} j(z) dz
-# instead of picking one of the closed-form models above -- normalized by the
-# total (unpolarized) emissivity so the result doesn't depend on the emitting
-# region's own integration bounds, only its shape. j_p(z) = emiss(z) *
-# e^{2i*phi(z)*lambda^2} is the *polarized* emissivity -- rendered as j_p(z)
-# in the builder dialog's own UI -- where emiss(z) is whatever plain-text math
-# expression the user types into that field (not to be confused with the
-# unrelated epsilon/eps already used elsewhere for a two-component model's
-# own spectral blend weight, see spectral_weights/spectral_params). j(z), the
-# plain (unpolarized) emissivity used for the denominator, is simply 1 across
-# the emitting region [j_lo, j_hi] (0 outside it) for an optically-thin
-# ('powerlaw'/'logparabola') model -- *not* derived from emiss(z) (an
-# earlier design forced p0->1 in emiss(z) and took |...| of what was left,
-# but that only ever strips out the literal p0 symbol: any other magnitude
-# dependence emiss(z) carries -- a spatial envelope, a bare 'nu'/'lambda'
-# factor meant to reshape P(lambda)'s own spectrum -- would reappear
-# identically in that derived j(z) too and cancel out of the ratio exactly,
-# leaving it with zero effect on P(lambda) besides a spurious EVPA rotation
-# wherever it went negative, since only the magnitude survives an abs()
-# while the numerator keeps the sign). emiss(z) is instead taken to mean
-# the local complex fractional-polarization factor m(z)=j_p(z)/j(z)
-# outright (degree and phase together, e.g. its default
-# 'p0*exp(2*i*chi0)'), so any magnitude dependence typed into it reshapes
-# P(lambda) directly instead of being divided back out -- it's only ever
-# clipped to |m(z)|<=1 pointwise (see _custom_P_raw), never rescaled by a
-# second, independently-derived j(z). I_lambda (j(z)'s own integral) is
-# accordingly just the emitting region's rectangular area, j_hi-j_lo,
-# computed directly rather than by a second numerical emiss(z) evaluation.
+# instead of picking a closed-form model above. See help/Custom_models.tex
+# for the full user-facing writeup (equations, builder-dialog walkthrough,
+# syntax reference); this comment covers only what the code below needs.
 #
-# An 'ssa'/'thermal' model is the one exception: Kirchhoff's law ties the
-# per-z opacity directly to the *actual* local emissivity (see
-# _custom_opacity_attenuation), so there's no way to compute a physically
-# meaningful attenuation from a flat j(z)=1 -- self-absorption has to know
-# where the source's own material really is. For that case only, j(z) falls
-# back to the earlier emiss(z)-with-p0-forced-to-1 derivation (real
-# numerical integration, not the rectangle shortcut), same as it always
-# has -- see _custom_P_raw's own shape branch.
+# j_p(z) = emiss(z) * e^{2i*phi(z)*lambda^2} is the polarized emissivity --
+# emiss(z) is the user's own plain-text expression (default
+# 'p0*exp(2*i*chi0)'), meaning the complex fractional-polarization factor
+# m(z)=j_p(z)/j(z) directly (clipped to |m(z)|<=1 pointwise, see
+# _custom_P_raw), not a bare intensity envelope. j(z), the unpolarized
+# emissivity for the I_lambda denominator, is simply 1 across [j_lo, j_hi]
+# (0 outside) for an optically-thin ('powerlaw'/'logparabola') model --
+# except 'ssa'/'thermal', where Kirchhoff's law ties opacity to the actual
+# local emissivity (see _custom_opacity_attenuation), so j(z) instead falls
+# back to an emiss(z)-with-p0-forced-to-1 derivation (real numerical
+# integration, not the rectangle shortcut) -- see _custom_P_raw's shape branch.
 #
-# p0 (fractional polarization amplitude), chi0 (EVPA) and phi0 (Faraday-depth
-# scale) are ordinary symbols emiss(z)/phi'(z) can reference directly, not
-# hidden/automatic factors applied outside the integral -- but they're still
-# the model's three *standard* always-present sliders (fixed
-# built-in-model-matching bounds, CUSTOM_P0_BOUNDS/CUSTOM_PHI0_BOUNDS below),
-# not free constants the user has to pick a Kind/bounds for themselves (see
-# discover_custom_params). The builder dialog starts a fresh model's emiss(z)
-# field prefilled with 'p0 * exp(2 * i * chi0)' (multiplying the always-shown,
-# non-editable e^{2i*phi(z)*lambda^2} phase factor) and phi'(z) prefilled
-# with 'phi0', reproducing the same physical roles p0/chi0/phi0 always had --
-# amplitude, EVPA, and Faraday-depth magnitude -- just typed out explicitly
-# now instead of applied invisibly, and editable/removable like any other
-# part of either expression from there.
+# p0/chi0/phi0 (amplitude, EVPA, Faraday-depth scale) are ordinary symbols
+# emiss(z)/phi'(z) reference directly, not hidden automatic factors -- but
+# still the model's three always-present sliders (fixed bounds,
+# CUSTOM_P0_BOUNDS/CUSTOM_PHI0_BOUNDS below), not user-picked-Kind constants
+# like anything else discover_custom_params finds.
 #
-# phi(z) itself -- the Faraday depth actually accumulated by a photon
-# emitted at position z, the thing that actually appears in the integral
-# above -- is *not* what the builder dialog's phi'(z) field holds. What
-# the user types there is phi'(z), a Faraday-depth *density* (proportional
-# to n_e*B_parallel, same role as a rotation measure per unit length). A
-# photon emitted at z travels *forward* toward the observer (z=1), so it's
-# only rotated by material *ahead* of it on that remaining path, not by
-# anything behind it -- phi(z) is accordingly the remaining-path integral,
+# phi(z), the Faraday depth actually accumulated by a photon emitted at z
+# (only rotated by material *ahead* of it, toward the observer at z=1), is
+# the remaining-path integral of the user's own phi'(z) density:
 #     phi(z) = integral_{z}^{1} phi'(z') dz'
 # built by custom_func via a cumulative trapezoid (_cumtrapz0, run forward
-# from z=-1 and then subtracted from its own total to turn that prefix sum
-# into the suffix one actually needed) over the same LOS quadrature grid
-# used for the P(lambda) integral itself (which spans the full [-1,1], not
-# just the emitting region, precisely so there's something to integrate
-# over past it -- see custom_func), not read off phi'(z) directly.
+# from z=-1 and subtracted from its own total to turn that prefix sum into
+# the needed suffix one) over the full [-1,1] LOS quadrature grid, not read
+# off phi'(z) directly.
 #
-# emiss(z) need not be real: 'i' parses as the imaginary unit (see
-# _SYMPY_GLOBAL_DICT), so a profile like 'p0*exp(2*i*chi_z*z)' encodes an
-# intrinsic EVPA that itself varies with position, not just an intensity
-# envelope. phi'(z) (and so phi(z)) need not be real either: since phi(z)
-# is used as the angle argument of exp(2i*phi(z)*lambda^2), an imaginary
-# part on phi(z) becomes a genuine exp(+-real) factor there (via
-# lambda^2), i.e. a wavelength-dependent exponential damping/growth on top
-# of the ordinary real rotation -- the same role a Burn-style dispersion
-# term plays, e.g. phi'(z)='phi0 + i*sigma'. A plain real phi'(z) is
-# unaffected either way, since its own imaginary part is already all
-# zeros.
+# emiss(z)/phi'(z) need not be real: 'i' parses as the imaginary unit (see
+# _SYMPY_GLOBAL_DICT), so emiss(z) can encode a position-dependent EVPA, and
+# an imaginary phi'(z) becomes a wavelength-dependent exponential
+# damping/growth via exp(2i*phi(z)*lambda^2) -- the same role a Burn-style
+# dispersion term plays (e.g. phi'(z)='phi0 + i*sigma').
 #
-# The emitting and rotating regions need not span the whole [-1,1] path, or
-# even overlap: emiss(z)/j(z) are only ever evaluated (and integrated) over z
-# in [j_lo, j_hi] -- zero outside it -- and phi'(z) is forced to zero outside
-# [p_lo, p_hi], so phi(z) only picks up whatever of the remaining path lies
-# within that window. j_lo/j_hi/p_lo/p_hi are set via the builder dialog's
-# own bound boxes -- default j_lo=p_lo=-1, j_hi=p_hi=1, i.e. the full path
-# -- and each box takes a plain-text expression exactly like emiss(z)/
-# phi'(z) themselves (see build_custom_model, parse_custom_expr): typing a
-# bare number there (still every default) behaves exactly as before, but
-# an expression referencing a *new* constant (e.g. j_hi='3*w') is what
-# promotes that constant into one of the model's own discovered params,
-# with its own slider -- a bound only becomes indirectly adjustable this
-# way, through a constant it's written in terms of, never as a slider of
-# its own (see discover_custom_params). Whatever the current expression
-# evaluates to (fixed for a bare number; re-evaluated on every call, see
-# custom_func, if a referenced constant's slider moves) is what actually
-# distinguishes internal from external
-# Faraday rotation here (see the module discussion this was built from):
-# p_lo<=j_hi puts a genuinely co-spatial (internal, differentially-
-# rotating) stretch in the middle of the emitting region, so different
-# emission depths pick up different amounts of rotation before reaching
-# the observer -- true Burn-slab depolarization; p_lo>=j_hi makes every
-# emission point's remaining path pass through the *entire* rotating
-# region (since it all lies beyond where emission stops), so phi(z)
-# collapses to one shared number: a pure external screen, switched on only
-# *after* all emission has stopped, rotating everything by the same amount
-# regardless of where within the source it originated. phi'(z) left blank
-# (treated as the constant 1 -- see parse_custom_expr) at the default
-# j_lo=p_lo=-1/j_hi=p_hi=1 is accordingly already a full-path internal
-# screen, phi(z)=(1-z); push p_lo up past j_hi to turn the same phi'(z)=1
-# into an external one instead (phi(z)=p_hi-p_lo, the same number for
-# every z<=j_hi).
-#
-# emiss(z)/phi'(z) can also depend on frequency/wavelength directly, not just
-# position: 'nu' (frequency, MHz) and 'lambda' (wavelength, m) are both
-# reserved symbols available in either expression, alongside z -- e.g.
-# emiss='(nu/1000)**(-0.7)' folds a spectral index straight into the
-# emissivity profile itself, on top of (or instead of) the Spectrum box's
-# own overall alpha (which still applies uniformly to the total Stokes I on
-# top of whatever P(lambda) this integral produces).
+# emiss(z)/j(z) are evaluated only over z in [j_lo, j_hi] (0 outside), and
+# phi'(z) is forced to 0 outside [p_lo, p_hi] -- both default to the full
+# [-1, 1] path. Each bound field takes a plain-text expression like
+# emiss(z)/phi'(z) themselves (see build_custom_model, parse_custom_expr);
+# referencing a new constant there (e.g. j_hi='3*w') promotes it into a
+# discovered param exactly like one used inside emiss(z)/phi'(z) directly
+# (see discover_custom_params). p_lo<=j_hi gives a co-spatial, internally/
+# differentially-rotating stretch (true Burn-slab depolarization); p_lo>=j_hi
+# instead makes every emission point's remaining path cross the *entire*
+# rotating region, collapsing phi(z) to one shared number (a pure external
+# screen). emiss(z)/phi'(z) may also reference 'nu' [MHz]/'lambda' [m]
+# directly, alongside z, for a profile that depends on frequency too.
 Z_SYMBOL = sympy.Symbol('z', real=True)
 NU_SYMBOL = sympy.Symbol('nu', positive=True)      # MHz, matches spectral_weights' own convention
 LAMBDA_SYMBOL = sympy.Symbol('lambda', positive=True)  # m, matches x/wl elsewhere in this module
@@ -1269,46 +1149,23 @@ CUSTOM_FUNC_CACHE_MAX = 128
 
 
 def _custom_quad_n(depth_probe, lam2_max):
-    """(n, underresolved): how many LOS quadrature points custom_func needs
-    for this call's wavelength range, given the accumulated Faraday depth
-    phi(z) (*not* the user-typed density phi'(z) -- see build_custom_model's
-    own module comment -- already integrated by the caller, via
-    _cumtrapz0) evaluated on a coarse probe grid
-    spanning the model's own [0, z1] (see build_custom_model), and whether
-    that need exceeds CUSTOM_Z_N_MAX (in which case `n` is clamped to it
-    and the returned integral should be treated as unreliable -- see
-    custom_func's own last_call_underresolved).
-
-    e^{2i*phi(z)*lambda^2} oscillates across [0,z1] roughly
-    ptp(phi(z))*2*lam2_max/(2*pi) times at the longest wavelength in `x`
-    (lam2_max = max(x**2)); trapz needs several samples per cycle to avoid
-    aliasing (CUSTOM_Z_SAMPLES_PER_CYCLE), clamped to
-    [CUSTOM_Z_N_MIN, CUSTOM_Z_N_MAX] so a pathologically large phi(z)/lambda
-    combination costs more time rather than an unboundedly expensive grid
-    size inside a tight likelihood loop -- at the cost of the integral
-    itself becoming unreliable past that point (flagged via `underresolved`
-    rather than silently returned as if it were still accurate).
-
-    This only tracks oscillation from the *phi(z)*lambda^2 term, using
-    phi(z)'s min-to-max spread on the probe grid -- a phi(z) that itself
-    wiggles faster than that probe can resolve (rather than just being
-    large) is a pathological case outside what any fixed-size quadrature
-    here can guarantee; keep phi'(z) itself smooth/monotonic-ish.
-
-    depth_probe can be non-finite (e.g. phi'(z) divides by a user-defined
-    constant whose bounds let it reach 0) -- np.ptp of an array containing
-    inf is itself inf or nan (inf-inf is an indeterminate form), which
-    would otherwise reach `int(np.clip(nan, ...))` below and raise
-    ValueError: cannot convert float NaN to integer. Treat that the same
-    as "needs more resolution than we'll ever give it": clamp to the max
-    grid size and flag underresolved, same as genuinely needing more
-    points than CUSTOM_Z_N_MAX -- the integral is unreliable either way,
-    and custom_func/app.py's own warning label already say so instead of
-    silently trusting it."""
+    """(n, underresolved): LOS quadrature point count needed to resolve
+    e^{2i*phi(z)*lambda^2}'s oscillation across the model's [0, z1] probe
+    grid at the longest wavelength (lam2_max = max(x**2)), from
+    `depth_probe`'s (phi(z), not phi'(z)) own min-to-max spread --
+    CUSTOM_Z_SAMPLES_PER_CYCLE samples/cycle, clamped to [CUSTOM_Z_N_MIN,
+    CUSTOM_Z_N_MAX]. `underresolved` is True if the true requirement
+    exceeded CUSTOM_Z_N_MAX (n was clamped, see custom_func's own
+    last_call_underresolved) -- only phi(z)*lambda^2's own oscillation is
+    tracked, not a phi'(z) that itself wiggles faster than the probe grid
+    resolves."""
     phase_span = float(np.ptp(depth_probe)) * 2.0 * lam2_max
     n_cycles = phase_span / (2.0 * np.pi)
     raw_n = n_cycles * CUSTOM_Z_SAMPLES_PER_CYCLE
     if not np.isfinite(raw_n):
+        # depth_probe can be non-finite (e.g. phi'(z) divides by a
+        # user-defined constant whose bounds let it reach 0) -- treat that
+        # the same as needing more resolution than we'll ever give it.
         return CUSTOM_Z_N_MAX, True
     n = int(np.clip(raw_n, CUSTOM_Z_N_MIN, CUSTOM_Z_N_MAX))
     return n, raw_n > CUSTOM_Z_N_MAX
@@ -1539,27 +1396,13 @@ def _cumtrapz0(y, z):
 def _custom_opacity_attenuation(emiss_fn, consts, chi0_val, phi0_val, j_lo, j_hi,
                                  z, nu, lam, emiss_den_zw, shape, nu0, alpha_val, T_val, beta_val):
     """exp(-tau(z,nu)) -- the per-z opacity attenuation envelope
-    _custom_P_raw's own SSA/thermal case multiplies onto both j_p(z) and
-    j(z) before they're integrated (see there), built via Kirchhoff's law
-    alpha'(z) = j(z)/S(nu) with S(nu) the *bare* local source function --
-    the true, classical-radiative-transfer-sense j_nu/alpha_nu, not I'(nu)
-    (intensity_shape(..., apply_escape=False) -- see its own docstring for
-    why the default, already-escaped I'(nu) can't be reused here without
-    double-applying the same escape-probability physics this per-z
-    integral is itself computing).
-
-    tau(z,nu) = integral_z^1 alpha'(z') dz' is built the same suffix-
-    integral way phi(z) is in _custom_P_raw (_cumtrapz0 + total-minus-
-    prefix), from j(z,nu) = `emiss_den_zw` (already computed, and already
-    masked to 0 outside [j_lo,j_hi], by the caller), then rescaled by a
-    single amplitude so that tau at the emitting region's far edge
-    (z=j_lo, the model's own *total* column depth) equals 1 exactly at
-    nu=nu0 -- preserving the same "nu0 is where the model turns over"
-    meaning every other SSA/thermal model already has (see
-    intensity_shape's own docstring). That requires j(z) evaluated at
-    exactly nu=nu0 too (`emiss_den_z_nu0` below), independent of whatever
-    wavelengths `nu`/`lam` this call actually needs -- mirrors stokes_I's
-    own raw_ref pattern (re-evaluating at a fixed reference frequency)."""
+    _custom_P_raw's SSA/thermal case multiplies onto both j_p(z) and j(z)
+    before integrating, via Kirchhoff's law alpha'(z) = j(z)/S(nu) with
+    S(nu) the bare local source function (intensity_shape(...,
+    apply_escape=False)). tau(z,nu) = integral_z^1 alpha'(z') dz' (same
+    suffix-integral construction as phi(z) in _custom_P_raw), rescaled so
+    tau=1 exactly at z=j_lo (the model's total column depth), nu=nu0 --
+    preserving "nu0 is where the model turns over" (see intensity_shape)."""
     prefix_j = _cumtrapz0(emiss_den_zw, z[:, 0])
     w_zw = prefix_j[-1:, :] - prefix_j            # W(z,nu): (n_grid, n_lambda)
     s_bare_nu = intensity_shape(nu, nu0, alpha_val, shape, T=T_val, beta=beta_val,
@@ -1583,44 +1426,21 @@ def _custom_P_raw(emiss_fn, phi_fn, consts, p0_val, chi0_val, phi0_val,
                    x, j_lo, j_hi, p_lo, p_hi, n,
                    shape='powerlaw', nu0=None, alpha_val=None, T_val=None, beta_val=None):
     """P(x) = integral_{j_lo}^{j_hi} j_p(z) dz / integral_{j_lo}^{j_hi} j(z) dz,
-    the LOS integral custom_func actually needs, evaluated on an n-point z
-    grid -- j_p(z) = emiss_fn(z) * e^{2i*phi(z)*lambda^2} (`emiss_fn` is the
-    user's own emiss(z) expression, referencing p0/chi0/phi0 exactly as
-    typed), taken to mean the local complex fractional-polarization factor
-    m(z)=j_p(z)/j(z) outright. For an optically-thin ('powerlaw'/
-    'logparabola') `shape`, j(z) is simply 1 across [j_lo,j_hi] (0 outside
-    it) rather than derived from emiss_fn, so any magnitude dependence
-    emiss_fn carries reshapes P(lambda) directly instead of canceling out
-    of the ratio (see build_custom_model's own module comment for the
-    problem that fixes). For 'ssa'/'thermal', where Kirchhoff's law ties
-    the per-z opacity directly to the *actual* local emissivity, j(z)
-    falls back to the earlier derivation instead -- emiss_fn evaluated
-    again with p0 forced to 1, then |...| taken of whatever's left (see
-    the module comment for why a magnitude, not also substituting
-    chi0->0). Either way, j_p(z) is then clipped pointwise to
-    |j_p(z)| <= j(z) (phase preserved) before either integral runs, since a
-    user-typed emiss(z) is under no obligation to keep its own local
-    polarization fraction physical -- see the comment at that clip below
-    for why that's enough to guarantee |P(lambda)|<=1 everywhere. Pulled
-    out of custom_func as its own
-    function purely to keep that already-long resolution/masking logic
-    readable -- `x` there is only ever the subset of wavelengths
-    custom_func has already determined are worth resolving (see its own
-    `resolvable` mask), at whatever quadrature size `n` _custom_quad_n
-    decided that subset needs.
-
-    `shape` is the live Spectrum-box shape (models.SPECTRAL_SHAPE) custom_func
-    passes in; only 'ssa'/'thermal' (with `nu0`/`alpha_val`/`T_val`/`beta_val`
-    -- that component's own turnover/spectral-index/temperature/curvature)
-    add a genuine per-z opacity attenuation on top of the always-optically-
-    thin integral above (see _custom_opacity_attenuation) -- 'powerlaw'/
-    'logparabola' behave exactly as before this existed. Opacity only
-    changes P(lambda)'s own *shape* when something else in the integrand
-    also varies with z (an internal phi'(z), or a spatial gradient in
-    j_p(z) itself) -- a spatially-uniform emissivity with a purely external
-    Faraday screen cancels it out exactly between this numerator and
-    denominator, same as it already does for the plain spectral index (see
-    stokes_I's own docstring)."""
+    the LOS integral custom_func needs, evaluated on an n-point z grid --
+    j_p(z) = emiss_fn(z) * e^{2i*phi(z)*lambda^2} (`emiss_fn` is the user's
+    emiss(z) expression), meaning the local complex fractional-polarization
+    factor m(z)=j_p(z)/j(z) directly. For `shape` in ('powerlaw',
+    'logparabola'), j(z)=1 across [j_lo,j_hi] (0 outside); for 'ssa'/
+    'thermal' (Kirchhoff's law ties opacity to the actual local emissivity,
+    with `nu0`/`alpha_val`/`T_val`/`beta_val` that component's turnover/
+    spectral-index/temperature/curvature -- see _custom_opacity_attenuation),
+    j(z) instead falls back to emiss_fn with p0 forced to 1, |...| taken
+    (see the module comment above build_custom_model for why). j_p(z) is
+    then clipped pointwise to |j_p(z)| <= j(z) (phase preserved) to
+    guarantee |P(lambda)|<=1 everywhere. `x` is only the wavelength subset
+    custom_func's own `resolvable` mask kept, at the quadrature size `n`
+    _custom_quad_n decided that subset needs. Pulled out of custom_func
+    purely to keep its resolution/masking logic readable."""
     z = np.linspace(-1.0, 1.0, n)[:, None]      # (n_grid, 1) -- full LOS
     lam = x[None, :]                            # (1, n_lambda)
     nu = (C / x / 1e6)[None, :]                 # (1, n_lambda) MHz
@@ -2021,47 +1841,19 @@ def _custom_param_latex(name):
 def custom_model_equation_lines(emiss_expr, phi_expr, j_lo_expr, j_hi_expr, p_lo_expr, p_hi_expr):
     """(phi_line, p_line) -- the two standalone equation-card LaTeX strings
     for a custom model built from `emiss_expr`/`phi_expr` (already parsed,
-    see parse_custom_expr) at the given j_lo_expr/j_hi_expr/p_lo_expr/
-    p_hi_expr (also already parsed -- may be a bare number, e.g. a plain
-    Integer(-1), exactly like before this replaced literal floats, or a
-    genuine expression referencing a discovered constant, e.g. '3*w'):
-    phi(z)'s own
-    integral form (its integrand is phi_expr's own text -- phi'(z), the
-    Faraday-depth density the user actually types, possibly referencing
-    phi0 directly, see the module comment above -- with z renamed to the
-    dummy integration variable z' for display only), and the normalized
-    P(lambda) = (1/I_lambda) * integral j_p(z) dz, with j_p(z) shown
-    concretely (its own form is the whole point of a custom model, so it's
-    shown explicitly rather than hidden behind a placeholder symbol) but
-    phi(z) referenced only by name in the phase term -- its own concrete
-    form is given by the other line, so restating it again here would be
-    redundant. I_lambda itself is *not* defined anywhere in either line --
-    see build_model.py's own intro text for that (the one place it's
-    spelled out), so this card reads as "P(lambda) is this shape,
-    normalized" without cluttering the one line that matters most (what
-    j_p(z) itself looks like) with I_lambda's own derivation.
-
-    j_p(z)'s own integral runs over [j_lo,j_hi] (it's 0 outside it, so
-    integrating past there would add nothing); phi(z)'s own integral
-    instead runs from max(z, p_lo) up to p_hi -- a photon emitted at z is
-    only rotated by material *ahead* of it on its way out, not behind it,
-    and phi'(z) itself is 0 outside [p_lo,p_hi] anyway (see
-    build_custom_model's own masking) -- evaluated fresh at every point
-    along the outer P(lambda) integral (see custom_func's own
-    prefix/total-minus-prefix construction), not a single number, except
-    when p_lo>=j_hi (a pure external screen): then max(z,p_lo)=p_lo for
-    every emission point z<=j_hi, so every one of them integrates the
-    exact same range and phi(z) collapses to one shared total.
-
-    Used both for build_custom_model's own registered spec.equation (via
-    custom_model_equation_latex below) and by the builder dialog's own
-    side-by-side equation cards (which have no built model yet to read
-    spec.equation off of -- just the six parsed expressions currently
-    typed).
-
-    matplotlib mathtext (not a full TeX engine, see latex_stuff.py)
-    doesn't support \\displaystyle -- plain \\int/\\dfrac render fine, just
-    inline-sized."""
+    see parse_custom_expr) and the four (also already-parsed, possibly
+    constant-referencing) bound expressions: phi(z)'s own integral form
+    (integrand is phi_expr, i.e. phi'(z); z renamed to z' for display),
+    and the normalized P(lambda)=(1/I_lambda)*integral j_p(z) dz with
+    j_p(z) shown concretely but phi(z) referenced only by name (its form
+    is the other line). j_p(z)'s integral runs over [j_lo,j_hi]; phi(z)'s
+    runs from max(z, p_lo) up to p_hi (only material ahead of an emission
+    point z rotates it), collapsing to one shared total when p_lo>=j_hi
+    (a pure external screen). Used both for build_custom_model's
+    registered spec.equation (via custom_model_equation_latex) and the
+    builder dialog's own side-by-side equation cards. matplotlib mathtext
+    doesn't support \\displaystyle -- plain \\int/\\dfrac render fine,
+    just inline-sized."""
     z_prime = sympy.Symbol("z'", real=True)
     phi_line = (r"$\phi(z)=\int_{\max(z,\,%s)}^{%s} %s\,dz'$"
                 % (sympy.latex(p_lo_expr), sympy.latex(p_hi_expr),
@@ -2085,72 +1877,38 @@ def custom_model_equation_latex(emiss_expr, phi_expr, j_lo_expr, j_hi_expr, p_lo
 
 def build_custom_model(label, emiss_str, phi_str, param_specs,
                         j_lo=-1.0, j_hi=1.0, p_lo=-1.0, p_hi=1.0, title=None, name=None):
-    """Parse `emiss_str`/`phi_str` (plain-text j_p(z)/phi'(z) expressions
-    -- `phi_str` is the Faraday-depth *density*, not the depth itself, see
-    the module comment above) and `j_lo`/`j_hi`/`p_lo`/`p_hi` (see below --
-    also plain text now, e.g. '-1' or '3*w', not necessarily a bare
-    float), build the resulting model function, register it into
-    MODELS/MODELS_BY_NAME under a unique name, and return that function.
+    """Parse `emiss_str`/`phi_str` (plain-text j_p(z)/phi'(z) expressions,
+    `phi_str` a Faraday-depth *density* -- see the module comment above)
+    and `j_lo`/`j_hi`/`p_lo`/`p_hi` (each parsed the same way -- a plain
+    number, e.g. '-1', or an expression referencing a new constant, e.g.
+    'j_hi=3*w'), build the model function, register it into MODELS/
+    MODELS_BY_NAME under a unique name, and return it. `j_lo`/`j_hi`/
+    `p_lo`/`p_hi` fix emiss(z)/j(z)=0 outside [j_lo,j_hi] and phi'(z)=0
+    outside [p_lo,p_hi] (a structural, Define-time-fixed choice, not a
+    slider) -- unlike emiss_str/phi_str, a bound expression can't
+    reference z/nu/lambda: it must evaluate to one number per custom_func
+    call, not vary along the LOS or with wavelength.
 
-    The returned model's params are always p0 (fractional polarization
-    amplitude), X_0 (chi_0, EVPA), phi0 (Faraday-depth scale -- see
-    CUSTOM_P0_BOUNDS/CUSTOM_PHI0_BOUNDS for their fixed bounds -- same
-    p_0/X_0/phi order every closed-form model above uses), then whatever
-    other constants `emiss_str`/`phi_str` themselves introduce, in that
-    order. p0/chi0/phi0 need no entry in `param_specs` -- they're ordinary
-    symbols `emiss_str`/`phi_str` can (and, via the builder dialog's own
-    defaults, normally do) reference directly by name ('p0'/'chi0'/'phi0',
-    see parse_custom_expr), evaluated at their own slider's current value
-    exactly like any other constant, rather than applied as an automatic
-    closed-form factor the way the old design did (see the module comment
-    above).
+    The model's params are always p0/chi0/phi0 (fractional-polarization
+    amplitude/EVPA/Faraday-depth scale, same order every closed-form
+    model uses; fixed bounds CUSTOM_P0_BOUNDS/CUSTOM_PHI0_BOUNDS, no
+    `param_specs` entry needed), then whatever other constants
+    emiss_str/phi_str/the four bounds introduce, in that order.
 
-    `param_specs` is a {constant_name: (kind, lo, hi[, description])} dict
-    covering every *other* free symbol `emiss_str`/`phi_str` introduce,
-    i.e. excluding the reserved z/nu/lambda/p0/chi0/phi0 (see
-    discover_custom_params) -- `kind` one of CUSTOM_PARAM_KINDS (picked
-    via the builder dialog's own "Kind" dropdown; see its module
-    docstring), `lo`/`hi` already in that kind's own physical units
-    (radians for 'X', a 0-1 fraction for 'p', rad/m^2 for 'phi', as-is for
-    'scale' -- i.e. the same units app.ParamSlider expects in spec.bounds
-    for that kind, not necessarily what the dialog displayed to the
-    user). The optional trailing `description` (the dialog's own
-    Description column, see build_model.py) becomes that constant's
-    Param.description -- shown as its slider's tooltip in the main window
-    exactly like p0/chi0/phi0's own fixed tooltips (see app.ParamSlider)
-    -- falling back to a generic "User-defined constant '<name>'." when
-    omitted (every 3-element tuple, e.g. from a 'custom_definition' saved
-    before this) or left blank. Plain ValueError if any constant is
-    missing or its kind isn't recognized (a caller bug, not a user-input
-    problem -- the builder dialog always derives param_specs from
-    discover_custom_params's own output first, restricted to a valid Kind
-    dropdown selection).
-
-    `j_lo`/`j_hi`/`p_lo`/`p_hi` fix emiss(z)/j(z)=0 outside [j_lo,j_hi] and
-    phi'(z)=0 outside [p_lo,p_hi] -- a structural choice fixed at
-    Define-time, not itself a slider of the returned model (see the module
-    comment above for what the four actually encode physically). Each is
-    parsed as its own expression exactly like emiss_str/phi_str (see
-    parse_custom_expr) -- typing a bare number (e.g. '-1', still every
-    default here) behaves exactly as it always did, but an expression that
-    references a *new* constant (e.g. j_hi='3*w', tying the emitting
-    region's own extent to a width `w` that also shapes emiss(z)) is what
-    turns that constant into one of the model's discovered params, with
-    its own Kind/bounds/slider, same as one used directly in emiss_str/
-    phi_str -- see discover_custom_params. Unlike emiss_str/phi_str, a
-    bound expression can't reference z/nu/lambda (CustomModelError if it
-    does): it has to evaluate to a single number for a given set of
-    constants, evaluated once per custom_func call rather than varying
-    along the line-of-sight quadrature or with wavelength. `name`, if
-    given, is used as-is for func.__name__ (re-registering a model loaded
-    from a saved 'custom_definition' block under the name it already had,
-    rather than slugifying `label` fresh every time -- see app.py's
-    load_model_action); otherwise one is derived from `label` via
-    unique_custom_name. `title` defaults to `label`.
+    `param_specs` is a {constant_name: (kind, lo, hi[, description])}
+    dict covering every other free symbol (excluding reserved
+    z/nu/lambda/p0/chi0/phi0, see discover_custom_params): `kind` one of
+    CUSTOM_PARAM_KINDS, `lo`/`hi` already in that kind's own physical
+    units (matching app.ParamSlider's spec.bounds convention), optional
+    `description` becomes that slider's tooltip (default: a generic
+    "User-defined constant '<name>'."). `name`, if given, is used as-is
+    for func.__name__ (re-registering a saved model under its existing
+    name); otherwise derived from `label` via unique_custom_name. `title`
+    defaults to `label`.
 
     Raises CustomModelError for anything wrong with any of the six
-    expressions themselves (bad syntax, reserved names, a bound
-    referencing z/nu/lambda)."""
+    expressions: bad syntax, a reserved name, a missing or unrecognized-
+    kind param_specs entry, or a bound expression referencing z/nu/lambda."""
     emiss_expr = parse_custom_expr(emiss_str, 'j_p(z)')
     phi_expr = parse_custom_expr(phi_str, "phi'(z)")
     # str(...) rather than assuming a string outright -- every default
@@ -2169,10 +1927,10 @@ def build_custom_model(label, emiss_str, phi_str, param_specs,
     const_names = discover_custom_params(emiss_expr, phi_expr, j_lo_expr, j_hi_expr, p_lo_expr, p_hi_expr)
     missing = [n for n in const_names if n not in param_specs]
     if missing:
-        raise ValueError(f'No bounds given for: {", ".join(missing)}')
+        raise CustomModelError(f'No bounds given for: {", ".join(missing)}')
     bad_kind = [n for n in const_names if param_specs[n][0] not in CUSTOM_PARAM_KINDS]
     if bad_kind:
-        raise ValueError(f'Unrecognized kind for: {", ".join(bad_kind)}')
+        raise CustomModelError(f'Unrecognized kind for: {", ".join(bad_kind)}')
 
     # emiss_fn is j_p(z)'s own envelope exactly as typed (may reference
     # p0/chi0 directly) -- reused for *both* the numerator (evaluated at

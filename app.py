@@ -29,13 +29,9 @@ import sys
 
 
 def ensure_qt_plugin_path():
-    """Some conda envs ship a `PyQt5` wheel whose own Qt5/plugins directory
-    is missing (QLibraryInfo.PluginsPath points at a folder that doesn't
-    exist), while the real Qt platform plugins (xcb, etc.) live under the
-    conda env's own `plugins/` dir (from the separate `qt-main` package).
-    Without this, Qt fails with "Could not find the Qt platform plugin
-    xcb" even though the plugin is present on disk. Auto-detect and set
-    QT_QPA_PLATFORM_PLUGIN_PATH so the app runs without env-var wrangling."""
+    """Point Qt at the platform-plugins dir under sys.prefix (conda's
+    qt-main package layout) when the active PyQt5 wheel's own Qt5/plugins
+    dir is missing one, so Qt doesn't fail to find e.g. the xcb plugin."""
     if os.environ.get('QT_QPA_PLATFORM_PLUGIN_PATH'):
         return
     import PyQt5
@@ -54,6 +50,7 @@ ensure_qt_plugin_path()
 import re
 import csv
 import json
+import traceback
 
 import numpy as np
 import matplotlib as mpl
@@ -78,7 +75,7 @@ from polvista.latex_stuff import latex_pixmap, fit_equation_pixmap, TexViewerDia
 from polvista.widgets import (
     ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDEST_UNIT, ModelPlot, StokesPlot, RMSynthPlot)
 from polvista.sampling import SamplingMixin, warm_up_sampling_imports
-from polvista.measurements import MeasurementsMixin
+from polvista.measurements import MeasurementsMixin, DEFAULT_BANDS_BY_PRESET
 from polvista.rm_synthesis import compute_faraday_spectrum, phi_axis_half_width, FaradaySpectrumError
 
 # pymultinest (Bayesian/nested-sampling fitting) is an optional dependency --
@@ -93,8 +90,7 @@ from polvista.rm_synthesis import compute_faraday_spectrum, phi_axis_half_width,
 
 
 # QU-fitting holds epsilon fixed at this value (see MainWindow.run_fit) --
-# q, u data alone can't constrain it (see spectral_weights) and this
-# app only does QU fitting so far.
+# q, u data alone can't constrain it (see spectral_weights).
 FIT_FIXED_EPSILON = 0.5
 
 # Figure default parameters
@@ -110,28 +106,18 @@ mpl.rcParams['font.size'] = 16
 # treating it as a model to plot; see open_custom_model_dialog.
 CUSTOM_MODEL_SENTINEL = object()
 
-# A QSlider's own SLIDER_STEPS resolution means almost every pixel of a drag
-# fires a fresh valueChanged -- each wired (via request_update_plot, not
-# update_plot directly) to a full model evaluation + matplotlib redraw, which
-# for a custom model (up to a CUSTOM_Z_N_MAX-point LOS quadrature) can't
-# possibly keep up with that event rate. PLOT_THROTTLE_MS caps how often
-# request_update_plot actually redraws: the first event in a burst still
-# redraws immediately (no perceived lag for a single discrete change, e.g. a
-# spin box click), and any further events arriving before the timer elapses
-# just mark the plot dirty and get coalesced into one redraw when it fires --
-# so a fast drag can't queue up more model evaluations than the eye could
-# ever perceive anyway. ~30 Hz is comfortably smooth to the eye while leaving
-# custom models room to keep up.
+# request_update_plot's redraw throttle: the first event in a burst redraws
+# immediately, further events before the timer elapses just mark the plot
+# dirty and coalesce into one redraw when it fires -- otherwise a slider
+# drag's near-every-pixel valueChanged rate would queue up more full model
+# evaluations (esp. a custom model's LOS quadrature) than the eye could
+# ever perceive anyway. ~30 Hz is comfortably smooth.
 PLOT_THROTTLE_MS = 33
 
-# wl_ext's own point count (self.n_points) to use instead, only while a
-# parameter slider is actively being dragged (see on_slider_drag_started/
-# _ended) -- a custom model's own LOS quadrature cost scales with both its
-# resolved z-grid *and* the number of wavelengths it's evaluated at, so
-# capping the latter while the former is being recomputed on every throttled
-# tick keeps a drag responsive even at a high n_points setting. The drag's
-# final tick (sliderReleased) always forces one full-resolution redraw
-# regardless, so the plotted curve never settles at this reduced grid.
+# wl_ext's own point count, capped to this while a slider is actively being
+# dragged (see on_slider_drag_started/_ended) so a custom model's LOS-
+# quadrature-per-wavelength cost stays responsive mid-drag; the drag's
+# final tick (sliderReleased) always forces one full-resolution redraw.
 DRAG_N_POINTS_CAP = 150
 
 # Log-decade ranges for the signed Faraday-depth (phi) and turbulent term (dphi)
@@ -140,18 +126,13 @@ DRAG_N_POINTS_CAP = 150
 PHI_LOG_RANGE = (-6.5, 6.5)
 DPHI_LOG_RANGE = (0.0, 6.5)
 
-# Placeholder q_err/u_err for rmsynth_from_model's noiseless model curve --
-# rm_synthesis.compute_faraday_spectrum only ever uses q_err/u_err in ratios
-# (Briggs relative weighting) or as an overall multiplicative scale
-# (sigma_fdf, the CLEAN threshold), never in absolute terms that would
-# affect the recovered dirty/clean spectrum itself -- so any constant works
-# equally well for "every point weighted equally", but the constant's own
-# absolute size *does* set sigma_fdf/threshold's absolute size. A
-# fractional-polarization curve is typically well under 1 in amplitude, so
-# using 1.0 here (rather than something negligibly small) previously made
-# the plotted sigma_fdf noise line -- and the CLEAN stopping threshold --
-# come out comparable to or larger than the curve's own peak, even though
-# there's no real noise to represent.
+# Placeholder q_err/u_err for rmsynth_from_model's noiseless model curve.
+# compute_faraday_spectrum only uses q_err/u_err in ratios (Briggs relative
+# weighting) or as an overall scale (sigma_fdf/CLEAN threshold) -- any
+# constant gives equal per-point weighting, but its absolute size still
+# sets sigma_fdf's size, so this is small relative to a typical
+# fractional-polarization curve's amplitude rather than ~1 (which made the
+# plotted noise line/CLEAN threshold swamp the curve despite no real noise).
 RMSYNTH_MODEL_WEIGHT = 1e-6
 
 # Linear range for power-law spectral indices
@@ -189,10 +170,20 @@ WAVELENGTH_PRESETS = [
     ('Full MeerKat (8.6 - 70 cm / 500 - 3500 MHz)', 86.0, 700.0),
     ('Full LOFAR (1.25 - 30 m / 10 - 240 MHz)', 1250, 30000),
     ('Full MHz (8.6 cm - 30 m / 10 - 3500 GHz)', 86.0, 30000),
+    ('Full SKA (2 - 86 cm / 350 MHz - 15 GHz)', 20, 860.0),
     ('Full radio (0.25mm - 30 m / 500 MHz - 1200 GHz)', 0.25, 30000),
     ('Full HAWC+ FIR (40 - 250 um / 1.2 - 7.5 THz)', 0.04, 0.25),
     ('Full SPARC4 optical (400 - 1000 nm / 300 - 750 THz)', 4.0e-4, 1.0e-3),
 ]
+
+# Cheap consistency check: every DEFAULT_BANDS_BY_PRESET key is hand-typed
+# to match one of these preset labels exactly (see that dict's own module
+# comment) -- catch a typo/renamed preset here at import time rather than
+# have it silently fall back to a generic single-band default.
+_WAVELENGTH_PRESET_LABELS = {label for label, _lo, _hi in WAVELENGTH_PRESETS}
+assert set(DEFAULT_BANDS_BY_PRESET) <= _WAVELENGTH_PRESET_LABELS, (
+    f'DEFAULT_BANDS_BY_PRESET has key(s) not in WAVELENGTH_PRESETS: '
+    f'{set(DEFAULT_BANDS_BY_PRESET) - _WAVELENGTH_PRESET_LABELS}')
 
 
 def find_column(fieldnames, *names):
@@ -216,15 +207,12 @@ def find_freq_column(fieldnames):
 
 
 def freq_unit_hz_multiplier(header):
-    """Multiplier that converts a frequency column's values to Hz, inferred
-    from a unit annotation in its header (e.g. 'Frequency [GHz]', 'freq_mhz',
-    'nu (kHz)'). This app's own exports don't agree on a single unit --
-    Save Spectra writes 'Frequency [Hz]' (save_spectra_action) while
-    Generate's Export Measurements writes 'Frequency [GHz]'
-    (measurements.py.export_measurements_action) -- so Load Data can't
-    just assume one. Checked most-specific-first since 'hz' is a substring
-    of 'ghz'/'mhz'/'khz'; defaults to Hz (multiplier 1) when no unit is
-    recognized, matching the previous hard-coded assumption."""
+    """Multiplier converting a frequency column's values to Hz, inferred
+    from a unit annotation in its header (e.g. 'Frequency [GHz]',
+    'freq_mhz') -- this app's own exports disagree on units (Save Spectra
+    writes Hz, Export Measurements writes GHz), so Load Data can't assume
+    one. Checked most-specific-first ('hz' is a substring of 'ghz' etc.);
+    defaults to Hz when no unit is recognized."""
     key = header.strip().casefold()
     for unit, mult in (('ghz', 1e9), ('mhz', 1e6), ('khz', 1e3), ('hz', 1.0)):
         if unit in key:
@@ -240,17 +228,12 @@ def find_error_column(fieldnames, base):
 
 
 def load_vapola_csv(path):
-    """Parse a Stokes I/Q/U-vs-frequency CSV (the format Load Data's own
-    load_data_action reads) into (freq [Hz], I, Q, U, I_err, Q_err, U_err),
-    sorted by frequency -- error arrays are None where the CSV has no
-    matching column. Raises ValueError on a missing required column or an
-    empty file.
-
-    Shared by load_data_action (interactive) and
-    sampling.SamplingMixin's qu_fit.py sample import
-    (_load_qu_fit_samples), which needs this same data to re-derive a
-    spectral alpha estimate (see fitting.estimate_alpha) for a run that
-    predates this app's own metadata sidecar and so never recorded one."""
+    """Parse a Stokes I/Q/U-vs-frequency CSV into (freq [Hz], I, Q, U,
+    I_err, Q_err, U_err), sorted by frequency -- error arrays are None
+    where the CSV has no matching column. Raises ValueError on a missing
+    required column or an empty file. Shared by load_data_action and
+    sampling.SamplingMixin's own qu_fit.py sample import
+    (_load_qu_fit_samples)."""
     with open(path, newline='') as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames or []
@@ -533,7 +516,6 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Polvista: POLarization VISualizer Tool for Astronomy')
-        #self.resize(1800, 1000) # size of the window
         self.resize(1500, 700) # size of the window
 
         self.sliders = []
@@ -587,6 +569,17 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
 
+        self._build_left_panel(root)
+        self._build_right_panel(root)
+
+        self.build_menu()
+        self.rebuild_sliders()
+
+    def _build_left_panel(self, root):
+        """Left control panel: wavelength range, model/spectrum choice,
+        parameter sliders (Visualization/Measurements/Sampling tabs), and
+        the Reset/Load/Clear/Fit! row + Results box. Split out of
+        __init__ purely for readability -- see MainWindow's own docstring."""
         # ── Left: model choice, wavelength range, parameter sliders ──────
         # QVBoxLayout stacks its children top-to-bottom -- this is the
         # left-hand control panel's layout.
@@ -825,6 +818,9 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
 
         root.addWidget(left)
 
+    def _build_right_panel(self, root):
+        """Right plot panel: the equation card, custom-model resolution
+        warning, and the p/EVPA, Stokes I/Q/U, and RM-synth plot tabs."""
         # ── Right: equation card, toolbar, matplotlib canvas ─────────────
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -959,9 +955,6 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.plot_tabs.addTab(rmsynth_tab, 'RM-synth')
         right_layout.addWidget(self.plot_tabs, stretch=1)
         root.addWidget(right, stretch=1)
-
-        self.build_menu()
-        self.rebuild_sliders()
 
     def on_model_combo_changed(self, index):
         """model_combo's own slot: opens the custom-model builder when its
@@ -1191,17 +1184,14 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         Spectrum box's SSA/thermal turnover-frequency controls -- see
         _build_ui, which builds one or two of these depending on the
         current model's component count (see sync_spectrum_ui).
-        `default_ghz` is applied (and its own valueChanged wired up) only
-        after construction, so building the slider itself can't
-        prematurely fire the app-level handler.
 
-        Starts *fixed* (checkbox checked) -- at its default (~1% of the
+        Starts *fixed* (checkbox checked): at its default (~1% of the
         band's own nu_min, deep in the optically-thin regime), a fit
-        should start out assuming there's no turnover in view and only fit
-        alpha; the user frees this slider (unchecks it) to let a fit
-        jointly solve for nu_0 too (see MainWindow.fit_spectrum_lsq -- note
-        this joint solve only happens for 'ssa'; a 'thermal' component's
-        nu_0/T are always taken as-is from these sliders, never fit)."""
+        should assume there's no turnover in view and only fit alpha;
+        unchecking it lets a fit jointly solve for nu_0 too (only for
+        'ssa' -- see fit_spectrum_lsq; 'thermal' never fits nu_0/T).
+        build_temp_slider/build_beta_slider start fixed for the same
+        reason, since fitting never solves for T/beta at all."""
         sl = ParamSlider(Param('nu0', latex, 'nu0', description), lo_ghz, hi_ghz)
         sl.set_value(default_ghz)
         sl.fix_checkbox.setChecked(True)
@@ -1209,13 +1199,8 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         return sl
 
     def build_temp_slider(self, lo_k, hi_k, default_k, latex, description):
-        """One T ParamSlider (log-scale, like build_nu0_slider) for the
-        Spectrum box's thermal electron-temperature controls -- see
-        _build_ui/sync_spectrum_ui. Starts *fixed*, like the nu_0 sliders:
-        least-squares fitting never solves for a thermal component's own
-        T (see fit_spectrum_lsq), so there's no "let the fit vary this"
-        state to default to -- the checkbox only matters in that it keeps
-        this slider visually consistent with nu_0's own default."""
+        """One T ParamSlider (log-scale) for the Spectrum box's thermal
+        electron-temperature controls -- see build_nu0_slider."""
         sl = ParamSlider(Param('temp', latex, 'temp', description), lo_k, hi_k)
         sl.set_value(default_k)
         sl.fix_checkbox.setChecked(True)
@@ -1223,12 +1208,8 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         return sl
 
     def build_beta_slider(self, lo, hi, default, latex, description):
-        """One beta ParamSlider (linear, 'scale' kind -- same generic
-        slider used for e.g. Tribble's s or the covering fraction f, since
-        beta doesn't need nu_0/temp's log-scale) for the Spectrum box's
-        log-parabola curvature controls -- see _build_ui/sync_spectrum_ui.
-        Starts *fixed*, like the nu_0/T sliders, for the same reason: beta
-        is never solved for during fitting (see fit_spectrum_lsq)."""
+        """One beta ParamSlider (linear, 'scale' kind) for the Spectrum
+        box's log-parabola curvature controls -- see build_nu0_slider."""
         sl = ParamSlider(Param('beta', latex, 'scale', description), lo, hi)
         sl.set_value(default)
         sl.fix_checkbox.setChecked(True)
@@ -1805,6 +1786,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         try:
             best_pars, result = qu_fit(wl, q, q_err, u, u_err, func, pars, (lo, hi), fixed=fixed)
         except Exception as e:
+            traceback.print_exc()
             QMessageBox.warning(self, 'Fitting', f'Fit failed:\n{e}')
             return None
 

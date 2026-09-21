@@ -1,0 +1,44 @@
+{
+  "model": "custom_custom_model",
+  "parameters": {
+    "p0": 0.10003000000000001,
+    "X_0": 0.0,
+    "phi0": 1864.5203891005938,
+    "Delta": 0.7853981633974483,
+    "Z": 0.5,
+    "a": 1.0,
+    "alpha": -0.5
+  },
+  "spectral_shape": "ssa",
+  "nu0_ghz": 1.0006223244179047,
+  "custom_definition": {
+    "label": "Field flip",
+    "title": "Field flip",
+    "emiss_expr": "p0 * exp(2 * i * (chi0+Delta*(z+1)/a))",
+    "phi_expr": "phi0*gaussian(0,Z)*z",
+    "param_specs": {
+      "Delta": [
+        "X",
+        -1.5707963267948966,
+        1.5707963267948966,
+        ""
+      ],
+      "Z": [
+        "scale",
+        0.0,
+        1.0,
+        ""
+      ],
+      "a": [
+        "scale",
+        0.0,
+        2.0,
+        ""
+      ]
+    },
+    "j_lo": "-1",
+    "j_hi": "0",
+    "p_lo": "-1",
+    "p_hi": "1"
+  }
+}

@@ -1,21 +1,10 @@
 """CustomModel -- the "Build Custom Model" window (see app.py's Models
-menu action / "Custom model..." dropdown entry). Lets a user type j_p(z)
-(the polarized emissivity envelope -- may reference the standard p0/chi0
-sliders directly, see models.build_custom_model's own module comment) and
-phi'(z) (the Faraday-depth *density*, may reference phi0 -- see models.
-build_custom_model's own module comment for why this isn't phi(z) itself)
-expressions for the general, normalized Sokoloff et al. 1998 (eq. 1) /
-Burn 1966 line-of-sight integral (see models.build_custom_model), discover
-the new constants those expressions introduce (beyond p0/chi0/phi0), pick
-each one's Kind (which auto-sets its bounds to that kind's own usual range
--- see KIND_DEFS) and a preview value to evaluate it at, preview
-j_p(z)/phi'(z)/phi(z) over the line of sight, and register the result
-as a new selectable model. j_p(z)'s own frequency dependence beyond
-whatever it references directly (the 'nu'/'lambda' symbols, see the intro
-text below) isn't set here -- that's the main window's existing Spectrum
-box (Power-law/SSA/Thermal/Log-parabola + alpha), applied on top exactly
-as it is for every other single-component model, once the custom model is
-selected there."""
+menu action / "Custom model..." dropdown entry). Lets a user type j_p(z)/
+phi'(z) expressions for the general, normalized line-of-sight integral
+(see models.build_custom_model), discover the new constants those
+expressions introduce, pick each one's Kind/bounds/preview value (see
+KIND_DEFS), preview j_p(z)/phi'(z)/phi(z) over the line of sight, and
+register the result as a new selectable model."""
 import functools
 import numpy as np
 from PyQt5.QtCore import Qt
@@ -35,33 +24,22 @@ from polvista.models import (
     CUSTOM_P0_BOUNDS, CUSTOM_PHI0_BOUNDS, SPECTRAL_BOUNDS_LO_SINGLE, SPECTRAL_BOUNDS_HI_SINGLE,
     TEMP_BOUNDS_K, BETA_BOUNDS)
 from polvista.latex_stuff import LATEX_DPI, fit_equation_pixmap, latex_pixmap, pixmap_to_img_tag
+from polvista.widgets import apply_fixed_margins
 
 DEFAULT_PREVIEW_LAMBDA_MM = 3.0  # fallback when parent has no wl_min/wl_max to derive one from
 
-# p0/chi0/phi0's own preview values -- j_p(z)/phi'(z) can now reference
-# these three standard sliders directly (see models.py's own module comment
-# above build_custom_model), but the builder dialog itself has no slider
-# for them (those only exist once a model is actually registered and
-# selected in the main window) -- so the j_p(z)/j(z)/phi'(z)/phi(z) preview
-# plot (see refresh_preview) needs *some* fixed value to evaluate them at.
-# Matches KIND_DEFS's own 'Fraction'/'Angle'/'Depth' preview_disp defaults
-# (physical units: a 0-1 fraction, radians, rad/m^2) -- the same preview
-# magnitudes p0/chi0/phi0 would get if they were ever offered as one of
-# those Kinds themselves.
-# nu0/alpha/T/beta's own preview values -- same reasoning as CUSTOM_P0_PREVIEW
-# et al. above, but for the builder's own preview-only Spectral-model
-# dropdown (see _build_ui): when it's set to SSA/Thermal, refresh_preview
-# needs *some* fixed turnover-frequency/spectral-index/temperature/curvature
-# to evaluate models.preview_los_profiles's own opacity term at, since (like
-# p0/chi0/phi0) there are no real sliders for these yet at Define-time --
-# the real values only exist once this model is registered and selected in
-# the main window, where its actual opacity behavior is governed by the main
-# window's own live Spectrum box, not this dropdown (see the dropdown's own
-# tooltip). CUSTOM_NU0_PREVIEW [MHz] is a mid-band-ish placeholder (~10 cm);
-# CUSTOM_ALPHA_PREVIEW is a typical optically-thin synchrotron index;
-# CUSTOM_TEMP_PREVIEW [K] a typical HII-region electron temperature;
-# CUSTOM_BETA_PREVIEW unused by SSA/Thermal (only 'logparabola', which this
-# dropdown never previews opacity for) but still passed through for symmetry.
+# Fixed pixel margins for the stacked emiss/phi preview axes, applied via
+# widgets.apply_fixed_margins (hspace pinned to 0 there, unlike
+# tight_layout() which would recompute it).
+PREVIEW_MARGINS_PX = dict(left=85, right=15, bottom=65, top=10)
+
+# Fixed preview values for p0/chi0/phi0 and nu0/alpha/T/beta -- j_p(z)/
+# phi'(z) (and, for SSA/Thermal, the opacity term) can reference these
+# standard sliders directly, but the builder dialog has no real slider for
+# them until the model is registered/selected in the main window, so
+# refresh_preview needs some fixed value to evaluate them at meanwhile.
+# nu0/alpha/T/beta's own live values come from the main window's Spectrum
+# box once selected there, not this dialog's preview-only dropdown.
 CUSTOM_NU0_PREVIEW = 3000.0
 CUSTOM_ALPHA_PREVIEW = -0.7
 CUSTOM_TEMP_PREVIEW = 1e4
@@ -82,16 +60,12 @@ COL_NAME, COL_KIND, COL_LO, COL_HI, COL_PREVIEW, COL_DESC = range(6)
 LOCKED_ROW_BG = QColor(224, 224, 224)
 
 # Kind dropdown label -> (Param.kind, display<->physical conversion,
-# default (lo, hi) and preview value *in display units*). 'Fraction'/'Angle'
-# are shown/typed in the same user-facing units app.ParamSlider itself
-# displays for 'p'/'X' (percent, degrees) even though the physical value
-# threaded through to the model (and stored in spec.bounds) is a 0-1
-# fraction / radians -- 'Depth'/'Dispersion'/'Number' have no such split,
-# display units are the physical ones. Preview defaults are deliberately
-# away from 0 where a typical expression would divide by the constant (a
-# width, say) -- the bound-*midpoint* this dialog used to preview at was 0
-# by construction for any kind symmetric about 0, which is exactly the
-# singularity a width-like constant hits.
+# default (lo, hi) and preview value in display units). 'Fraction'/'Angle'
+# use the same user-facing display units as app.ParamSlider's 'p'/'X'
+# (percent, degrees) though the physical value is a 0-1 fraction/radians;
+# the rest have no such split. Preview defaults are deliberately away from
+# 0 (a bound-midpoint preview would sit at 0 for any kind symmetric about
+# it -- the exact singularity a width-like constant used as a divisor hits).
 KIND_DEFS = {
     'Fraction': dict(model_kind='p', to_phys=lambda d: d / 100.0, to_disp=lambda p: p * 100.0,
                       bounds_disp=(0.0, 100.0), preview_disp=10.0),
@@ -118,28 +92,15 @@ KIND_DEFS = {
 MODEL_KIND_TO_LABEL = {d['model_kind']: label for label, d in KIND_DEFS.items()}
 DEFAULT_KIND_LABEL = 'Number'
 
-# The always-present p0/chi0/phi0 sliders (see models.py's own module
-# comment above build_custom_model) plus the Spectrum box's own
-# nu0/alpha/T/beta -- shown as locked rows at the top of the constants
-# table (see CustomModel._sync_locked_rows) purely for reference (their
-# Kind/bounds/Description are fixed elsewhere -- CUSTOM_P0_BOUNDS, the
-# main window's own SSA/Thermal sliders, etc. -- editing them here
-# wouldn't do anything, so those cells are non-editable), with a genuinely
-# editable Preview value that -- unlike a real discovered constant's --
-# feeds refresh_preview directly in place of a fixed module constant, so
-# the builder's own preview plot/equation can be explored at different
-# p0/chi0/phi0/nu0/alpha/T/beta without editing code.
-#
-# `lo_disp`/`hi_disp` None means "no single fixed pair to show" -- nu0's
-# own real bounds are dynamically derived from the current wavelength
-# range (see app.NU0_BOUNDS_MULT), not a fixed constant, so its row just
-# shows an em dash instead of duplicating that calculation here.
-#
-# `relevant(shape)` decides whether this row is shown at all for the
-# Spectral-model dropdown's current selection -- mirrors app.py's own
-# rebuild_sliders visibility exactly (nu0 needs SSA/Thermal, T needs
-# Thermal, beta needs Log-parabola, alpha is hidden only for Thermal,
-# where intensity_shape's own alpha argument is inert).
+# The always-present p0/chi0/phi0 sliders plus the Spectrum box's own
+# nu0/alpha/T/beta, shown as read-only locked rows at the top of the
+# constants table (CustomModel._sync_locked_rows) for reference -- only
+# Preview value is editable there, feeding refresh_preview directly.
+# `lo_disp`/`hi_disp` None means nu0's bounds are dynamic (derived from the
+# current wavelength range, see app.NU0_BOUNDS_MULT), so its row shows an
+# em dash instead. `relevant(shape)` mirrors app.py's rebuild_sliders
+# visibility (nu0 needs SSA/Thermal, T needs Thermal, beta needs
+# Log-parabola, alpha is hidden only for Thermal).
 LOCKED_PARAM_ROWS = [
     dict(name='p0', kind_text='Fraction', to_phys=KIND_DEFS['Fraction']['to_phys'],
          lo_disp=CUSTOM_P0_BOUNDS[0] * 100.0, hi_disp=CUSTOM_P0_BOUNDS[1] * 100.0,
@@ -170,20 +131,9 @@ LOCKED_PARAM_ROWS = [
 
 
 def _intro_math(latex, dpi, fontsize=13):
-    """<img> tag rendering `latex` via the same mathtext pipeline
-    ParamSlider uses for its own parameter-name labels (`latex_stuff.
-    latex_pixmap`, rendered here with a transparent background and wrapped
-    for inline use by `latex_stuff.pixmap_to_img_tag` -- the same two
-    functions TexViewerDialog composes for its own inline math, just at a
-    fixed size since this QLabel never zooms).
-
-    `dpi` -- see `_intro_html` -- is threaded through to `latex_pixmap` so
-    the raster actually has enough pixels for the screen it's shown on;
-    `pixmap_to_img_tag` is what turns that oversampling into on-screen
-    sharpness rather than just a bigger image (it sizes the <img>'s CSS
-    box down by the same devicePixelRatio latex_pixmap attached, so more
-    dpi means more pixels *within* the same displayed size, not a bigger
-    image)."""
+    """<img> tag rendering `latex` as inline mathtext at `dpi` (see
+    latex_stuff.latex_pixmap/pixmap_to_img_tag, the same pair
+    TexViewerDialog uses for its own inline math)."""
     pixmap = latex_pixmap(latex, fontsize=fontsize, facecolor=None, dpi=dpi)
     return pixmap_to_img_tag(pixmap, pixmap.devicePixelRatio(), inline=True)
 
@@ -296,14 +246,9 @@ def _math_field_label(latex, dpi, fontsize=13):
 
 
 def _bound_edit(default_text):
-    """A plain QLineEdit for one j_lo/j_hi/p_lo/p_hi integration-bound
-    field -- a free-form math expression (see parse_custom_expr), exactly
-    like emiss_edit/phi_edit, not restricted to a bare float any more. A
-    plain number (e.g. '-1', still every default here) behaves exactly as
-    it always did; an expression referencing a *new* constant (e.g.
-    '3*w') is what promotes that constant into a discovered param with its
-    own slider -- see models.discover_custom_params. `default_text` is
-    just the field's initial text."""
+    """QLineEdit for one j_lo/j_hi/p_lo/p_hi integration-bound field -- a
+    free-form math expression (see parse_custom_expr), not restricted to a
+    bare float; `default_text` is its initial text."""
     return QLineEdit(default_text)
 
 
@@ -319,33 +264,21 @@ def _bound_text(value):
 class CustomModel(QDialog):
     """On accept (Define/Update Model), self.model_func holds the newly
     built and registered model function (see models.build_custom_model);
-    None if the dialog was cancelled. `existing_def`, if given, pre-fills
-    every field and the preview instead of starting blank -- either
-    re-opening a custom model previously loaded from a saved
-    'custom_definition' JSON block (see app.py's load_model_action), or
-    editing one already selected in the current session (see
-    app.py's edit_custom_model_menu_action).
+    None if cancelled.
 
-    `edit_func`, if given (the currently-registered function this dialog is
-    editing -- app.py's Models menu "Edit Custom Model..." entry, not the
-    plain "Custom model..."/"Build Custom Model..." paths, which always
-    leave it None), makes on_define() pass edit_func.__name__ through to
-    build_custom_model's own `name` so the edited model *replaces* the
-    original registration in place (same MODELS_BY_NAME key) instead of
-    minting a new one alongside it -- app.py's caller still has to swap the
-    combo row's own itemData/text over to the freshly-returned function
-    object itself, since build_custom_model always returns a brand new
-    closure even when reusing the same name.
-
-    `initial_spectral_shape`, if given, is the key (see SPECTRAL_SHAPES)
-    the (preview-only) Spectral-model dropdown opens on instead of always
-    defaulting to 'powerlaw' -- app.py's edit_custom_model_menu_action
-    passes the main window's own live Spectrum-box shape for the model
-    being edited, so re-opening it to edit doesn't visually revert opacity
-    off (in the equation card/preview here) when it's actually still on
-    for this model in the main window. Left None for the plain "Custom
-    model..."/"Build Custom Model..." paths, which have no existing model
-    -- and so no live shape -- to inherit one from."""
+    Args:
+      existing_def: prefill every field/preview from a saved
+        'custom_definition' block or an already-selected custom model,
+        instead of starting blank.
+      edit_func: the currently-registered function this dialog is editing
+        (Models menu "Edit Custom Model..."); makes on_define() replace
+        that registration in place (same MODELS_BY_NAME key) instead of
+        minting a new one. None for the plain "Custom model..."/"Build
+        Custom Model..." paths.
+      initial_spectral_shape: the (preview-only) Spectral-model dropdown's
+        starting key (see SPECTRAL_SHAPES), so re-opening a model to edit
+        doesn't visually revert its opacity term off. None when there's no
+        existing model to inherit a live shape from."""
 
     def __init__(self, parent=None, existing_def=None, edit_func=None, initial_spectral_shape=None):
         super().__init__(parent)
@@ -428,7 +361,6 @@ class CustomModel(QDialog):
                             'directly in j_p(z)/φ\'(z).')
         self.emiss_edit = QLineEdit()
         self.emiss_edit.setText(CUSTOM_EMISS_DEFAULT)
-        #self.emiss_edit.setPlaceholderText('e.g. p0*exp(2*i*chi0)*exp(-((z-0.5)/w)**2)')
         self.j_lo_edit = _bound_edit('-1')
         self.j_hi_edit = _bound_edit('1')
         for edit in (self.j_lo_edit, self.j_hi_edit):
@@ -531,11 +463,6 @@ class CustomModel(QDialog):
         # whatever width the other, ResizeToContents/interactive columns
         # don't need, rather than sitting at some arbitrary fixed guess.
         self.table.horizontalHeader().setSectionResizeMode(COL_DESC, QHeaderView.Stretch)
-        #self.table.setToolTip(
-        #    'Kind auto-fills Lower/Upper bound and Preview value with that kind\'s usual range -- '
-        #    'all three stay editable afterward. Preview value (only, not the bounds) is what the '
-        #    "j_p(z)/φ'(z)/φ(z) plots to the right are evaluated at. Description is free text -- "
-        #    "shown as that constant's own slider tooltip once selected in the main window.")
         self.table.itemChanged.connect(self.on_item_changed)
         # How many of the table's own rows, starting at 0, are currently
         # the locked p0/chi0/phi0/nu0/alpha/T/beta rows (see
@@ -574,7 +501,7 @@ class CustomModel(QDialog):
         # table_col competing for the same row and no minimum size of its
         # own, the canvas could otherwise get laid out at only a few
         # pixels tall before the dialog's first real resize settles,
-        # collapsing _apply_preview_margins's own pixel margins down to a
+        # collapsing apply_fixed_margins's own pixel margins down to a
         # near-zero plot area. Setting an explicit floor guarantees it
         # always gets real room.
         self.canvas.setMinimumSize(320, 256)
@@ -679,44 +606,14 @@ class CustomModel(QDialog):
                 parse_custom_expr(self.p_lo_edit.text(), 'p_lo'),
                 parse_custom_expr(self.p_hi_edit.text(), 'p_hi'))
 
-    # Fixed PIXEL margins for the stacked emiss/phi preview axes (see
-    # apply_fixed_margins in widgets.py for the same left/right/bottom/top
-    # -> subplots_adjust fraction technique, used here instead of
-    # tight_layout() specifically so hspace can be pinned to exactly 0 --
-    # tight_layout() recomputes every spacing itself, including hspace,
-    # so anything it's given would just get overridden back to whatever
-    # it thinks the tick/label geometry needs).
-    PREVIEW_MARGINS_PX = dict(left=85, right=15, bottom=65, top=10)
-
-    def _apply_preview_margins(self):
-        """subplots_adjust the two stacked preview axes to PREVIEW_MARGINS_PX
-        with hspace=0 -- ax_emiss's own x tick labels are hidden (see
-        _style_preview_axes) precisely so the two panels can sit flush
-        against each other without redundant sharex labels caught in the
-        gap."""
-        w = max(self.canvas.width(), 1)
-        h = max(self.canvas.height(), 1)
-        m = self.PREVIEW_MARGINS_PX
-        left_px, right_px = m['left'], m['right']
-        bottom_px, top_px = m['bottom'], m['top']
-        if left_px + right_px > 0.8 * w:
-            scale = 0.8 * w / (left_px + right_px)
-            left_px, right_px = left_px * scale, right_px * scale
-        if bottom_px + top_px > 0.8 * h:
-            scale = 0.8 * h / (bottom_px + top_px)
-            bottom_px, top_px = bottom_px * scale, top_px * scale
-        self.fig.subplots_adjust(left=left_px / w, right=1 - right_px / w,
-                                  bottom=bottom_px / h, top=1 - top_px / h, hspace=0.0)
-
     def _style_preview_axes(self):
         self.ax_emiss.set_ylabel(r'$j_p(z)$')
         self.ax_phi.set_ylabel(r"$\phi(z),\ \phi'(z)$")
         self.ax_phi.set_xlabel('z  (-1 = source far-side  →  1 = observer)', fontsize=14)
         self.ax_emiss.set_xlim(-1.0, 1.0)
-        #self.ax_emiss.set_ylim(0.0,)
         self.ax_phi.set_xlim(-1.0, 1.0)
         # sharex=True already keeps the two x-axes in sync -- hide the top
-        # panel's own tick labels so hspace=0 (see _apply_preview_margins)
+        # panel's own tick labels so hspace=0 (see apply_fixed_margins)
         # doesn't jam them into the gap against ax_phi's plot area.
         self.ax_emiss.tick_params(labelbottom=False)
         self.ax_emiss.grid(True)
@@ -767,11 +664,11 @@ class CustomModel(QDialog):
     def resizeEvent(self, event):
         """Keep the equation preview fit to its panel, and the eps/phi
         preview plots' own margins fit to *their* panel, across a dialog
-        resize -- _apply_preview_margins only knows the canvas's size as
-        of the moment it's called, so without this it stays stale at
-        whatever (likely too-small, pre-layout) size the canvas had at the
-        first draw, leaving the plots visibly not filling the space Qt
-        actually gave them."""
+        resize -- apply_fixed_margins only knows the canvas's size as of
+        the moment it's called, so without this it stays stale at whatever
+        (likely too-small, pre-layout) size the canvas had at the first
+        draw, leaving the plots visibly not filling the space Qt actually
+        gave them."""
         super().resizeEvent(event)
         try:
             emiss_expr = parse_custom_expr(self.emiss_edit.text(), 'j_p(z)')
@@ -780,7 +677,7 @@ class CustomModel(QDialog):
             pass
         else:
             self.refit_dialog_equation(emiss_expr, phi_expr)
-        self._apply_preview_margins()
+        apply_fixed_margins(self.fig, self.canvas, extra_adjust={'hspace': 0.0}, margins=PREVIEW_MARGINS_PX)
         self.canvas.draw_idle()
 
     def _row_state(self, row):
@@ -1114,7 +1011,7 @@ class CustomModel(QDialog):
         self.ax_phi.legend(fontsize=8, loc='best')
         self.ax_phi.hlines(0, xmin=-1, xmax=1, linestyle='dashed',color='k')
         self._style_preview_axes()
-        self._apply_preview_margins()
+        apply_fixed_margins(self.fig, self.canvas, extra_adjust={'hspace': 0.0}, margins=PREVIEW_MARGINS_PX)
         # A synchronous draw() (not draw_idle()'s deferred repaint) so the
         # preview always reflects what was just typed/selected the moment
         # this returns, regardless of the surrounding event-loop state --
