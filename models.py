@@ -351,17 +351,17 @@ def comp2mixdep(x, params):
     return spectral_combine(x, term1, term2, eps, alpha1, alpha2)
 
 
-def legacy_sum_combine(term1, term2):
+def classic_sum_combine(term1, term2):
     """Plain per-component sum P = term1 + term2 -- the two-component
     convention ~/Downloads/pipe/qu_fit.py's own comp2RMdep/comp2mixdep (and
     their "no dep"/"mid" dphi-reduced variants) always used, unlike this
     app's own spectral_combine (an eps-weighted *convex* combination,
     (w1*term1+w2*term2)/(w1+w2)).
 
-    Used only by the *_legacy model variants below, which exist solely so
-    sampling.SamplingMixin's qu_fit.py sample-import path
-    (_load_qu_fit_samples) can re-read one of those runs' own p1/p2
-    samples unchanged. Feeding them through spectral_combine's own formula
+    Used by the *_classic model variants below -- selectable from the
+    Model dropdown like any other, and also what sampling.SamplingMixin's
+    qu_fit.py sample-import path (_load_qu_fit_samples) maps a qu_fit.py
+    run to, so it can re-read that run's own p1/p2 samples unchanged. Feeding them through spectral_combine's own formula
     instead would need each doubled to compensate (at eps=0.5 with
     alpha1=alpha2, spectral_combine's average is exactly half this plain
     sum) -- which pushes them past this model's own registered p bounds
@@ -372,33 +372,43 @@ def legacy_sum_combine(term1, term2):
     return term1 + term2
 
 
-def comp2RMdep_legacy(x, params):
+def comp2RMdep_classic(x, params):
     """Two-component external Faraday screen with turb, combined via
-    legacy_sum_combine rather than spectral_combine (11 pars, same layout
-    as comp2RMdep: p1,X1,phi1,dphi1,p2,X2,phi2,dphi2,eps,alpha1,alpha2) --
-    eps/alpha1/alpha2 are inert for this P(lambda) formula itself (kept
-    only so stokes_I()'s own I(nu) display shape, and every other piece of
-    this app that assumes a two-component model always has these 3
-    trailing params, still works unchanged). See legacy_sum_combine's own
-    docstring for why this variant exists -- hidden from the Model
-    dropdown (ModelSpec.hidden); only ever reached by loading a qu_fit.py
-    '2 Ext'/'2 Ext dep'/'2 Ext dep1' run (sampling.QU_FIT_MODEL_MAP)."""
-    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, eps, alpha1, alpha2 = params
+    classic_sum_combine rather than spectral_combine (9 pars: p1,X1,phi1,
+    dphi1,p2,X2,phi2,dphi2,alpha). With no per-component spectral
+    weighting in this P(lambda) formula, it's registered as a
+    single-spectral-component model (n_components=1): one alpha that only
+    shapes stokes_I()'s own I(nu) display, like any single-component
+    model's. See classic_sum_combine's own docstring for why this variant
+    exists -- reached by loading a qu_fit.py '2 Ext'/'2 Ext dep'/
+    '2 Ext dep1' run (sampling.QU_FIT_MODEL_MAP)."""
+    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, alpha = params
     term1 = ext_term(x, p1, X1, phi1, dphi1)
     term2 = ext_term(x, p2, X2, phi2, dphi2)
-    return legacy_sum_combine(term1, term2)
+    return classic_sum_combine(term1, term2)
 
 
-def comp2mixdep_legacy(x, params):
+def comp2mixdep_classic(x, params):
     """One internal + one external Faraday component, combined via
-    legacy_sum_combine rather than spectral_combine (11 pars, same layout
-    as comp2mixdep). See comp2RMdep_legacy's own docstring -- only ever
-    reached by loading a qu_fit.py 'Int+Ext'/'Int+Ext dep'/'Int+Ext dep1'/
-    'Int+Ext dep2' run."""
-    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, eps, alpha1, alpha2 = params
+    classic_sum_combine rather than spectral_combine (9 pars, same layout
+    as comp2RMdep_classic). See comp2RMdep_classic's own docstring -- reached
+    by loading a qu_fit.py 'Int+Ext'/'Int+Ext dep' run."""
+    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, alpha = params
     term1 = int_term(x, p1, X1, phi1, dphi1)
     term2 = ext_term(x, p2, X2, phi2, dphi2)
-    return legacy_sum_combine(term1, term2)
+    return classic_sum_combine(term1, term2)
+
+
+def comp2intern_classic(x, params):
+    """Two internal Faraday components, combined via classic_sum_combine
+    rather than spectral_combine (9 pars, same layout as
+    comp2RMdep_classic). See comp2RMdep_classic's own docstring -- no
+    qu_fit.py import maps here (see sampling.QU_FIT_MODEL_MAP's note on
+    '2_Int')."""
+    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, alpha = params
+    term1 = int_term(x, p1, X1, phi1, dphi1)
+    term2 = int_term(x, p2, X2, phi2, dphi2)
+    return classic_sum_combine(term1, term2)
 
 
 # Each two-component model's own per-component (term1, term2) building
@@ -409,17 +419,7 @@ COMPONENT_TERM_FUNCS = {
     comp2RMdep: (ext_term, ext_term),
     comp2intern: (int_term, int_term),
     comp2mixdep: (int_term, ext_term),
-    comp2RMdep_legacy: (ext_term, ext_term),
-    comp2mixdep_legacy: (int_term, ext_term),
 }
-
-# The *_legacy models' own P(lambda) is legacy_sum_combine's plain sum, not
-# spectral_combine's eps-weighted blend -- stokes_components() (below)
-# branches on membership here to decompose I1/Q1/U1, I2/Q2/U2 consistently
-# with that (so they still sum back to stokes_I/stokes_QU's own total)
-# instead of applying spectral_combine's own w1/w2 fractions, which would
-# not.
-LEGACY_SUM_MODELS = {comp2RMdep_legacy, comp2mixdep_legacy}
 
 
 def evpa(fit):
@@ -506,31 +506,11 @@ def stokes_components(wl, model, pars, nu_min=None):
     stokes_I(...)'s own output and (Q1+Q2, U1+U2) equals stokes_QU(...)'s
     -- each component's own term (see COMPONENT_TERM_FUNCS) weighted by
     its own share (w1 or w2, see spectral_weights) of the same raw_ref
-    normalization stokes_I anchors the total to.
-
-    A LEGACY_SUM_MODELS member's own P(lambda) is legacy_sum_combine's
-    plain term1+term2, not spectral_combine's w1/w2-weighted blend -- so
-    it's decomposed differently: each component gets the *full* stokes_I
-    total (Q1=term1.real*I_total etc.), still summing back to stokes_QU's
-    own total exactly (term1+term2=fit), with I1/I2 only an amplitude-
-    proportional (|term1|:|term2|) split of that same total for a
-    visually sensible pair of dashed Stokes-I lines -- not a physically
-    separate per-component intensity, since this model's P formula never
-    defines one."""
+    normalization stokes_I anchors the total to."""
     term1_func, term2_func = COMPONENT_TERM_FUNCS[model]
     p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, eps, alpha1, alpha2 = pars
     term1 = term1_func(wl, p1, X1, phi1, dphi1)
     term2 = term2_func(wl, p2, X2, phi2, dphi2)
-
-    if model in LEGACY_SUM_MODELS:
-        I_total = stokes_I(wl, 2, pars, nu_min=nu_min)
-        amp1, amp2 = np.abs(term1), np.abs(term2)
-        denom = amp1 + amp2
-        denom = np.where(denom == 0, 1.0, denom)
-        I1, I2 = I_total * amp1 / denom, I_total * amp2 / denom
-        Q1, U1 = term1.real * I_total, term1.imag * I_total
-        Q2, U2 = term2.real * I_total, term2.imag * I_total
-        return (I1, Q1, U1), (I2, Q2, U2)
 
     nu = C / wl / 1e6  # MHz
     if nu_min is None:
@@ -582,12 +562,9 @@ class ModelSpec:
     # True excludes this model from the Model dropdown at startup (see
     # app.MainWindow._build_ui) -- still a full MODELS/MODELS_BY_NAME
     # citizen otherwise, so everything keyed off those (sliders, corner
-    # tab, save/load) works unchanged once it's actually in use. Only the
-    # *_legacy two-component models currently set this (see
-    # comp2RMdep_legacy's own docstring) -- they exist solely for
-    # sampling.SamplingMixin's qu_fit.py sample-import path to select
-    # programmatically, not something to fit fresh from the dropdown, so
-    # they'd otherwise just clutter it for every user. Mirrors a custom
+    # tab, save/load) works unchanged once it's actually in use. No
+    # built-in model currently sets this (the *_classic two-component
+    # models used to, before they were exposed in the dropdown). Mirrors a custom
     # model built at runtime (build_custom_model), which also isn't in the
     # dropdown until app.MainWindow.open_custom_model_dialog inserts it --
     # see sampling.SamplingMixin.on_load_samples_finished for the
@@ -735,8 +712,32 @@ register(partial2,
     equation=r'$P(\lambda)=p_0\,e^{2i\chi_0}\left\{f\left[\frac{1-e^{-\left(2\sigma_\phi^2\lambda^4-2i\phi\lambda^2\right)}}{2\sigma_\phi^2\lambda^4-2i\phi\lambda^2}\right]+(1-f)\right\}$')
 
 
+# ── qu_fit.py-style ("classic") two-component variants ────────────────────
+# Same polarization params/bounds as comp2RMdep/comp2mixdep above (so a
+# loaded qu_fit.py run's own p1/p2 samples are never out of range -- see
+# classic_sum_combine's docstring), just classic_sum_combine's plain sum
+# instead of spectral_combine's eps-weighted blend. No spectral weighting,
+# so a single spectral component (one alpha, n_components=1) rather than
+# comp2RMdep's eps/alpha1/alpha2.
+register(comp2RMdep_classic,
+    label='2 External screens (classic)', title='2 External components (classic)',
+    params=[Param('p_1', r'$p_1$', 'p', "Component 1's intrinsic fractional polarization."),
+            Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
+            Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
+            Param('dphi1', r'$\sigma_{\phi,1}$', 'dphi', "Component 1's Faraday depth dispersion across its external screen."),
+            Param('p_2', r'$p_2$', 'p', "Component 2's intrinsic fractional polarization."),
+            Param('X_2', r'$\chi_2$', 'X', "Component 2's intrinsic EVPA at lambda=0."),
+            Param('phi2', r'$\phi_2$', 'phi', "Component 2's Faraday depth (RM-like)."),
+            Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its external screen.")] + spectral_param_single(),
+    bounds=([0, -np.pi / 2, -5e6, 1, 0, -np.pi / 2, -5e6, 1] + SPECTRAL_BOUNDS_LO_SINGLE,
+            [0.7, np.pi / 2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
+    n_components=1, n_live_points=2500, hidden=False,
+    equation=(r'$P(\lambda)=p_1e^{-\sigma_{\phi,1}^2\lambda^4}e^{\,2i(\chi_1+\phi_1\lambda^2)}'
+              r'+p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
+
+
 register(comp2RMdep,
-    label='2 External screens', title='2 External components',
+    label='2 External screens (weighted)', title='2 External components (weighted)',
     params=[Param('p_1', r'$p_1$', 'p', "Component 1's intrinsic fractional polarization."),
             Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
             Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
@@ -752,8 +753,25 @@ register(comp2RMdep,
               r'+\frac{w_2}{w_1+w_2}p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
 
 
+register(comp2intern_classic,
+    label='2 Internal screens (classic)', title='2 internal components (classic)',
+    params=[Param('p_1', r'$p_1$', 'p', "Component 1's intrinsic fractional polarization."),
+            Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
+            Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
+            Param('dphi1', r'$\sigma_{\phi,1}$', 'dphi', "Component 1's Faraday depth dispersion across its internal screen."),
+            Param('p_2', r'$p_2$', 'p', "Component 2's intrinsic fractional polarization, before Faraday depolarization."),
+            Param('X_2', r'$\chi_2$', 'X', "Component 2's intrinsic EVPA at lambda=0."),
+            Param('phi2', r'$\phi_2$', 'phi', "Component 2's Faraday depth (RM-like)."),
+            Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its internal screen.")] + spectral_param_single(),
+    bounds=([0, -np.pi / 2, -5e6, 1, 0, -np.pi / 2, -5e6, 1] + SPECTRAL_BOUNDS_LO_SINGLE,
+            [0.7, np.pi / 2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
+    n_components=1, n_live_points=2500, hidden=False,
+    equation=(r'$P(\lambda)=p_1\,e^{2i\chi_1}\left[\frac{1-e^{-\left(2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2\right)}}{2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2}\right]'
+              r'+p_2\,e^{2i\chi_2}\left[\frac{1-e^{-\left(2\sigma_{\phi,2}^2\lambda^4-2i\phi_2\lambda^2\right)}}{2\sigma_{\phi,2}^2\lambda^4-2i\phi_2\lambda^2}\right]$'))
+
+
 register(comp2intern,
-    label='2 Internal screens', title='2 internal components',
+    label='2 Internal screens (weighted)', title='2 internal components (weighted)',
     params=[Param('p_1', r'$p_1$', 'p', "Component 1's intrinsic fractional polarization."),
             Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
             Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
@@ -769,8 +787,26 @@ register(comp2intern,
     	      r'+\frac{w_2}{w_1+w_2}p_2\,e^{2i\chi_2}\left[\frac{1-e^{-\left(2\sigma_{\phi,2}^2\lambda^4-2i\phi_2\lambda^2\right)}}{2\sigma_{\phi,2}^2\lambda^4-2i\phi_2\lambda^2}\right]$'))
 
 
+
+register(comp2mixdep_classic,
+    label='Internal and external screens (classic)', title='Internal + external components (classic)',
+    params=[Param('p_1', r'$p_1$', 'p', "Component 1's (internal screen) intrinsic fractional polarization."),
+            Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
+            Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
+            Param('dphi1', r'$\sigma_{\phi,1}$', 'dphi', "Component 1's Faraday depth dispersion across its internal screen."),
+            Param('p_2', r'$p_2$', 'p', "Component 2's (external screen) intrinsic fractional polarization."),
+            Param('X_2', r'$\chi_2$', 'X', "Component 2's intrinsic EVPA at lambda=0."),
+            Param('phi2', r'$\phi_2$', 'phi', "Component 2's Faraday depth (RM-like)."),
+            Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its external screen.")] + spectral_param_single(),
+    bounds=([0, -np.pi/2, -5e6, 1, 0, -np.pi/2, -5e6, 1] + SPECTRAL_BOUNDS_LO_SINGLE,
+            [0.7, np.pi/2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
+    n_components=1, n_live_points=2500, hidden=False,
+    equation=(r'$P(\lambda)=p_1\,e^{2i\chi_1}\left[\frac{1-e^{-\left(2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2\right)}}{2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2}\right]'
+              r'+p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
+
+
 register(comp2mixdep,
-    label='Internal and external screens', title='Internal + external components',
+    label='Internal and external screens (weighted)', title='Internal + external components (weighted)',
     params=[Param('p_1', r'$p_1$', 'p', "Component 1's (internal screen) intrinsic fractional polarization."),
             Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
             Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
@@ -785,44 +821,6 @@ register(comp2mixdep,
     equation=(r'$P(\lambda)=\frac{w_1}{w_1+w_2}p_1e^{2i\chi_1}\left[\frac{1-e^{-\left(2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2\right)}}{2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2}\right]'
               r'+\frac{w_2}{w_1+w_2}p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
 
-
-# ── qu_fit.py-import-only ("legacy") two-component variants ────────────────
-# Same params/bounds as comp2RMdep/comp2mixdep above (so a loaded run's own
-# p1/p2 samples are never out of range -- see legacy_sum_combine's
-# docstring), just legacy_sum_combine's plain sum instead of
-# spectral_combine's eps-weighted blend, and hidden from the Model dropdown
-# (see ModelSpec.hidden).
-register(comp2RMdep_legacy,
-    label='2 External screens (qu_fit.py legacy sum)', title='2 External components (legacy sum)',
-    params=[Param('p_1', r'$p_1$', 'p', "Component 1's intrinsic fractional polarization."),
-            Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
-            Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
-            Param('dphi1', r'$\sigma_{\phi,1}$', 'dphi', "Component 1's Faraday depth dispersion across its external screen."),
-            Param('p_2', r'$p_2$', 'p', "Component 2's intrinsic fractional polarization."),
-            Param('X_2', r'$\chi_2$', 'X', "Component 2's intrinsic EVPA at lambda=0."),
-            Param('phi2', r'$\phi_2$', 'phi', "Component 2's Faraday depth (RM-like)."),
-            Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its external screen.")] + spectral_params(),
-    bounds=([0, -np.pi / 2, -5e6, 1, 0, -np.pi / 2, -5e6, 1] + SPECTRAL_BOUNDS_LO,
-            [0.7, np.pi / 2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI),
-    n_components=2, n_live_points=2500, hidden=True,
-    equation=(r'$P(\lambda)=p_1e^{-\sigma_{\phi,1}^2\lambda^4}e^{\,2i(\chi_1+\phi_1\lambda^2)}'
-              r'+p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
-
-register(comp2mixdep_legacy,
-    label='Internal and external screens (qu_fit.py legacy sum)', title='Internal + external components (legacy sum)',
-    params=[Param('p_1', r'$p_1$', 'p', "Component 1's (internal screen) intrinsic fractional polarization."),
-            Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
-            Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
-            Param('dphi1', r'$\sigma_{\phi,1}$', 'dphi', "Component 1's Faraday depth dispersion across its internal screen."),
-            Param('p_2', r'$p_2$', 'p', "Component 2's (external screen) intrinsic fractional polarization."),
-            Param('X_2', r'$\chi_2$', 'X', "Component 2's intrinsic EVPA at lambda=0."),
-            Param('phi2', r'$\phi_2$', 'phi', "Component 2's Faraday depth (RM-like)."),
-            Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its external screen.")] + spectral_params(),
-    bounds=([0, -np.pi/2, -5e6, 1, 0, -np.pi/2, -5e6, 1] + SPECTRAL_BOUNDS_LO,
-            [0.7, np.pi/2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI),
-    n_components=2, n_live_points=2500, hidden=True,
-    equation=(r'$P(\lambda)=p_1\,e^{2i\chi_1}\left[\frac{1-e^{-\left(2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2\right)}}{2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2}\right]'
-              r'+p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
 
 
 # ── Equation-card display: prepend the chosen I'(nu) definition(s) to a

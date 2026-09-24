@@ -29,7 +29,7 @@ never touched: (a, b) is converted back to physical (p, X) before every
 import numpy as np
 from scipy.optimize import least_squares
 
-from polvista.models import MODELS, comp2RMdep, comp2intern, comp2RMdep_legacy, intensity_shape
+from polvista.models import MODELS, comp2RMdep, comp2intern, comp2RMdep_classic, comp2intern_classic, intensity_shape
 
 EPS = 1e-10
 
@@ -358,13 +358,14 @@ from scipy.special import logsumexp
 # (p1,X1,phi1,dphi1) <-> (p2,X2,phi2,dphi2) leaves the model function
 # unchanged, so their raw posterior is doubly degenerate ("label
 # switching") -- every genuine solution appears twice, once under each
-# labeling. comp2mixdep (and comp2mixdep_legacy) is excluded: its two
+# labeling. comp2mixdep (and comp2mixdep_classic) is excluded: its two
 # components use different functional forms (one internal, one external
 # screen), so they're not exchangeable and have no such degeneracy.
-# comp2RMdep_legacy has the same swap symmetry as comp2RMdep itself
-# (legacy_sum_combine's plain term1+term2 is as swap-invariant as
-# spectral_combine's own blend) -- see models.comp2RMdep_legacy.
-DEGENERATE_PAIR_MODELS = {comp2RMdep, comp2intern, comp2RMdep_legacy}
+# comp2RMdep_classic/comp2intern_classic have the same swap symmetry as
+# comp2RMdep/comp2intern themselves
+# (classic_sum_combine's plain term1+term2 is as swap-invariant as
+# spectral_combine's own blend) -- see models.comp2RMdep_classic.
+DEGENERATE_PAIR_MODELS = {comp2RMdep, comp2intern, comp2RMdep_classic, comp2intern_classic}
 
 # Non-winning families below this evidence_share (%) are dropped from
 # `other_families` entirely (folded into `dropped` instead) -- see

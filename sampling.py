@@ -41,10 +41,10 @@ from polvista.widgets import ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDE
 # param indices qu_fit.py held fixed at 0 rather than sampling, and a
 # fitting.load_previous_run degenerate_pair override -- None keeps the
 # default; see its docstring). The two-component entries map to this app's
-# *_legacy models (qu_fit.py's plain-sum convention, not this app's own
-# eps-weighted spectral_combine -- see comp2RMdep_legacy's docstring), and
-# _load_qu_fit_samples re-derives alpha/epsilon (never sampled by
-# qu_fit.py) the same way a fresh Sampling-tab pre-fit would. '2_Int'
+# *_classic models (qu_fit.py's plain-sum convention, not this app's own
+# eps-weighted spectral_combine -- see comp2RMdep_classic's docstring), and
+# _load_qu_fit_samples re-derives alpha (and epsilon, where a model has
+# one; never sampled by qu_fit.py) the same way a fresh Sampling-tab pre-fit would. '2_Int'
 # (comp2intern) is unsupported: qu_fit.py's own MODELS registration for it
 # is internally inconsistent (6 vs. 8 params), so there's no way to tell
 # which convention a real output directory would use.
@@ -53,13 +53,13 @@ QU_FIT_MODEL_MAP = {
     'Internal':      ('intern',             [],     None),
     'Partial':       ('partial',            [],     None),
     'Tribble':       ('tribble',            [],     None),
-    '2_Ext':         ('comp2RMdep_legacy',  [3, 7], None),
-    '2_Ext_dep':     ('comp2RMdep_legacy',  [],     None),
-    '2_Ext_dep1':    ('comp2RMdep_legacy',  [7],    False),
-    'Int_Ext':       ('comp2mixdep_legacy', [3, 7], None),
-    'Int_Ext_dep':   ('comp2mixdep_legacy', [],     True),
-    'Int_Ext_dep1':  ('comp2mixdep_legacy', [7],    False),
-    'Int_Ext_dep2':  ('comp2mixdep_legacy', [3],    False),
+    '2_Ext':         ('comp2RMdep_classic',  [3, 7], None),
+    '2_Ext_dep':     ('comp2RMdep_classic',  [],     None),
+    '2_Ext_dep1':    ('comp2RMdep_classic',  [7],    False),
+    'Int_Ext':       ('comp2mixdep_classic', [3, 7], None),
+    'Int_Ext_dep':   ('comp2mixdep_classic', [],     True),
+    'Int_Ext_dep1':  ('comp2mixdep_classic', [7],    False),
+    'Int_Ext_dep2':  ('comp2mixdep_classic', [3],    False),
 }
 
 
@@ -1782,9 +1782,10 @@ class SamplingMixin:
         # alpha estimated from this source's own I(nu) data (shared by both
         # components for a two-component model -- see estimate_alpha's own
         # docstring for why only one shared value is ever recoverable from
-        # QU-only fitting), epsilon fixed at FIT_FIXED_EPSILON. Both inert
-        # for a *_legacy model's own P(lambda) (legacy_sum_combine ignores
-        # them) -- only stokes_I()'s own I(nu) display shape still uses them.
+        # QU-only fitting), epsilon fixed at FIT_FIXED_EPSILON. The
+        # *_classic models are single-spectral-component (one alpha, no
+        # epsilon) and classic_sum_combine ignores it -- only stokes_I()'s
+        # own I(nu) display shape uses it.
         alpha_val = estimate_alpha(freq, I)
         spectral_pars = {i: alpha_val for i in spec.indices('alpha')}
         eps_indices = spec.indices('eps')
@@ -1802,8 +1803,8 @@ class SamplingMixin:
         model = self.mn_model
         index = self.model_combo.findData(model)
         if index == -1:
-            # A hidden model (ModelSpec.hidden -- currently only the
-            # *_legacy qu_fit.py-import variants, see QU_FIT_MODEL_MAP)
+            # A hidden model (ModelSpec.hidden -- no built-in model
+            # currently sets it, but a custom one may not be added yet)
             # isn't in the dropdown yet; insert it just above the "Custom
             # model..." sentinel row, same as a freshly-built custom model
             # (see app.MainWindow.open_custom_model_dialog), so
