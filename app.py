@@ -69,7 +69,7 @@ from polvista.models import (
     CustomModelError, SPECTRAL_SHAPES, TEMP_BOUNDS_K, BETA_BOUNDS)
 from polvista.build_model import CustomModel
 from polvista.fitting import (
-    qu_fit, estimate_alpha, estimate_ssa_shape, estimate_shape_2comp, fit_statistics,
+    qu_fit, estimate_alpha, estimate_spectral_shape, estimate_shape_2comp, fit_statistics,
     multinest_fit, load_previous_run)
 from polvista.latex_stuff import latex_pixmap, fit_equation_pixmap, TexViewerDialog
 from polvista.widgets import (
@@ -170,7 +170,8 @@ WAVELENGTH_PRESETS = [
     ('Full MeerKat (8.6 - 70 cm / 500 - 3500 MHz)', 86.0, 700.0),
     ('Full LOFAR (1.25 - 30 m / 10 - 240 MHz)', 1250, 30000),
     ('Full MHz (8.6 cm - 30 m / 10 - 3500 GHz)', 86.0, 30000),
-    ('Full SKA (2 - 86 cm / 350 MHz - 15 GHz)', 20, 860.0),
+    ('SKA-Mid (2 - 86 cm / 350 MHz - 15 GHz)', 20, 860.0),
+    ('SKA-Low (86 cm - 6 m / 50 MHz - 350 MHz)', 860, 6000),
     ('Full radio (0.25mm - 30 m / 500 MHz - 1200 GHz)', 0.25, 30000),
     ('Full HAWC+ FIR (40 - 250 um / 1.2 - 7.5 THz)', 0.04, 0.25),
     ('Full SPARC4 optical (400 - 1000 nm / 300 - 750 THz)', 4.0e-4, 1.0e-3),
@@ -1683,24 +1684,25 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         FIT_FIXED_EPSILON (q, u data alone can't constrain it) and alpha
         defaults to a direct regression against the loaded I(nu) data --
         estimate_alpha when every component's shape is 'powerlaw', or a
-        joint (nu_0, alpha) nonlinear regression otherwise (see
-        estimate_ssa_shape/estimate_shape_2comp, and build_nu0_slider for
-        why a component's own nu_0 only joins that regression once its own
-        slider is unchecked -- and only when that component's own shape is
-        'ssa' to begin with, since a power-law component's reference
-        frequency is always the shared band edge, never a free parameter)
-        -- rather than being fit alongside p/X/phi/dphi. For a
-        two-component model, alpha1/alpha2 always end up equal regardless
-        of the two components' own shapes: there's only one real I(nu)
-        dataset, so a single shared spectral index is all QU-only fitting
-        can ever anchor two components to -- same reasoning
-        FIT_FIXED_EPSILON already relies on. Each component's own nu_0 (for
-        whichever of the two is 'ssa') is the exception: it's fit or pinned
-        independently against that same shared-alpha regression, per its
-        own nu0_slider_1/2 fixed checkbox (see estimate_shape_2comp) -- not
-        forced equal to the other component's, since a fixed component's
-        own turnover frequency is meaningful chosen input, not just an
-        unconstrained initial guess.
+        joint nonlinear regression otherwise (see estimate_spectral_shape/
+        estimate_shape_2comp) -- rather than being fit alongside
+        p/X/phi/dphi. That joint regression also picks up each shape's own
+        extra parameter -- nu_0 for 'ssa'/'thermal', T for 'thermal', beta
+        for 'logparabola' -- once its own slider is unchecked (see
+        build_nu0_slider/build_temp_slider/build_beta_slider); a
+        'powerlaw'/'logparabola' component's reference frequency is always
+        the shared band edge, never a free nu_0. For a two-component
+        model, alpha1/alpha2 always end up equal regardless of the two
+        components' own shapes: there's only one real I(nu) dataset, so a
+        single shared spectral index is all QU-only fitting can ever
+        anchor two components to -- same reasoning FIT_FIXED_EPSILON
+        already relies on (dropped entirely when both components are
+        'thermal', where alpha is inert for both). Each component's own
+        nu_0/T/beta is the exception: fit or pinned independently against
+        that same shared-alpha regression, per its own slider's fixed
+        checkbox -- not forced equal to the other component's, since a
+        fixed component's own value is meaningful chosen input, not just
+        an unconstrained initial guess.
 
         Any slider whose fix_checkbox is checked is additionally (or
         instead, for epsilon/alpha) held fixed at its own current value()
@@ -1722,57 +1724,82 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
 
         alpha_indices = spec.indices('alpha')
         shape1, shape2 = self.current_shapes()
-        if spec.n_components == 2 and alpha_indices and (shape1 == 'ssa' or shape2 == 'ssa'):
+        NEEDS_REGRESSION = ('ssa', 'thermal', 'logparabola')
+        if spec.n_components == 2 and alpha_indices and (shape1 in NEEDS_REGRESSION or shape2 in NEEDS_REGRESSION):
             alpha_init = self.sliders[alpha_indices[0]].value()
             nu0_lo_ghz, nu0_hi_ghz = self.nu0_slider_1.bounds()
             nu0_bounds_hz = (nu0_lo_ghz * 1e9, nu0_hi_ghz * 1e9)
-            # Each component's own nu_0 is fit or pinned independently (per
-            # its own slider's fixed checkbox), never forced equal -- alpha
-            # is still shared, same reasoning FIT_FIXED_EPSILON below
-            # relies on for eps (see estimate_shape_2comp). eps itself
-            # mirrors the `fixed` dict built below: FIT_FIXED_EPSILON
-            # unless the user has pinned the eps slider to their own value.
-            # A component whose own shape is 'powerlaw' always evaluates at
-            # the shared band nu0 (see models.component_reference_nu), not
-            # its own (irrelevant, hidden) nu0 slider -- so its own init is
-            # the band edge itself and it's never fit, regardless of that
-            # slider's own fixed checkbox.
+            T_bounds = self.temp_slider_1.bounds()
+            beta_bounds = self.beta_slider_1.bounds()
+            # Each component's own nu_0/T/beta is fit or pinned
+            # independently (per its own slider's fixed checkbox), never
+            # forced equal -- alpha is still shared, same reasoning
+            # FIT_FIXED_EPSILON below relies on for eps (see
+            # estimate_shape_2comp). eps itself mirrors the `fixed` dict
+            # built below: FIT_FIXED_EPSILON unless the user has pinned the
+            # eps slider to their own value.
+            # A component whose own shape is 'powerlaw'/'logparabola'
+            # always evaluates at the shared band nu0 (see
+            # models.component_reference_nu), not its own (irrelevant,
+            # hidden) nu0 slider -- so its own init is the band edge itself
+            # and it's never fit, regardless of that slider's own fixed
+            # checkbox.
             eps_idx = spec.indices('eps')[0]
             eps_val = self.sliders[eps_idx].value() if self.sliders[eps_idx].is_fixed() else FIT_FIXED_EPSILON
             band_nu0_hz = float(freq.min())
             nu0_1_init = self.nu0_slider_1.value() * 1e9 if shape1 in ('ssa', 'thermal') else band_nu0_hz
             nu0_2_init = self.nu0_slider_2.value() * 1e9 if shape2 in ('ssa', 'thermal') else band_nu0_hz
-            fit_nu0_1 = shape1 == 'ssa' and not self.nu0_slider_1.is_fixed()
-            fit_nu0_2 = shape2 == 'ssa' and not self.nu0_slider_2.is_fixed()
-            # A 'thermal' component's own T is never fit (see
-            # build_temp_slider) -- just its current slider value, passed
-            # through so estimate_shape_2comp's internal intensity_shape
-            # calls don't crash on a missing T (see thermal_intensity_shape).
-            T1 = self.temp_slider_1.value() if shape1 == 'thermal' else None
-            T2 = self.temp_slider_2.value() if shape2 == 'thermal' else None
-            # Same reasoning for a 'logparabola' component's own beta --
-            # never fit (see build_beta_slider), just passed through so
-            # estimate_shape_2comp's internal intensity_shape calls don't
-            # crash on a missing beta.
-            beta1 = self.beta_slider_1.value() if shape1 == 'logparabola' else None
-            beta2 = self.beta_slider_2.value() if shape2 == 'logparabola' else None
-            alpha_est, nu0_1_est_ghz, nu0_2_est_ghz = estimate_shape_2comp(
+            fit_nu0_1 = shape1 in ('ssa', 'thermal') and not self.nu0_slider_1.is_fixed()
+            fit_nu0_2 = shape2 in ('ssa', 'thermal') and not self.nu0_slider_2.is_fixed()
+            T1_init = self.temp_slider_1.value() if shape1 == 'thermal' else None
+            T2_init = self.temp_slider_2.value() if shape2 == 'thermal' else None
+            fit_T1 = shape1 == 'thermal' and not self.temp_slider_1.is_fixed()
+            fit_T2 = shape2 == 'thermal' and not self.temp_slider_2.is_fixed()
+            beta1_init = self.beta_slider_1.value() if shape1 == 'logparabola' else None
+            beta2_init = self.beta_slider_2.value() if shape2 == 'logparabola' else None
+            fit_beta1 = shape1 == 'logparabola' and not self.beta_slider_1.is_fixed()
+            fit_beta2 = shape2 == 'logparabola' and not self.beta_slider_2.is_fixed()
+            (alpha_est, nu0_1_est_hz, nu0_2_est_hz,
+             T1_est, T2_est, beta1_est, beta2_est) = estimate_shape_2comp(
                 freq, I, eps_val, nu0_1_init, nu0_2_init, alpha_init,
                 nu0_bounds_hz, fit_nu0_1, fit_nu0_2, shape1, shape2,
-                T1=T1, T2=T2, beta1=beta1, beta2=beta2)
-            if shape1 == 'ssa':
-                self.nu0_slider_1.set_value(nu0_1_est_ghz / 1e9)
-            if shape2 == 'ssa':
-                self.nu0_slider_2.set_value(nu0_2_est_ghz / 1e9)
+                T1_init=T1_init, T2_init=T2_init, beta1_init=beta1_init, beta2_init=beta2_init,
+                fit_T1=fit_T1, fit_T2=fit_T2, fit_beta1=fit_beta1, fit_beta2=fit_beta2,
+                T_bounds=T_bounds, beta_bounds=beta_bounds)
+            if shape1 in ('ssa', 'thermal'):
+                self.nu0_slider_1.set_value(nu0_1_est_hz / 1e9)
+            if shape2 in ('ssa', 'thermal'):
+                self.nu0_slider_2.set_value(nu0_2_est_hz / 1e9)
+            if shape1 == 'thermal':
+                self.temp_slider_1.set_value(T1_est)
+            if shape2 == 'thermal':
+                self.temp_slider_2.set_value(T2_est)
+            if shape1 == 'logparabola':
+                self.beta_slider_1.set_value(beta1_est)
+            if shape2 == 'logparabola':
+                self.beta_slider_2.set_value(beta2_est)
             self.sync_spectrum_ui()
-        elif spec.n_components == 1 and shape1 == 'ssa' and alpha_indices:
+        elif spec.n_components == 1 and shape1 in NEEDS_REGRESSION and alpha_indices:
             alpha_init = self.sliders[alpha_indices[0]].value()
             nu0_lo_ghz, nu0_hi_ghz = self.nu0_slider_1.bounds()
             nu0_bounds_hz = (nu0_lo_ghz * 1e9, nu0_hi_ghz * 1e9)
-            alpha_est, nu0_est_ghz = estimate_ssa_shape(
-                freq, I, self.nu0_slider_1.value() * 1e9, alpha_init,
-                nu0_bounds_hz, not self.nu0_slider_1.is_fixed())
-            self.nu0_slider_1.set_value(nu0_est_ghz / 1e9)
+            T_bounds = self.temp_slider_1.bounds()
+            beta_bounds = self.beta_slider_1.bounds()
+            nu0_init = self.nu0_slider_1.value() * 1e9 if shape1 in ('ssa', 'thermal') else float(freq.min())
+            T_init = self.temp_slider_1.value() if shape1 == 'thermal' else None
+            beta_init = self.beta_slider_1.value() if shape1 == 'logparabola' else None
+            fit_nu0 = shape1 in ('ssa', 'thermal') and not self.nu0_slider_1.is_fixed()
+            fit_T = shape1 == 'thermal' and not self.temp_slider_1.is_fixed()
+            fit_beta = shape1 == 'logparabola' and not self.beta_slider_1.is_fixed()
+            alpha_est, nu0_est_hz, T_est, beta_est = estimate_spectral_shape(
+                freq, I, shape1, alpha_init, nu0_init, T_init, beta_init,
+                nu0_bounds_hz, T_bounds, beta_bounds, fit_nu0, fit_T, fit_beta)
+            if shape1 in ('ssa', 'thermal'):
+                self.nu0_slider_1.set_value(nu0_est_hz / 1e9)
+            if shape1 == 'thermal':
+                self.temp_slider_1.set_value(T_est)
+            if shape1 == 'logparabola':
+                self.beta_slider_1.set_value(beta_est)
             self.sync_spectrum_ui()
         else:
             alpha_est = estimate_alpha(freq, I)

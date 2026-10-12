@@ -203,133 +203,171 @@ def estimate_alpha(freq, I):
     return float(np.sum(x * y) / denom)
 
 
-def estimate_ssa_shape(freq, I, nu0_init, alpha_init, nu0_bounds, fit_nu0):
-    """Nonlinear regression of loaded I(nu) data against the SSA normalized
-    intensity shape I'(nu; nu0, alpha, 'ssa') (models.intensity_shape -- the
-    caller must only invoke this for a single-component model whose own
-    Spectrum-box shape is 'ssa', see models.set_spectral_shape), anchored
-    the same way estimate_alpha
-    is: log(I/I[i0]) fit against log(I'/I'[i0]) at the lowest-frequency
-    point i0, no free intercept.
+def estimate_spectral_shape(freq, I, shape, alpha_init, nu0_init=None, T_init=None, beta_init=None,
+                             nu0_bounds=None, T_bounds=None, beta_bounds=None,
+                             fit_nu0=False, fit_T=False, fit_beta=False):
+    """Nonlinear regression of loaded I(nu) data against the single-
+    component normalized intensity shape I'(nu; nu0, alpha, shape, T, beta)
+    (models.intensity_shape -- the caller must only invoke this for a
+    single-component model whose own Spectrum-box shape is 'ssa',
+    'thermal', or 'logparabola'; plain 'powerlaw' has a closed form, see
+    estimate_alpha), anchored the same way estimate_alpha is: log(I/I[i0])
+    fit against log(I'/I'[i0]) at the lowest-frequency point i0, no free
+    intercept.
 
-    Unlike a plain power law, alpha appears inside an exponential under
-    SSA (see intensity_shape), so there's no closed form -- this is a
-    genuine nonlinear least-squares solve (scipy `least_squares`, same
-    machinery `qu_fit` itself uses).
+    Unlike a plain power law, alpha/T/beta appear inside a turnover or
+    curvature term under 'ssa'/'thermal'/'logparabola' (see
+    intensity_shape), so there's no closed form -- this is a genuine
+    nonlinear least-squares solve (scipy `least_squares`, same machinery
+    `qu_fit` itself uses).
 
-    If `fit_nu0` is False, nu0 stays pinned at `nu0_init` and only alpha is
-    optimized (1-D) -- this is the default (see
-    MainWindow.build_nu0_slider): a fit starts out assuming there's no
-    turnover in view, since the nu_0 sliders themselves default to fixed,
-    deep in the optically-thin regime. Unchecking a nu_0 slider's "fixed"
-    box switches this to a joint 2-D solve for (nu0, alpha) together,
-    seeded from (nu0_init, alpha_init) with nu0 boxed to `nu0_bounds` --
-    both must share freq's own frequency unit (only ratios matter, so any
-    consistent unit works; MainWindow uses Hz throughout).
+    `alpha` always joins the regression, except under 'thermal' (there
+    it's inert -- see intensity_shape). `nu0`/`T`/`beta` join only when
+    the matching `fit_nu0`/`fit_T`/`fit_beta` flag is set (that
+    parameter's own slider "fixed" checkbox unchecked, see
+    MainWindow.fit_spectrum_lsq), each boxed to its own `nu0_bounds`/
+    `T_bounds`/`beta_bounds`, and seeded from its own `nu0_init`/`T_init`/
+    `beta_init` -- freq/nu0_bounds must share freq's own frequency unit
+    (only ratios matter, so any consistent unit works; MainWindow uses Hz
+    throughout).
 
-    Returns (alpha_est, nu0_est) -- nu0_est is just nu0_init echoed back
-    when `fit_nu0` is False. Falls back to (0.0, nu0_init) if every point
-    is at the same frequency (shape undefined), or to (alpha_init,
-    nu0_init) if the solve itself doesn't converge."""
+    Returns (alpha_est, nu0_est, T_est, beta_est) -- any parameter not fit
+    (including alpha itself under 'thermal') is just its own *_init echoed
+    back. Falls back to every *_init value if every point is at the same
+    frequency (shape undefined), if there's nothing at all to fit, or if
+    the solve doesn't converge."""
     freq = np.asarray(freq)
     I = np.asarray(I)
     i0 = np.argmin(freq)
     if np.all(freq == freq[i0]):
-        return 0.0, nu0_init
+        return alpha_init, nu0_init, T_init, beta_init
     target = np.log(I / I[i0])
 
-    def shape_log_ratio(nu0, alpha):
-        Iprime = intensity_shape(freq, nu0, alpha, 'ssa')
-        return np.log(Iprime / Iprime[i0])
+    fit_alpha = shape != 'thermal'
+    free_names, x0, lo, hi = [], [], [], []
+    if fit_alpha:
+        free_names.append('alpha'); x0.append(alpha_init); lo.append(-np.inf); hi.append(np.inf)
+    if fit_nu0:
+        lo_nu0, hi_nu0 = nu0_bounds
+        free_names.append('nu0'); x0.append(nu0_init); lo.append(lo_nu0); hi.append(hi_nu0)
+    if fit_T:
+        lo_T, hi_T = T_bounds
+        free_names.append('T'); x0.append(T_init); lo.append(lo_T); hi.append(hi_T)
+    if fit_beta:
+        lo_beta, hi_beta = beta_bounds
+        free_names.append('beta'); x0.append(beta_init); lo.append(lo_beta); hi.append(hi_beta)
 
-    if not fit_nu0:
-        result = least_squares(lambda p: shape_log_ratio(nu0_init, p[0]) - target, x0=[alpha_init])
-        alpha_est = float(result.x[0]) if result.success else alpha_init
-        return alpha_est, nu0_init
+    if not free_names:
+        return alpha_init, nu0_init, T_init, beta_init
 
-    lo_nu0, hi_nu0 = nu0_bounds
-    result = least_squares(
-        lambda p: shape_log_ratio(p[0], p[1]) - target,
-        x0=[nu0_init, alpha_init], bounds=([lo_nu0, -np.inf], [hi_nu0, np.inf]))
+    def residual(p):
+        values = dict(zip(free_names, p))
+        Iprime = intensity_shape(
+            freq, values.get('nu0', nu0_init), values.get('alpha', alpha_init), shape,
+            T=values.get('T', T_init), beta=values.get('beta', beta_init))
+        return np.log(Iprime / Iprime[i0]) - target
+
+    result = least_squares(residual, x0=x0, bounds=(lo, hi))
     if not result.success:
-        return alpha_init, nu0_init
-    nu0_est, alpha_est = float(result.x[0]), float(result.x[1])
-    return alpha_est, nu0_est
+        return alpha_init, nu0_init, T_init, beta_init
+    values = dict(zip(free_names, result.x))
+    return (float(values['alpha']) if fit_alpha else alpha_init,
+            float(values['nu0']) if fit_nu0 else nu0_init,
+            float(values['T']) if fit_T else T_init,
+            float(values['beta']) if fit_beta else beta_init)
 
 
 def estimate_shape_2comp(freq, I, eps, nu0_1_init, nu0_2_init, alpha_init,
                           nu0_bounds, fit_nu0_1, fit_nu0_2, shape1, shape2,
-                          T1=None, T2=None, beta1=None, beta2=None):
-    """Two-component counterpart of estimate_ssa_shape: nonlinear
+                          T1_init=None, T2_init=None, beta1_init=None, beta2_init=None,
+                          fit_T1=False, fit_T2=False, fit_beta1=False, fit_beta2=False,
+                          T_bounds=None, beta_bounds=None):
+    """Two-component counterpart of estimate_spectral_shape: nonlinear
     regression of loaded I(nu) data against a shared-alpha blend
-    eps*I'(nu; nu0_1, alpha, shape1) + (1-eps)*I'(nu; nu0_2, alpha, shape2)
-    (see intensity_shape) -- each component in its own shape, which need
-    not match the other's (a 'powerlaw' component and an 'ssa' component
-    can be blended together) -- anchored the same log(I/I[i0]) way. alpha
-    is always shared between both components -- QU-only fitting has only
-    one real I(nu) dataset to anchor it to, same reasoning
-    FIT_FIXED_EPSILON already relies on (see MainWindow.fit_spectrum_lsq)
-    -- but nu0_1 and nu0_2 are each independently fit or held pinned at
-    their own *_init, per fit_nu0_1/fit_nu0_2 (MainWindow.nu0_slider_1/2's
-    own fixed checkboxes -- always False for a component whose own shape
-    is 'powerlaw', since its reference frequency is always the shared band
-    edge, never a free parameter), rather than forced equal: with both
-    pinned, only alpha is optimized (1-D); with exactly one free, that one
-    nu0 and alpha are jointly solved (2-D); with both free, all three go
-    into one joint solve (3-D).
+    eps*I'(nu; nu0_1, alpha, shape1, T1, beta1) +
+    (1-eps)*I'(nu; nu0_2, alpha, shape2, T2, beta2) (see intensity_shape)
+    -- each component in its own shape, which need not match the other's
+    (a 'powerlaw' component and an 'ssa' component can be blended
+    together) -- anchored the same log(I/I[i0]) way. alpha is always
+    shared between both components -- QU-only fitting has only one real
+    I(nu) dataset to anchor it to, same reasoning FIT_FIXED_EPSILON
+    already relies on (see MainWindow.fit_spectrum_lsq) -- except it drops
+    out of the regression entirely when both components are 'thermal'
+    (there it's inert for both, see intensity_shape, and would just be an
+    unconstrained dead dimension).
 
-    `T1`/`T2` are each component's own fixed electron temperature [K],
-    required (non-None) only when that component's own shape is 'thermal'
-    -- unlike nu0_1/nu0_2, T is never fit here (MainWindow.temp_slider_1/2
-    are always taken as-is), just passed through to intensity_shape.
-    `beta1`/`beta2` are likewise each component's own fixed curvature
-    index, required only when that component's own shape is 'logparabola'
-    (MainWindow.beta_slider_1/2), also never fit here.
+    nu0_1/nu0_2, T1/T2, and beta1/beta2 are each independently fit or held
+    pinned at their own *_init, per fit_nu0_1/fit_nu0_2/fit_T1/fit_T2/
+    fit_beta1/fit_beta2 (each parameter's own slider's own fixed checkbox,
+    see MainWindow.fit_spectrum_lsq/build_nu0_slider/build_temp_slider/
+    build_beta_slider -- always False for a component whose own shape
+    doesn't use that parameter, e.g. fit_T1 for a 'powerlaw' component 1),
+    rather than forced equal to the other component's own value: whichever
+    subset of these end up free (alongside alpha, unless both components
+    are 'thermal') go into one joint nonlinear solve together.
 
-    Returns (alpha_est, nu0_1_est, nu0_2_est) -- a pinned nu0 is just its
-    own *_init echoed back. Falls back to all *_init values if every point
-    is at the same frequency (shape undefined) or the solve doesn't
-    converge."""
+    Returns (alpha_est, nu0_1_est, nu0_2_est, T1_est, T2_est, beta1_est,
+    beta2_est) -- anything not fit is just its own *_init echoed back
+    (including alpha itself when both components are 'thermal'). Falls
+    back to every *_init value if every point is at the same frequency
+    (shape undefined) or the solve doesn't converge."""
     freq = np.asarray(freq)
     I = np.asarray(I)
     i0 = np.argmin(freq)
+    fallback = (alpha_init, nu0_1_init, nu0_2_init, T1_init, T2_init, beta1_init, beta2_init)
     if np.all(freq == freq[i0]):
-        return 0.0, nu0_1_init, nu0_2_init
+        return fallback
     target = np.log(I / I[i0])
 
-    def shape_log_ratio(nu0_1, nu0_2, alpha):
-        Iprime = (eps * intensity_shape(freq, nu0_1, alpha, shape1, T=T1, beta=beta1)
-                  + (1.0 - eps) * intensity_shape(freq, nu0_2, alpha, shape2, T=T2, beta=beta2))
-        return np.log(Iprime / Iprime[i0])
+    fit_alpha = not (shape1 == 'thermal' and shape2 == 'thermal')
 
-    lo_nu0, hi_nu0 = nu0_bounds
-
-    # Build the free-parameter vector dynamically: whichever of nu0_1/nu0_2
-    # is free gets its own slot (boxed to nu0_bounds); alpha is always free.
+    # Build the free-parameter vector dynamically: whichever of these is
+    # free gets its own slot, boxed to its own bounds.
     free_names, x0, lo, hi = [], [], [], []
     if fit_nu0_1:
+        lo_nu0, hi_nu0 = nu0_bounds
         free_names.append('nu0_1'); x0.append(nu0_1_init); lo.append(lo_nu0); hi.append(hi_nu0)
     if fit_nu0_2:
+        lo_nu0, hi_nu0 = nu0_bounds
         free_names.append('nu0_2'); x0.append(nu0_2_init); lo.append(lo_nu0); hi.append(hi_nu0)
-    free_names.append('alpha')
-    x0.append(alpha_init)
-    lo.append(-np.inf)
-    hi.append(np.inf)
+    if fit_T1:
+        lo_T, hi_T = T_bounds
+        free_names.append('T1'); x0.append(T1_init); lo.append(lo_T); hi.append(hi_T)
+    if fit_T2:
+        lo_T, hi_T = T_bounds
+        free_names.append('T2'); x0.append(T2_init); lo.append(lo_T); hi.append(hi_T)
+    if fit_beta1:
+        lo_beta, hi_beta = beta_bounds
+        free_names.append('beta1'); x0.append(beta1_init); lo.append(lo_beta); hi.append(hi_beta)
+    if fit_beta2:
+        lo_beta, hi_beta = beta_bounds
+        free_names.append('beta2'); x0.append(beta2_init); lo.append(lo_beta); hi.append(hi_beta)
+    if fit_alpha:
+        free_names.append('alpha'); x0.append(alpha_init); lo.append(-np.inf); hi.append(np.inf)
+
+    if not free_names:
+        return fallback
 
     def residual(p):
         values = dict(zip(free_names, p))
-        return shape_log_ratio(values.get('nu0_1', nu0_1_init),
-                                values.get('nu0_2', nu0_2_init),
-                                values['alpha']) - target
+        alpha = values.get('alpha', alpha_init)
+        Iprime = (eps * intensity_shape(freq, values.get('nu0_1', nu0_1_init), alpha, shape1,
+                                         T=values.get('T1', T1_init), beta=values.get('beta1', beta1_init))
+                  + (1.0 - eps) * intensity_shape(freq, values.get('nu0_2', nu0_2_init), alpha, shape2,
+                                                   T=values.get('T2', T2_init), beta=values.get('beta2', beta2_init)))
+        return np.log(Iprime / Iprime[i0]) - target
 
     result = least_squares(residual, x0=x0, bounds=(lo, hi))
     if not result.success:
-        return alpha_init, nu0_1_init, nu0_2_init
+        return fallback
     values = dict(zip(free_names, result.x))
-    alpha_est = float(values['alpha'])
-    nu0_1_est = float(values['nu0_1']) if fit_nu0_1 else nu0_1_init
-    nu0_2_est = float(values['nu0_2']) if fit_nu0_2 else nu0_2_init
-    return alpha_est, nu0_1_est, nu0_2_est
+    return (float(values['alpha']) if fit_alpha else alpha_init,
+            float(values['nu0_1']) if fit_nu0_1 else nu0_1_init,
+            float(values['nu0_2']) if fit_nu0_2 else nu0_2_init,
+            float(values['T1']) if fit_T1 else T1_init,
+            float(values['T2']) if fit_T2 else T2_init,
+            float(values['beta1']) if fit_beta1 else beta1_init,
+            float(values['beta2']) if fit_beta2 else beta2_init)
 
 
 # ── Bayesian (MultiNest) fitting ─────────────────────────────────────────────

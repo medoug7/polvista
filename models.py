@@ -434,20 +434,18 @@ def pol(fit):
     return 100 * np.sqrt(fit.real ** 2 + fit.imag ** 2)
 
 
-def two_component_ref_wl(nu, nu_min, shape1, shape2):
+def two_component_ref_wl(nu, nu_min):
     """The wavelength [m] the two-component branches of stokes_I/
-    stokes_components evaluate raw_ref at: the wavelength corresponding to
-    nu_min (lowest plotted frequency, or an explicit override) by default
-    -- except when component 1's own shape is 'ssa' or 'thermal' (or,
-    failing that, component 2's), which anchors at that component's own
-    turnover nu0 instead (see stokes_I's docstring for why)."""
-    if shape1 in ('ssa', 'thermal'):
-        nu_ref = component_reference_nu(nu, nu_min, SPECTRAL_NU0, shape1)
-    elif shape2 in ('ssa', 'thermal'):
-        nu_ref = component_reference_nu(nu, nu_min, SPECTRAL_NU0_2, shape2)
-    else:
-        nu_ref = band_nu0(nu, nu_min)
-    return C / (nu_ref * 1e6)
+    stokes_components evaluate raw_ref at: the wavelength corresponding
+    to nu_min (lowest plotted frequency, or an explicit override) -- the
+    same I(nu_min)=1 convention loaded data itself is normalized to at
+    load time (see app.MainWindow.load_data_action), so the displayed/
+    fitted curve stays on the same amplitude scale as the data regardless
+    of either component's own shape (a component whose own shape is
+    'ssa'/'thermal' still has its own turnover nu0, see
+    component_reference_nu -- it's just no longer where I(nu) is pinned
+    to 1)."""
+    return C / (band_nu0(nu, nu_min) * 1e6)
 
 
 def stokes_I(wl, n_components, pars, nu_min=None):
@@ -455,10 +453,12 @@ def stokes_I(wl, n_components, pars, nu_min=None):
     (alpha for one component; eps,alpha1,alpha2 for two), via I'(nu) (see
     intensity_shape/set_spectral_shape) -- a display/export shape, not a
     separate I_0. Normalized to 1 at `nu_min` [MHz] (default: the lowest
-    frequency spanned by `wl`; matches MainWindow.load_data_action's own
-    I(nu_min)=1 convention), except 'ssa'/'thermal' components, which
-    anchor at their own turnover nu0 instead (already I'(nu0)=1 by
-    construction -- see two_component_ref_wl for the two-component case)."""
+    frequency spanned by `wl`), matching MainWindow.load_data_action's own
+    I(nu_min)=1 convention for every spectral shape, including 'ssa'/
+    'thermal' components (whose own turnover nu0 sets I'(nu0)=1 for the
+    *shape* function itself, per intensity_shape, but that's a different
+    pivot than nu_min unless the two happen to coincide -- see
+    two_component_ref_wl for the two-component case)."""
     nu = C / wl / 1e6  # MHz
     if nu_min is None:
         nu_min = np.min(nu)
@@ -468,13 +468,10 @@ def stokes_I(wl, n_components, pars, nu_min=None):
         alpha = pars[-1]
         nu0 = reference_nu(nu, nu_min)
         raw = intensity_shape(nu, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)
-        if SPECTRAL_SHAPE in ('ssa', 'thermal'):
-            raw_ref = 1.0  # intensity_shape is already I'(nu0)=1 by construction for both
-        else:
-            raw_ref = intensity_shape(nu_min_arr, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)[0]
+        raw_ref = intensity_shape(nu_min_arr, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)[0]
     else:
         eps, alpha1, alpha2 = pars[-3:]
-        wl_ref = two_component_ref_wl(nu, nu_min, SPECTRAL_SHAPE, SPECTRAL_SHAPE_2)
+        wl_ref = two_component_ref_wl(nu, nu_min)
         w1, w2 = spectral_weights(wl, eps, alpha1, alpha2, nu_min=nu_min)
         raw = w1 + w2
         w1_ref, w2_ref = spectral_weights(np.array([wl_ref]), eps, alpha1, alpha2, nu_min=nu_min)
@@ -515,7 +512,7 @@ def stokes_components(wl, model, pars, nu_min=None):
     nu = C / wl / 1e6  # MHz
     if nu_min is None:
         nu_min = np.min(nu)
-    wl_ref = two_component_ref_wl(nu, nu_min, SPECTRAL_SHAPE, SPECTRAL_SHAPE_2)  # matches stokes_I's own anchor
+    wl_ref = two_component_ref_wl(nu, nu_min)  # matches stokes_I's own anchor
 
     w1, w2 = spectral_weights(wl, eps, alpha1, alpha2, nu_min=nu_min)
     w1_ref, w2_ref = spectral_weights(np.array([wl_ref]), eps, alpha1, alpha2, nu_min=nu_min)

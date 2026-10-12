@@ -193,15 +193,40 @@ VLA_HIGH_BANDS = [VLA_K, VLA_KA, VLA_Q]
 VLA_ALL_BANDS = [VLA_L, VLA_S, VLA_C, VLA_X, VLA_KU, VLA_K, VLA_KA, VLA_Q]
 
 # MeerKAT -- UHF, L, and S band, https://skaafrica.atlassian.net/wiki/spaces/ESDKB/pages/277315585/MeerKAT+specifications
-MEERKAT_UHF = (0.77, 0.54, 4)   # UHF band: 544-1087 MHz
-MEERKAT_L = (1.21, 0.86, 4)     # L band:   856-1711 MHz
-MEERKAT_S = (2.47, 1.75, 4)     # S band:   1750-3499 MHz
+# Digitised ranges UHF 544-1088 and L 856-1712 MHz overlap, so the shared
+# 856-1088 MHz stretch is split near its midpoint; centers are linear
+# midpoints (center +/- bw/2 = band edges), with edges nudged a few MHz to
+# keep center and bw at the Bands box's 2 decimals. S band spans all five
+# 875 MHz sub-bands (S0-S4) of its 1750-3500 MHz receiver.
+MEERKAT_UHF = (0.76, 0.42, 14)   # UHF band: 544-1088 MHz -> 550-970 MHz
+MEERKAT_L = (1.34, 0.74, 20)     # L band:   856-1712 MHz -> 970-1710 MHz
+MEERKAT_S = (2.62, 1.74, 20)     # S band:   1750-3500 MHz -> 1750-3490 MHz
 MEERKAT_ALL_BANDS = [MEERKAT_UHF, MEERKAT_L, MEERKAT_S]
 
 # LOFAR -- LBA and HBA band, https://www.aanda.org/articles/aa/full_html/2013/08/aa20873-12/aa20873-12.html
 LOFAR_LBA = (0.05, 0.08, 50)   # 10 - 90 MHz
 LOFAR_HBA = (0.18, 0.12, 50)     # 120 - 240 MHz
 LOFAR_ALL_BANDS = [LOFAR_LBA, LOFAR_HBA]
+
+# SKA -- all six SKA-Mid bands (Bands 3 and 4 are future deployments,
+# not first-generation receivers) and SKA-Low's single band,
+# https://www.skao.int/en/science-users/118/ska-telescope-specifications
+# The spec's SKA-Mid receiver ranges overlap their neighbours (1/2: 950-1050,
+# 2/3: 1650-1760, 3/4: 2800-3050, 4/5a: 4600-5180, 5a/5b: 8300-8500 MHz), so
+# each shared stretch is split near its midpoint to keep the bands disjoint,
+# with edges nudged a few MHz to keep center and bw at the Bands box's 2
+# decimals. Band 5b uses its 2 x 2.5 GHz available bandwidth, centered in
+# its 8.3-15.4 GHz range.
+SKA_MID_B1 = (0.67, 0.64, 14)     # Band 1:  350-1050 MHz -> 350-990 MHz
+SKA_MID_B2 = (1.35, 0.72, 14)     # Band 2:  950-1760 MHz -> 990-1710 MHz
+SKA_MID_B3 = (2.32, 1.22, 14)     # Band 3:  1650-3050 MHz -> 1710-2930 MHz
+SKA_MID_B4 = (3.91, 1.96, 14)     # Band 4:  2800-5180 MHz -> 2930-4890 MHz
+SKA_MID_B5A = (6.69, 3.60, 25)    # Band 5a: 4600-8500 MHz -> 4890-8490 MHz
+SKA_MID_B5B = (11.85, 5.00, 25)   # Band 5b: 8300-15400 MHz -> 9350-14350 MHz
+SKA_MID_ALL_BANDS = [SKA_MID_B1, SKA_MID_B2, SKA_MID_B3, SKA_MID_B4,
+                     SKA_MID_B5A, SKA_MID_B5B]
+SKA_LOW = (0.20, 0.30, 50)       # 50-350 MHz
+SKA_LOW_ALL_BANDS = [SKA_LOW]
 
 # SDSS-like optical filters (g, r, i, z) -- SPARC4's own 4 simultaneous
 # channels, per its instrument papers -- using the same round-number
@@ -255,6 +280,8 @@ DEFAULT_BANDS_BY_PRESET = {
     'VLA low (2 - 30 cm / 1 - 15 GHz)': VLA_LOW_BANDS,
     'Full VLA (0.6 - 30 cm / 1 - 50 GHz)': VLA_ALL_BANDS,
     'Full GHz (0.25mm - 30 cm / 1 - 1200 GHz)': FULL_GHZ_BANDS,
+    'SKA-Mid (2 - 86 cm / 350 MHz - 15 GHz)': SKA_MID_ALL_BANDS,
+    'SKA-Low (86 cm - 6 m / 50 MHz - 350 MHz)': SKA_LOW_ALL_BANDS,
     'Full MeerKat (8.6 - 70 cm / 500 - 3500 MHz)': MEERKAT_ALL_BANDS,
     'Full LOFAR (1.25 - 30 m / 10 - 240 MHz)': LOFAR_ALL_BANDS,
     'Full MHz (8.6 cm - 30 m / 10 - 3500 GHz)': FULL_MHZ_BANDS,
@@ -675,7 +702,14 @@ class MeasurementsMixin:
             # actually measure from just this band's own noisy I points.
             alpha_fit = weighted_linfit(np.log(freqs_ghz), np.log(np.abs(I_obs)), I_err / np.abs(I_obs))
             dep_fit = weighted_linfit(freqs_ghz, p_frac, p_frac_err)
-            rm_fit = weighted_linfit(lam2, evpa_rad, evpa_err_rad)
+            # EVPAs are only defined mod pi (arctan2 wraps them into
+            # (-90, 90] deg), so a band whose EVPA rotates through +/-90 deg
+            # would otherwise fit the wrong-signed RM. Unwrap SPW-to-SPW
+            # (the SPWs are already frequency-ordered, hence adjacent in
+            # lambda^2) -- valid as long as neighbouring SPWs differ by
+            # < 90 deg, the usual n*pi ambiguity limit.
+            evpa_unwrapped = np.unwrap(evpa_rad, period=np.pi)
+            rm_fit = weighted_linfit(lam2, evpa_unwrapped, evpa_err_rad)
             if alpha_fit is None or dep_fit is None or rm_fit is None:
                 results_lines.append((color, f'{band_label}\n  fit failed (degenerate points)'))
                 continue
