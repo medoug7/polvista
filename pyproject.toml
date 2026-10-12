@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "polvista"
-version = "0.1.0"
+version = "1.0.0"
 description = "Interactive PyQt5 visualizer for Faraday-depolarization models"
 readme = "README.md"
 license = { text = "MIT" }
