@@ -248,10 +248,49 @@ def partial(x, params):
     return p0 * (f * np.exp(-2 * dphi**2 * x**4) * np.exp(2j * (X0 + phi * x**2)) + (1 - f) * np.exp(2j * X0))
 
 
-def intern(x, params):
-    """Internal uniform Faraday screen (4 pars; trailing alpha inert)."""
+def slab_factor(S):
+    """Burn (1966) eq. 18: uniform slab, (1-e^-S)/S, S complex. expm1 keeps
+    it accurate as S -> 0, where the limit 1 - S/2 is used at S == 0 exactly."""
+    S = np.asarray(S, dtype=complex)
+    small = np.abs(S) < 1e-8
+    S_safe = np.where(small, 1.0, S)
+    return np.where(small, 1 - S / 2, -np.expm1(-S_safe) / S_safe)
+
+
+def sphere_factor(S):
+    """Burn (1966) eq. 20: uniform sphere of diameter L, 3[(S+1)e^-S + S^2/2 - 1]/S^3.
+    The bracket cancels to O(S^3), so |S| < 0.5 uses its Maclaurin series
+    3 * sum_{n>=3} (-1)^n (1-n)/n! S^(n-3) = 1 - 3S/8 + S^2/10 - ..."""
+    S = np.asarray(S, dtype=complex)
+    small = np.abs(S) < 0.5
+    S_safe = np.where(small, 1.0, S)
+    direct = 3 * ((S_safe + 1) * np.exp(-S_safe) + S_safe**2 / 2 - 1) / S_safe**3
+    series = np.zeros_like(S)
+    term_pow = np.ones_like(S)
+    fact = 6.0  # n! for n=3
+    for n in range(3, 20):
+        series = series + 3 * (-1)**n * (1 - n) / fact * term_pow
+        term_pow = term_pow * S
+        fact *= n + 1
+    return np.where(small, series, direct)
+
+
+def intern_slab(x, params):
+    """Internal uniform Faraday screen, slab geometry (Burn 1966 eqs. 18-19;
+    4 pars; trailing alpha inert). phi and dphi are the total Faraday depth
+    and its dispersion through the slab."""
     p0, X0, phi, dphi = params[:4]
-    return (p0 * np.exp(2j * X0) * (1 - np.exp(-(2 * dphi**2 * x**4 - 2j * phi * x**2))) / (2 * (dphi+1e-10)**2 * x**4 - 2j * phi * x**2))
+    return p0 * np.exp(2j * X0) * slab_factor(2 * dphi**2 * x**4 - 2j * phi * x**2)
+
+
+def intern_sphere(x, params):
+    """Internal uniform Faraday screen, spherical geometry (Burn 1966 eq. 20;
+    4 pars; trailing alpha inert). phi and dphi are the Faraday depth and its
+    dispersion across the full diameter, so S matches the slab's S for a
+    slab of that same thickness."""
+    p0, X0, phi, dphi = params[:4]
+    return p0 * np.exp(2j * X0) * sphere_factor(2 * dphi**2 * x**4 - 2j * phi * x**2)
+
 
 def partial2(x, params):
     """internal screen with partial coverage (5 pars; trailing alpha inert)."""
@@ -685,8 +724,8 @@ register(field_gradient,
 
 
 
-register(intern,
-    label='Internal screen with depolarization', title='Internal screen',
+register(intern_slab,
+    label='Internal screen, slab (Burn)', title='Internal screen (slab)',
     params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
             Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
             Param('phi', r'$\phi$', 'phi', 'Faraday depth (RM-like): sets how fast EVPA rotates with lambda^2.'),
@@ -695,6 +734,20 @@ register(intern,
             [0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
     n_components=1, n_live_points=1000,
     equation=r'$P(\lambda)=p_0\,e^{2i\chi_0}\,\left[\frac{1-e^{-\left(2\sigma_\phi^2\lambda^4-2i\phi\lambda^2\right)}}{2\sigma_\phi^2\lambda^4-2i\phi\lambda^2}\right]$')
+
+register(intern_sphere,
+    label='Internal screen, sphere (Burn)', title='Internal screen (sphere)',
+    params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
+            Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
+            Param('phi', r'$\phi$', 'phi', 'Faraday depth across the full diameter: sets how fast EVPA rotates with lambda^2.'),
+            Param('dphi', r'$\sigma_{\phi}$', 'dphi', 'Faraday depth dispersion across the full diameter of the internal, emission-mixed spherical screen; drives depolarization at long wavelengths.')] + spectral_param_single(),
+    bounds=([0.0, -np.pi / 2, -5e6, 0] + SPECTRAL_BOUNDS_LO_SINGLE,
+            [0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
+    n_components=1, n_live_points=1000,
+    equation=r'$P(\lambda)=p_0\,e^{2i\chi_0}\,\frac{3\left[(S+1)e^{-S}+S^2/2-1\right]}{S^3},\;S=2\sigma_\phi^2\lambda^4-2i\phi\lambda^2$')
+
+# Legacy name for intern_slab, so saved models/sidecars naming 'intern' still load.
+MODELS_BY_NAME['intern'] = intern_slab
 
 register(partial2,
     label='Partial coverage internal screen', title='Partial coverage internal',

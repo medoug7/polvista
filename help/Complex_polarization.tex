@@ -70,13 +70,19 @@ Equation \ref{eq:partial} reduces to the Burn model in the case of total coverag
 
 \subsection{Internal rotation:}
 If the emitting and rotating regions are co-spatial, the screen is said to be internal. This might happen when the relativistic synchrotron-emitting plasma is mixed with thermal electrons, as the highly energetic electrons contribute less to the Faraday effect.
-Equation \ref{eq:intern} below describes a slab of emitting+rotating+depolarizing plasma from the original Burn paper from 1966.
+Equation \ref{eq:intern} below describes a slab of emitting+rotating+depolarizing plasma (Eqs. 18--19 of the original Burn paper from 1966), where $\phi$ and $\sigma_\phi$ are the total Faraday depth and its dispersion through the slab.
 \begin{equation}\label{eq:intern}
     \displaystyle P = p_0 \left[ \frac{1-e^{-2(\sigma_\phi^2\lambda^4-i\phi\lambda^2)}}{2(\sigma_\phi^2\lambda^4-i\phi\lambda^2)}\right] e^{2i\chi_0}
 \end{equation}
 
 The polarization spectrum of internal rotation with dispersion features an interference pattern from the radiation emitted at different Faraday depths within the source, which may lead to non-linear $\chi(\lambda^2)$ behavior.
 When the dispersion is small, the factor inside the brackets approaches $|\frac{\sin(\phi\lambda^2)}{\phi\lambda^2}|e^{i\phi\lambda^2}$, causing a characteristic regular beating behavior in $p(\lambda)$.
+
+For a uniform sphere of emitting+rotating plasma (Burn's Eq. 20), with $\phi$ and $\sigma_\phi$ now referring to the full diameter, the same $S=2(\sigma_\phi^2\lambda^4-i\phi\lambda^2)$ gives
+\begin{equation}\label{eq:intern_sphere}
+    \displaystyle P = p_0\, \frac{3\left[(S+1)e^{-S}+\tfrac{1}{2}S^2-1\right]}{S^3}\, e^{2i\chi_0}
+\end{equation}
+The sphere depolarizes more gradually than the slab, since lines of sight through its edges cross little Faraday depth, and its EVPAs depart from the $\lambda^2$ law as the polarization drops.
 \\
 
 \subsection{Multiple components:}

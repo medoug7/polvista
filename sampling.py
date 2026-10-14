@@ -50,7 +50,7 @@ from polvista.widgets import ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDE
 # which convention a real output directory would use.
 QU_FIT_MODEL_MAP = {
     'Burn':          ('burn',               [],     None),
-    'Internal':      ('intern',             [],     None),
+    'Internal':      ('intern_slab',        [],     None),
     'Partial':       ('partial',            [],     None),
     'Tribble':       ('tribble',            [],     None),
     '2_Ext':         ('comp2RMdep_classic',  [3, 7], None),
