@@ -1845,10 +1845,13 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
                 f"BIC = {stats['bic']:.4g}")
 
     def next_curve_color(self):
-        """The next color of the Preferences > Curve > Comparison palette,
-        wrapping around, by how many curves have been added so far."""
-        colors = COMPARISON_PALETTES[PLOT_PREFS['comparison_palette']]
-        return mcolors.to_hex(colors[self._next_curve_id % len(colors)])
+        """The earliest color of the Preferences > Curve > Comparison palette
+        not used by a current curve (so deleted curves free their color); once
+        every color is in use, the earliest among the least-used ones."""
+        colors = [mcolors.to_hex(c) for c in COMPARISON_PALETTES[PLOT_PREFS['comparison_palette']]]
+        in_use = [mcolors.to_hex(c['color']) for c in self.curves]
+        counts = [in_use.count(c) for c in colors]
+        return colors[counts.index(min(counts))]
 
     def add_curve_action(self):
         """Freeze the current model (parameters and spectral shape) as a
