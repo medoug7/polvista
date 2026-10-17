@@ -27,7 +27,8 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
-from polvista.models import MODELS, MODELS_BY_NAME
+from polvista.models import (MODELS, MODELS_BY_NAME, LEGACY_MODELS, get_model_by_name, legacy_dphi_scale,
+                             legacy_to_composite)
 from polvista.fitting import multinest_fit, load_previous_run, expand_pars_errs, estimate_alpha, pol_idx, wrap_pm_halfpi
 from polvista.latex_stuff import latex_pixmap
 from polvista.widgets import ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDEST_UNIT
@@ -41,25 +42,29 @@ from polvista.widgets import ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDE
 # param indices qu_fit.py held fixed at 0 rather than sampling, and a
 # fitting.load_previous_run degenerate_pair override -- None keeps the
 # default; see its docstring). The two-component entries map to this app's
-# *_classic models (qu_fit.py's plain-sum convention, not this app's own
-# eps-weighted spectral_combine -- see comp2RMdep_classic's docstring), and
+# class_* composites (qu_fit.py's plain-sum convention, not the weight_*
+# composites' eps-weighted blend), with each external component's sigma_phi
+# rescaled on load (qu_fit.py's own external term is exp(-sigma^2 lambda^4),
+# see models.legacy_dphi_scale), and
 # _load_qu_fit_samples re-derives alpha (and epsilon, where a model has
 # one; never sampled by qu_fit.py) the same way a fresh Sampling-tab pre-fit would. '2_Int'
-# (comp2intern) is unsupported: qu_fit.py's own MODELS registration for it
+# (two internal components) is unsupported: qu_fit.py's own MODELS registration for it
 # is internally inconsistent (6 vs. 8 params), so there's no way to tell
 # which convention a real output directory would use.
 QU_FIT_MODEL_MAP = {
     'Burn':          ('burn',               [],     None),
     'Internal':      ('intern_slab',        [],     None),
+    'Internal_sphere': ('intern_sphere',    [],     None),
     'Partial':       ('partial',            [],     None),
     'Tribble':       ('tribble',            [],     None),
-    '2_Ext':         ('comp2RMdep_classic',  [3, 7], None),
-    '2_Ext_dep':     ('comp2RMdep_classic',  [],     None),
-    '2_Ext_dep1':    ('comp2RMdep_classic',  [7],    False),
-    'Int_Ext':       ('comp2mixdep_classic', [3, 7], None),
-    'Int_Ext_dep':   ('comp2mixdep_classic', [],     True),
-    'Int_Ext_dep1':  ('comp2mixdep_classic', [7],    False),
-    'Int_Ext_dep2':  ('comp2mixdep_classic', [3],    False),
+    '2_Ext':         ('class_Ext_Ext',         [3, 7], None),
+    '2_Ext_dep':     ('class_Ext_Ext',         [],     None),
+    '2_Ext_dep1':    ('class_Ext_Ext',         [7],    False),
+    'Int_Ext':       ('class_Intslb_Ext',     [3, 7], None),
+    'Int_Ext_dep':   ('class_Intslb_Ext',     [],     True),
+    'Int_Ext_dep1':  ('class_Intslb_Ext',     [7],    False),
+    'Int_Ext_dep2':  ('class_Intslb_Ext',     [3],    False),
+    'Sph_Ext':       ('class_Intsph_Ext',     [],     True),
 }
 
 
@@ -711,7 +716,7 @@ def _build_family_legend(fig, families, dropped, selected_idx, color_by_k):
         legend_handles.append(mpatches.Patch(
             color=color_by_k[k], alpha=(1.0 if k == selected_idx else 0.5),
             label=fr"mass={family['evidence_share']:.1f}%, $\ln L$={family['lnZ']:.2f}, "
-                  fr"$\chi_\nu^2$={family['chi2']:.2f}{suffix}"))
+                  fr"$\chi^2_k$={family['chi2']:.2f}{suffix}"))
     if dropped['count'] > 0:
         legend_handles.append(mpatches.Patch(
             color='none', label=f"+{dropped['count']} more, {dropped['evidence_share']:.1f}% combined"))
@@ -1266,8 +1271,7 @@ class SamplingMixin:
         QMessageBox.warning(self, 'Sampling', f'MultiNest fit failed:\n{msg}')
         self.mn_worker = None
 
-    def _format_fit_stats_block(self, chi2, dof, chi2_red, loglike, aic, aicc, bic,
-                                  evidence_lnZ, global_evidence, global_evidence_err):
+    def _format_fit_stats_block(self, chi2, dof, chi2_red, loglike, aic, aicc, bic, evidence_lnZ):
         """Shared chi2/dof/AIC/AICc/BIC/evidence-lnZ lines used by both
         format_mn_stats (the winning family) and format_family_stats (any
         other family), so the Results box reads identically regardless of
@@ -1276,12 +1280,11 @@ class SamplingMixin:
         aicc_str = f'{aicc:.4g}' if np.isfinite(aicc) else 'n/a (dof ≤ 1)'
         return [
             f"χ² = {chi2:.4g}   dof = {dof}",
-            f"χ²_red = {chi2_red:.4g}",
+            f"χ²_k = {chi2_red:.4g}",
             f"ln L = {loglike:.4g}",
             f"AIC = {aic:.4g}   AICc = {aicc_str}",
             f"BIC = {bic:.4g}",
             f"evidence ln Z (this family) = {evidence_lnZ:.4g}",
-            f"global ln Z (whole model) = {global_evidence:.4g} ± {global_evidence_err:.3g}",
         ]
 
     def format_mn_stats(self, info):
@@ -1303,8 +1306,7 @@ class SamplingMixin:
             lines.append('; '.join(family_bits))
         lines += self._format_fit_stats_block(
             info['chi2'], info['dof'], info['chi2_red'], info['loglike'],
-            info['aic'], info['aicc'], info['bic'], info['winner_evidence_lnZ'],
-            info['global_evidence'], info['global_evidence_err'])
+            info['aic'], info['aicc'], info['bic'], info['winner_evidence_lnZ'])
         return '\n'.join(lines)
 
     # ── MultiNest result plumbing (posterior overlay + Corner plot tab) ──────
@@ -1623,7 +1625,7 @@ class SamplingMixin:
                  f"{family['evidence_share']:.2f}% evidence share"]
         lines += self._format_fit_stats_block(
             chi2, dof, family['chi2'], family['lnZ'], aic, aicc, bic,
-            family['evidence_lnZ'], info['global_evidence'], info['global_evidence_err'])
+            family['evidence_lnZ'])
         return '\n'.join(lines)
 
     def remove_corner_tab(self):
@@ -1652,6 +1654,41 @@ class SamplingMixin:
         # attribute pointing at an already-deleted C/C++ QComboBox.
         self.corner_family_combo = None
 
+    def _resolve_samples_directory(self, directory):
+        """The metadata-reading half of load_samples_action, shared with the
+        Comparison tab's Load samples (load_curve_samples_action): returns
+        (model, spectral_pars, wl, q, q_err, u, u_err, sampled_idx,
+        overrides) for a MultiNest output `directory`, or None (after
+        warning the user) if it can't be read."""
+        meta_path = os.path.join(directory, 'mn_polvista_meta.npz')
+        sampled_idx, overrides = None, {}
+        if os.path.exists(meta_path):
+            try:
+                meta = np.load(meta_path)
+                model_name = str(meta['model'])
+                try:
+                    model = get_model_by_name(model_name)
+                except KeyError:
+                    raise ValueError(f"unknown model '{model_name}' in metadata") from None
+                if model_name in LEGACY_MODELS:
+                    # Saved under a legacy two-component name: its external
+                    # sigma_phi columns are in the old convention.
+                    overrides = {'param_scale': legacy_dphi_scale(model)}
+                spectral_pars = {int(i): float(v) for i, v in zip(meta['spectral_idx'], meta['spectral_val'])}
+                wl, q, q_err, u, u_err = meta['wl'], meta['q'], meta['q_err'], meta['u'], meta['u_err']
+            except (Exception, SystemExit) as e:
+                # SystemExit included: see MultiNestWorker.run -- this runs on
+                # the main thread, so letting it escape uncaught would exit the
+                # whole app instead of just reporting the failure here.
+                QMessageBox.warning(self, 'Load samples', f'Failed to load samples:\n{e}')
+                return None
+        else:
+            result = self._load_qu_fit_samples(directory)
+            if result is None:
+                return None
+            model, spectral_pars, wl, q, q_err, u, u_err, sampled_idx, overrides = result
+        return model, spectral_pars, wl, q, q_err, u, u_err, sampled_idx, overrides
+
     def load_samples_action(self):
         """Load a previous MultiNest run's output (picked via a directory
         dialog), re-run the same mode-family clustering fitting.load_previous_run
@@ -1672,29 +1709,10 @@ class SamplingMixin:
         directory = QFileDialog.getExistingDirectory(self, 'Load MultiNest samples', start_dir)
         if not directory:
             return
-
-        meta_path = os.path.join(directory, 'mn_polvista_meta.npz')
-        sampled_idx = degenerate_pair = None
-        if os.path.exists(meta_path):
-            try:
-                meta = np.load(meta_path)
-                model_name = str(meta['model'])
-                if model_name not in MODELS_BY_NAME:
-                    raise ValueError(f"unknown model '{model_name}' in metadata")
-                model = MODELS_BY_NAME[model_name]
-                spectral_pars = {int(i): float(v) for i, v in zip(meta['spectral_idx'], meta['spectral_val'])}
-                wl, q, q_err, u, u_err = meta['wl'], meta['q'], meta['q_err'], meta['u'], meta['u_err']
-            except (Exception, SystemExit) as e:
-                # SystemExit included: see MultiNestWorker.run -- this runs on
-                # the main thread, so letting it escape uncaught would exit the
-                # whole app instead of just reporting the failure here.
-                QMessageBox.warning(self, 'Load samples', f'Failed to load samples:\n{e}')
-                return
-        else:
-            result = self._load_qu_fit_samples(directory)
-            if result is None:
-                return
-            model, spectral_pars, wl, q, q_err, u, u_err, sampled_idx, degenerate_pair = result
+        resolved = self._resolve_samples_directory(directory)
+        if resolved is None:
+            return
+        model, spectral_pars, wl, q, q_err, u, u_err, sampled_idx, overrides = resolved
 
         basename = os.path.join(directory, 'mn_')
 
@@ -1704,7 +1722,7 @@ class SamplingMixin:
         self.ls_worker = LoadSamplesWorker(dict(
             wl=wl, q=q, q_err=q_err, u=u, u_err=u_err, model=model,
             spectral_pars=spectral_pars, outputfiles_basename=basename,
-            sampled_idx=sampled_idx, degenerate_pair=degenerate_pair,
+            sampled_idx=sampled_idx, **overrides,
         ))
         self.ls_worker.finished_ok.connect(self.on_load_samples_finished)
         self.ls_worker.failed.connect(self.on_load_samples_failed)
@@ -1719,14 +1737,15 @@ class SamplingMixin:
         degenerate_pair) for fitting.load_previous_run's own overrides.
         wl/q/q_err/u/u_err come from the parent folder's plot_inputs.npz
         (qu_fit.py's own record of the fit data, reproducing its error
-        propagation exactly -- re-deriving q/u from a CSV wouldn't); a CSV
-        is still needed for the Stokes I(nu) values plot_inputs.npz lacks
-        (for this run's alpha estimate), tried first at the conventional
+        propagation exactly -- re-deriving q/u from a CSV wouldn't); the
+        Stokes I(nu) values plot_inputs.npz lacks (for this run's alpha
+        estimate) come from the currently loaded data if there is any,
+        otherwise from a CSV tried first at the conventional
         assets/data/<source>_<year>_VAPOLA.csv path (parsed from
         `directory`'s two parent folder names), falling back to a
         file-picker. Returns None (after warning the user) on any
         recognized failure; otherwise (model, spectral_pars, wl, q, q_err,
-        u, u_err, sampled_idx, degenerate_pair)."""
+        u, u_err, sampled_idx, overrides)."""
         name = os.path.basename(os.path.normpath(directory))
         entry = QU_FIT_MODEL_MAP.get(name)
         if entry is None or not os.path.exists(os.path.join(directory, 'mn_.txt')):
@@ -1738,8 +1757,11 @@ class SamplingMixin:
                 "recognized qu_fit.py model output directory.)")
             return None
         model_name, fixed_zero_idx, degenerate_pair = entry
-        model = MODELS_BY_NAME[model_name]
+        model = get_model_by_name(model_name)
         spec = MODELS[model]
+        overrides = {'param_scale': legacy_dphi_scale(model)}
+        if degenerate_pair is not None:
+            overrides['degenerate_pair'] = degenerate_pair
 
         parent = os.path.dirname(os.path.normpath(directory))
         plot_inputs_path = os.path.join(parent, 'plot_inputs.npz')
@@ -1754,28 +1776,33 @@ class SamplingMixin:
         wl, q, q_err, u, u_err = (plot_inputs['wl'], plot_inputs['qs'], plot_inputs['qers'],
                                     plot_inputs['us'], plot_inputs['uers'])
 
-        year = os.path.basename(parent)
-        source = os.path.basename(os.path.dirname(parent))
-        default_csv = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'assets', 'data',
-            f'{source}_{year}_VAPOLA.csv')
-        csv_path = default_csv if os.path.isfile(default_csv) else None
-        if csv_path is None:
-            csv_path, _ = QFileDialog.getOpenFileName(
-                self, f'Stokes I/Q/U data for {source} {year}', parent, 'CSV files (*.csv)')
-            if not csv_path:
-                return None
-
         # Deferred: app.py imports this module (SamplingMixin) at module
         # load time, so importing app.py back at *this* module's own top
         # level would be circular -- safe here since by call time (a user
         # actually clicking Load samples) app.py is already fully loaded.
         from polvista.app import load_vapola_csv, FIT_FIXED_EPSILON
-        try:
-            freq, I, _Q, _U, _I_err, _Q_err, _U_err = load_vapola_csv(csv_path)
-        except (OSError, ValueError, KeyError) as e:
-            QMessageBox.warning(self, 'Load samples', f'Failed to load data CSV:\n{csv_path}\n\n{e}')
-            return None
+
+        if self.fit_data is not None:
+            # Data is already loaded -- take I(nu) from it instead of
+            # searching for/prompting for a CSV (fit_data's 6th/7th entries).
+            freq, I = self.fit_data[5], self.fit_data[6]
+        else:
+            year = os.path.basename(parent)
+            source = os.path.basename(os.path.dirname(parent))
+            default_csv = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), 'assets', 'data',
+                f'{source}_{year}_VAPOLA.csv')
+            csv_path = default_csv if os.path.isfile(default_csv) else None
+            if csv_path is None:
+                csv_path, _ = QFileDialog.getOpenFileName(
+                    self, f'Stokes I/Q/U data for {source} {year}', parent, 'CSV files (*.csv)')
+                if not csv_path:
+                    return None
+            try:
+                freq, I, _Q, _U, _I_err, _Q_err, _U_err = load_vapola_csv(csv_path)
+            except (OSError, ValueError, KeyError) as e:
+                QMessageBox.warning(self, 'Load samples', f'Failed to load data CSV:\n{csv_path}\n\n{e}')
+                return None
 
         # Standard spectral parameters, same as a fresh Sampling-tab fit's
         # own pre-fit (app.fit_spectrum_lsq) would default to: powerlaw
@@ -1795,13 +1822,13 @@ class SamplingMixin:
             spectral_pars[i] = 0.0
         sampled_idx = [i for i in pol_idx(spec) if i not in fixed_zero_idx]
 
-        return model, spectral_pars, wl, q, q_err, u, u_err, sampled_idx, degenerate_pair
+        return model, spectral_pars, wl, q, q_err, u, u_err, sampled_idx, overrides
 
     def on_load_samples_finished(self, best_pars, errs, info):
         self._set_sampling_busy(False)
 
         model = self.mn_model
-        index = self.model_combo.findData(model)
+        index = self.model_index_for(model)
         if index == -1:
             # A hidden model (ModelSpec.hidden -- no built-in model
             # currently sets it, but a custom one may not be added yet)
@@ -1823,3 +1850,32 @@ class SamplingMixin:
         self._set_sampling_busy(False)
         QMessageBox.warning(self, 'Load samples', f'Failed to load samples:\n{msg}')
         self.ls_worker = None
+
+    def load_curve_samples_action(self):
+        """Comparison tab's Load samples: like load_samples_action, but the
+        result becomes a new curve in the Comparison list (see
+        on_curve_samples_finished) instead of replacing the Visualization
+        tab's model, sliders, posterior overlay and Corner plot."""
+        start_dir = self.sampling_outdir_edit.text() or os.getcwd()
+        directory = QFileDialog.getExistingDirectory(self, 'Load MultiNest samples', start_dir)
+        if not directory:
+            return
+        resolved = self._resolve_samples_directory(directory)
+        if resolved is None:
+            return
+        model, spectral_pars, wl, q, q_err, u, u_err, sampled_idx, overrides = resolved
+
+        self._set_sampling_busy(True, 'Loading samples...')
+        self.cs_worker = LoadSamplesWorker(dict(
+            wl=wl, q=q, q_err=q_err, u=u, u_err=u_err, model=model,
+            spectral_pars=spectral_pars, outputfiles_basename=os.path.join(directory, 'mn_'),
+            sampled_idx=sampled_idx, **overrides,
+        ))
+        self.cs_worker.finished_ok.connect(lambda best_pars, errs, info, m=model: self.on_curve_samples_finished(m, best_pars, errs, info))
+        self.cs_worker.failed.connect(self.on_curve_samples_failed)
+        self.cs_worker.start()
+
+    def on_curve_samples_failed(self, msg):
+        self._set_sampling_busy(False)
+        QMessageBox.warning(self, 'Load samples', f'Failed to load samples:\n{msg}')
+        self.cs_worker = None

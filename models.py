@@ -2,6 +2,8 @@
 
 """
 import re
+import math
+import contextlib
 from collections import OrderedDict
 import numpy as np
 import sympy
@@ -88,10 +90,16 @@ SPECTRAL_BETA = None    # log-parabola's curvature index: a
                          # two-component model's component-1 beta
 SPECTRAL_BETA_2 = None  # two-component log-parabola models' component-2
                          # curvature index, independent of SPECTRAL_BETA
+# Component 3's own, fully independent values (three-component weighted
+# models only; see component_spectral).
+SPECTRAL_SHAPE_3 = 'powerlaw'
+SPECTRAL_NU0_3 = None
+SPECTRAL_TEMP_3 = None
+SPECTRAL_BETA_3 = None
 
 
 def set_spectral_shape(shape, nu0=None, shape2=None, nu0_2=None, T=None, T2=None,
-                        beta=None, beta2=None):
+                        beta=None, beta2=None, shape3=None, nu0_3=None, T3=None, beta3=None):
     """Select the normalized intensity shape(s) I'(nu) used by every model's
     spectral weighting from here on: 'powerlaw' (the default; nu0
     auto-derived per call, always shared between both components of a
@@ -113,9 +121,12 @@ def set_spectral_shape(shape, nu0=None, shape2=None, nu0_2=None, T=None, T2=None
     either. All default to component 1's own value when not given, so
     single-component callers (and any two-component caller that hasn't
     been updated to pick component 2's shape independently) still get one
-    shared shape/nu0/T/beta as before."""
+    shared shape/nu0/T/beta as before. `shape3`/`nu0_3`/`T3`/`beta3` are
+    component 3's own (three-component weighted models), likewise
+    defaulting to component 1's."""
     global SPECTRAL_SHAPE, SPECTRAL_SHAPE_2, SPECTRAL_NU0, SPECTRAL_NU0_2
     global SPECTRAL_TEMP, SPECTRAL_TEMP_2, SPECTRAL_BETA, SPECTRAL_BETA_2
+    global SPECTRAL_SHAPE_3, SPECTRAL_NU0_3, SPECTRAL_TEMP_3, SPECTRAL_BETA_3
     SPECTRAL_SHAPE = shape
     SPECTRAL_SHAPE_2 = shape2 if shape2 is not None else shape
     SPECTRAL_NU0 = nu0
@@ -124,6 +135,40 @@ def set_spectral_shape(shape, nu0=None, shape2=None, nu0_2=None, T=None, T2=None
     SPECTRAL_TEMP_2 = T2 if T2 is not None else T
     SPECTRAL_BETA = beta
     SPECTRAL_BETA_2 = beta2 if beta2 is not None else beta
+    SPECTRAL_SHAPE_3 = shape3 if shape3 is not None else shape
+    SPECTRAL_NU0_3 = nu0_3 if nu0_3 is not None else nu0
+    SPECTRAL_TEMP_3 = T3 if T3 is not None else T
+    SPECTRAL_BETA_3 = beta3 if beta3 is not None else beta
+
+
+def component_spectral(k):
+    """(shape, nu0, T, beta) of component `k` (1, 2 or 3)."""
+    if k == 1:
+        return SPECTRAL_SHAPE, SPECTRAL_NU0, SPECTRAL_TEMP, SPECTRAL_BETA
+    if k == 2:
+        return SPECTRAL_SHAPE_2, SPECTRAL_NU0_2, SPECTRAL_TEMP_2, SPECTRAL_BETA_2
+    return SPECTRAL_SHAPE_3, SPECTRAL_NU0_3, SPECTRAL_TEMP_3, SPECTRAL_BETA_3
+
+
+def get_spectral_state():
+    """Snapshot of the module-level spectral shape state set_spectral_shape
+    writes, as set_spectral_shape's own kwargs -- see spectral_state."""
+    return dict(shape=SPECTRAL_SHAPE, nu0=SPECTRAL_NU0, shape2=SPECTRAL_SHAPE_2, nu0_2=SPECTRAL_NU0_2,
+                T=SPECTRAL_TEMP, T2=SPECTRAL_TEMP_2, beta=SPECTRAL_BETA, beta2=SPECTRAL_BETA_2,
+                shape3=SPECTRAL_SHAPE_3, nu0_3=SPECTRAL_NU0_3, T3=SPECTRAL_TEMP_3, beta3=SPECTRAL_BETA_3)
+
+
+@contextlib.contextmanager
+def spectral_state(state):
+    """Temporarily restore a get_spectral_state() snapshot -- lets a curve
+    frozen by the Add curve button keep its own spectral shape(s) after the
+    live Spectrum controls move on."""
+    saved = get_spectral_state()
+    set_spectral_shape(**state)
+    try:
+        yield
+    finally:
+        set_spectral_shape(**saved)
 
 
 def band_nu0(nu, nu_min):
@@ -257,22 +302,27 @@ def slab_factor(S):
     return np.where(small, 1 - S / 2, -np.expm1(-S_safe) / S_safe)
 
 
+# Maclaurin coefficients of sphere_factor's bracket for |S| < 0.5: the
+# coefficient of S^(n-3) is 3 (-1)^n (1-n)/n!, n = 3..19, highest power first
+# for np.polyval -- 1 - 3S/8 + S^2/10 - ...
+_SPHERE_SERIES = [3 * (-1) ** n * (1 - n) / math.factorial(n) for n in range(3, 20)][::-1]
+
+
 def sphere_factor(S):
     """Burn (1966) eq. 20: uniform sphere of diameter L, 3[(S+1)e^-S + S^2/2 - 1]/S^3.
     The bracket cancels to O(S^3), so |S| < 0.5 uses its Maclaurin series
-    3 * sum_{n>=3} (-1)^n (1-n)/n! S^(n-3) = 1 - 3S/8 + S^2/10 - ..."""
+    (see _SPHERE_SERIES) instead; each branch is evaluated only on the
+    points that need it."""
     S = np.asarray(S, dtype=complex)
     small = np.abs(S) < 0.5
-    S_safe = np.where(small, 1.0, S)
-    direct = 3 * ((S_safe + 1) * np.exp(-S_safe) + S_safe**2 / 2 - 1) / S_safe**3
-    series = np.zeros_like(S)
-    term_pow = np.ones_like(S)
-    fact = 6.0  # n! for n=3
-    for n in range(3, 20):
-        series = series + 3 * (-1)**n * (1 - n) / fact * term_pow
-        term_pow = term_pow * S
-        fact *= n + 1
-    return np.where(small, series, direct)
+    out = np.empty_like(S)
+    if small.any():
+        out[small] = np.polyval(_SPHERE_SERIES, S[small])
+    big = ~small
+    if big.any():
+        Sb = S[big]
+        out[big] = 3 * ((Sb + 1) * np.exp(-Sb) + Sb**2 / 2 - 1) / Sb**3
+    return out
 
 
 def intern_slab(x, params):
@@ -292,173 +342,82 @@ def intern_sphere(x, params):
     return p0 * np.exp(2j * X0) * sphere_factor(2 * dphi**2 * x**4 - 2j * phi * x**2)
 
 
-def partial2(x, params):
-    """internal screen with partial coverage (5 pars; trailing alpha inert)."""
-    p0, X0, phi, dphi, f = params[:5]
-    return p0 * np.exp(2j * X0) *(f* (1 - np.exp(-(2 * dphi**2 * x**4 - 2j * phi * x**2))) / (2 * (dphi+1e-10)**2 * x**4 - 2j * phi * x**2) + (1 - f))
-
-
-def ext_term(x, p, X, phi, dphi):
-    """Single external-Faraday-screen contribution -- the building block
-    shared by both components of comp2RMdep/comp2mixdep."""
-    return p * np.exp(2j * (X + phi * x**2)) * np.exp(-dphi**2 * x**4)
-
-
-def int_term(x, p, X, phi, dphi):
-    """Single internal-Faraday-screen contribution -- the building block
-    shared by both components of comp2intern/comp2mixdep."""
-    return p * np.exp(2j * X) * (1 - np.exp(-(2 * dphi**2 * x**4 - 2j * phi * x**2))) / (2 * (dphi+1e-10)**2 * x**4 - 2j * phi * x**2)
-
-
 def field_gradient(x, params):
     """one external screen with unresolved varying Faraday depth across the beam"""
     p0, X0, phi, D_phi, dphi = params[:5]
     return p0 * np.sin(D_phi * x**2 + 1e-10) / (D_phi * x**2 + 1e-10) * np.exp(-2 * dphi**2 * x**4 + 2j * (X0 + phi * x**2))
 
 
-def spectral_weights(x, eps, alpha1, alpha2, nu_min=None):
-    """w1(nu), w2(nu): each component's relative-intensity weight, i.e. its
-    own I_k(nu) up to the shared overall normalization (no separate I_0
-    needed -- these are shapes, amplitude 1 at each component's own
-    reference frequency).
+_WEIGHTS_CACHE = {}
+_WEIGHTS_CACHE_MAX = 16
 
-    epsilon is component 1's flux fraction at that reference frequency -- a
-    directly-set slider rather than something derived from per-component
-    turnover frequencies. Each weight then evolves away from it via that
-    component's own normalized intensity shape I'(nu), in that component's
-    own shape (see intensity_shape/set_spectral_shape -- the two
-    components need not share a shape):
-        w1 = eps * I1'(nu),  w2 = (1-eps) * I2'(nu)
-    w1+w2 is thus the (normalized) total Stokes I(nu) of the two-component
-    system; see stokes_I().
 
-    A component whose own shape is 'powerlaw' always uses the shared
-    reference frequency nu0 (`nu_min` [MHz] if given, else the *lowest*
-    frequency spanned by x -- the longest wavelength currently plotted);
-    one whose shape is 'ssa'/'thermal' instead uses its own turnover
-    frequency (and, for 'thermal', its own temperature), set via
-    set_spectral_shape (see component_reference_nu). Pass an explicit
-    `nu_min` to anchor the power-law case elsewhere (e.g. to loaded data's
-    own nu_min so the Stokes I/Q/U display doesn't drift when the plotted
-    wavelength range changes -- see MainWindow.data_nu_min)."""
+def spectral_weights_n(x, eps, alphas, nu_min=None):
+    """w_1..w_N(nu): each component's relative-intensity weight, i.e. its own
+    I_k(nu) up to the shared overall normalization -- shapes with amplitude 1
+    at each component's own reference frequency.
+
+    `eps` holds the N-1 epsilons, applied stick-breaking:
+        w_1 = eps_1 I_1',  w_2 = (1-eps_1) eps_2 I_2',  ...,
+        w_N = (1-eps_1)...(1-eps_{N-1}) I_N'
+    which for N=2 is the original w1 = eps I1', w2 = (1-eps) I2'. Each
+    eps_k is then component k's share of the flux left after the first k-1,
+    evaluated at the components' own reference frequencies. Every
+    eps_k lives in [0, 1], so the box prior stays rectangular.
+
+    A component whose own shape is 'powerlaw'/'logparabola' always uses the
+    shared reference frequency nu0 (`nu_min` [MHz] if given, else the lowest
+    frequency spanned by x); one whose shape is 'ssa'/'thermal' instead uses
+    its own turnover frequency (see component_reference_nu). Pass an explicit
+    `nu_min` to anchor the power-law case elsewhere (e.g. to loaded data's own
+    nu_min -- see MainWindow.data_nu_min)."""
+    n = len(alphas)
+    x = np.asarray(x)
+    # Memoized: a fit holds epsilon/alpha and the wavelengths fixed across
+    # every likelihood call, and a plot refresh asks for the same weights
+    # several times (stokes_I, stokes_components, ...).
+    key = (x.tobytes(), x.shape, tuple(float(e) for e in eps), tuple(float(a) for a in alphas), nu_min,
+           tuple(component_spectral(k + 1) for k in range(n)))
+    cached = _WEIGHTS_CACHE.get(key)
+    if cached is not None:
+        return list(cached)
     nu = C / x / 1e6  # MHz
-    nu0_1 = component_reference_nu(nu, nu_min, SPECTRAL_NU0, SPECTRAL_SHAPE)
-    nu0_2 = component_reference_nu(nu, nu_min, SPECTRAL_NU0_2, SPECTRAL_SHAPE_2)
-    w1 = eps * intensity_shape(nu, nu0_1, alpha1, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)
-    w2 = (1.0 - eps) * intensity_shape(nu, nu0_2, alpha2, SPECTRAL_SHAPE_2, T=SPECTRAL_TEMP_2, beta=SPECTRAL_BETA_2)
-    return w1, w2
+    shapes = []
+    for k in range(n):
+        shape, nu0, T, beta = component_spectral(k + 1)
+        nu_ref = component_reference_nu(nu, nu_min, nu0, shape)
+        shapes.append(intensity_shape(nu, nu_ref, alphas[k], shape, T=T, beta=beta))
+    ws = []
+    remaining = 1.0
+    for k in range(n - 1):
+        ws.append(remaining * eps[k] * shapes[k])
+        remaining = remaining * (1.0 - eps[k])
+    ws.append(remaining * shapes[-1])
+    for w in ws:
+        w.flags.writeable = False  # shared through the cache
+    if len(_WEIGHTS_CACHE) >= _WEIGHTS_CACHE_MAX:
+        _WEIGHTS_CACHE.pop(next(iter(_WEIGHTS_CACHE)))
+    _WEIGHTS_CACHE[key] = tuple(ws)
+    return ws
 
 
-def spectral_combine(x, term1, term2, eps, alpha1, alpha2):
-    """Blend two per-component polarization terms with independent
-    power-law spectral weighting, normalized so |P| can never exceed
-    max(|term1|,|term2|) regardless of alpha1/alpha2 -- i.e. spectral
-    effects alone can never push the observed polarization past 100%.
-    P = (w1*term1 + w2*term2) / (w1 + w2) is a convex combination of
-    term1, term2 at every wavelength, so |P| <= max(|term1|, |term2|)."""
-    w1, w2 = spectral_weights(x, eps, alpha1, alpha2)
-    return (w1 * term1 + w2 * term2) / (w1 + w2)
+def spectral_weights(x, eps, alpha1, alpha2, nu_min=None):
+    """Two-component spectral_weights_n: (w1, w2) = (eps I1', (1-eps) I2')."""
+    return tuple(spectral_weights_n(x, [eps], [alpha1, alpha2], nu_min=nu_min))
 
 
-def comp2RMdep(x, params):
-    """Two-component external Faraday screen with turb, each component
-    weighted by its own power-law spectral index (11 pars: p1,X1,phi1,
-    dphi1,p2,X2,phi2,dphi2,eps,alpha1,alpha2). alpha1=alpha2=0 reduces to
-    a plain eps/(1-eps) blend of the two components at every wavelength
-    (see spectral_combine)."""
-    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, eps, alpha1, alpha2 = params
-    term1 = ext_term(x, p1, X1, phi1, dphi1)
-    term2 = ext_term(x, p2, X2, phi2, dphi2)
-    return spectral_combine(x, term1, term2, eps, alpha1, alpha2)
+def spectral_combine_n(x, terms, eps, alphas):
+    """Blend per-component polarization terms by their spectral weights,
+    P = sum(w_k term_k) / sum(w_k): a convex combination at every wavelength,
+    so spectral effects alone can never push |P| past max_k |term_k|."""
+    ws = spectral_weights_n(x, eps, alphas)
+    total = ws[0]
+    num = ws[0] * terms[0]
+    for w, t in zip(ws[1:], terms[1:]):
+        total = total + w
+        num = num + w * t
+    return num / total
 
-
-def comp2intern(x, params):
-    """Two internal Faraday components, each weighted by its own power-law
-    spectral index (11 pars, see comp2RMdep's docstring)."""
-    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, eps, alpha1, alpha2 = params
-    term1 = int_term(x, p1, X1, phi1, dphi1)
-    term2 = int_term(x, p2, X2, phi2, dphi2)
-    return spectral_combine(x, term1, term2, eps, alpha1, alpha2)
-
-
-def comp2mixdep(x, params):
-    """One internal + one external Faraday component, each weighted by its
-    own power-law spectral index (11 pars, see comp2RMdep's docstring)."""
-    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, eps, alpha1, alpha2 = params
-    term1 = int_term(x, p1, X1, phi1, dphi1)
-    term2 = ext_term(x, p2, X2, phi2, dphi2)
-    return spectral_combine(x, term1, term2, eps, alpha1, alpha2)
-
-
-def classic_sum_combine(term1, term2):
-    """Plain per-component sum P = term1 + term2 -- the two-component
-    convention ~/Downloads/pipe/qu_fit.py's own comp2RMdep/comp2mixdep (and
-    their "no dep"/"mid" dphi-reduced variants) always used, unlike this
-    app's own spectral_combine (an eps-weighted *convex* combination,
-    (w1*term1+w2*term2)/(w1+w2)).
-
-    Used by the *_classic model variants below -- selectable from the
-    Model dropdown like any other, and also what sampling.SamplingMixin's
-    qu_fit.py sample-import path (_load_qu_fit_samples) maps a qu_fit.py
-    run to, so it can re-read that run's own p1/p2 samples unchanged. Feeding them through spectral_combine's own formula
-    instead would need each doubled to compensate (at eps=0.5 with
-    alpha1=alpha2, spectral_combine's average is exactly half this plain
-    sum) -- which pushes them past this model's own registered p bounds
-    and gets silently clamped by the p slider, visibly offsetting the
-    drawn curve from the loaded posterior samples themselves (never
-    clamped, since they're plotted directly, not routed through a
-    slider)."""
-    return term1 + term2
-
-
-def comp2RMdep_classic(x, params):
-    """Two-component external Faraday screen with turb, combined via
-    classic_sum_combine rather than spectral_combine (9 pars: p1,X1,phi1,
-    dphi1,p2,X2,phi2,dphi2,alpha). With no per-component spectral
-    weighting in this P(lambda) formula, it's registered as a
-    single-spectral-component model (n_components=1): one alpha that only
-    shapes stokes_I()'s own I(nu) display, like any single-component
-    model's. See classic_sum_combine's own docstring for why this variant
-    exists -- reached by loading a qu_fit.py '2 Ext'/'2 Ext dep'/
-    '2 Ext dep1' run (sampling.QU_FIT_MODEL_MAP)."""
-    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, alpha = params
-    term1 = ext_term(x, p1, X1, phi1, dphi1)
-    term2 = ext_term(x, p2, X2, phi2, dphi2)
-    return classic_sum_combine(term1, term2)
-
-
-def comp2mixdep_classic(x, params):
-    """One internal + one external Faraday component, combined via
-    classic_sum_combine rather than spectral_combine (9 pars, same layout
-    as comp2RMdep_classic). See comp2RMdep_classic's own docstring -- reached
-    by loading a qu_fit.py 'Int+Ext'/'Int+Ext dep' run."""
-    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, alpha = params
-    term1 = int_term(x, p1, X1, phi1, dphi1)
-    term2 = ext_term(x, p2, X2, phi2, dphi2)
-    return classic_sum_combine(term1, term2)
-
-
-def comp2intern_classic(x, params):
-    """Two internal Faraday components, combined via classic_sum_combine
-    rather than spectral_combine (9 pars, same layout as
-    comp2RMdep_classic). See comp2RMdep_classic's own docstring -- no
-    qu_fit.py import maps here (see sampling.QU_FIT_MODEL_MAP's note on
-    '2_Int')."""
-    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, alpha = params
-    term1 = int_term(x, p1, X1, phi1, dphi1)
-    term2 = int_term(x, p2, X2, phi2, dphi2)
-    return classic_sum_combine(term1, term2)
-
-
-# Each two-component model's own per-component (term1, term2) building
-# blocks, in the same order as its own 11-param layout -- lets
-# stokes_components() recover each component's contribution without
-# duplicating comp2RMdep/comp2intern/comp2mixdep's own term selection.
-COMPONENT_TERM_FUNCS = {
-    comp2RMdep: (ext_term, ext_term),
-    comp2intern: (int_term, int_term),
-    comp2mixdep: (int_term, ext_term),
-}
 
 
 def evpa(fit):
@@ -509,12 +468,11 @@ def stokes_I(wl, n_components, pars, nu_min=None):
         raw = intensity_shape(nu, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)
         raw_ref = intensity_shape(nu_min_arr, nu0, alpha, SPECTRAL_SHAPE, T=SPECTRAL_TEMP, beta=SPECTRAL_BETA)[0]
     else:
-        eps, alpha1, alpha2 = pars[-3:]
+        n = n_components
+        eps, alphas = list(pars[-(2 * n - 1):-n]), list(pars[-n:])
         wl_ref = two_component_ref_wl(nu, nu_min)
-        w1, w2 = spectral_weights(wl, eps, alpha1, alpha2, nu_min=nu_min)
-        raw = w1 + w2
-        w1_ref, w2_ref = spectral_weights(np.array([wl_ref]), eps, alpha1, alpha2, nu_min=nu_min)
-        raw_ref = (w1_ref + w2_ref)[0]
+        raw = sum(spectral_weights_n(wl, eps, alphas, nu_min=nu_min))
+        raw_ref = sum(spectral_weights_n(np.array([wl_ref]), eps, alphas, nu_min=nu_min))[0]
     return raw / raw_ref
 
 
@@ -536,31 +494,28 @@ def stokes_QU(wl, model, n_components, pars, nu_min=None, I=None):
 
 
 def stokes_components(wl, model, pars, nu_min=None):
-    """Decompose a two-component model's Stokes I/Q/U into each
-    component's own contribution: ((I1, Q1, U1), (I2, Q2, U2)), in the
-    same nu_min=1-normalized units as stokes_I/stokes_QU, so I1+I2 equals
-    stokes_I(...)'s own output and (Q1+Q2, U1+U2) equals stokes_QU(...)'s
-    -- each component's own term (see COMPONENT_TERM_FUNCS) weighted by
-    its own share (w1 or w2, see spectral_weights) of the same raw_ref
-    normalization stokes_I anchors the total to."""
-    term1_func, term2_func = COMPONENT_TERM_FUNCS[model]
-    p1, X1, phi1, dphi1, p2, X2, phi2, dphi2, eps, alpha1, alpha2 = pars
-    term1 = term1_func(wl, p1, X1, phi1, dphi1)
-    term2 = term2_func(wl, p2, X2, phi2, dphi2)
+    """Decompose a weighted multi-component model's Stokes I/Q/U into each
+    component's own contribution: [(I_k, Q_k, U_k), ...], in the same
+    nu_min=1-normalized units as stokes_I/stokes_QU, so sum_k I_k equals
+    stokes_I(...)'s own output and (sum Q_k, sum U_k) equals stokes_QU(...)'s
+    -- each component's own term (see component_terms) weighted by its own
+    share w_k (see spectral_weights_n) of the same raw_ref normalization
+    stokes_I anchors the total to."""
+    n = model.composite['n']
+    eps, alphas = list(pars[-(2 * n - 1):-n]), list(pars[-n:])
 
     nu = C / wl / 1e6  # MHz
     if nu_min is None:
         nu_min = np.min(nu)
     wl_ref = two_component_ref_wl(nu, nu_min)  # matches stokes_I's own anchor
 
-    w1, w2 = spectral_weights(wl, eps, alpha1, alpha2, nu_min=nu_min)
-    w1_ref, w2_ref = spectral_weights(np.array([wl_ref]), eps, alpha1, alpha2, nu_min=nu_min)
-    raw_ref = (w1_ref + w2_ref)[0]
-
-    I1, I2 = w1 / raw_ref, w2 / raw_ref
-    Q1, U1 = term1.real * I1, term1.imag * I1
-    Q2, U2 = term2.real * I2, term2.imag * I2
-    return (I1, Q1, U1), (I2, Q2, U2)
+    ws = spectral_weights_n(wl, eps, alphas, nu_min=nu_min)
+    raw_ref = sum(spectral_weights_n(np.array([wl_ref]), eps, alphas, nu_min=nu_min))[0]
+    out = []
+    for term, w in zip(component_terms(model, wl, pars), ws):
+        I_k = w / raw_ref
+        out.append((I_k, term.real * I_k, term.imag * I_k))
+    return out
 
 
 # ── Model metadata: ModelSpec registry ────────────────────────────────────────
@@ -606,6 +561,15 @@ class ModelSpec:
     # see sampling.SamplingMixin.on_load_samples_finished for the
     # equivalent insert-if-missing this needs.
     hidden: bool = False
+    # Short name used to label a curve added with the Visualization tab's
+    # Add curve button in plot legends and the Comparison tab (borrowed from
+    # ~/Downloads/pipe/qu_fit.py's plot_label/label, e.g. 'Int+Ext'); falls
+    # back to `label` when empty (e.g. custom models, see display_name).
+    plot_name: str = ''
+
+    @property
+    def display_name(self):
+        return self.plot_name or self.label
 
     @property
     def param_names(self):
@@ -631,29 +595,31 @@ def register(func, **kwargs):
     MODELS_BY_NAME[func.__name__] = func
 
 
-def spectral_params():
-    """The 3 trailing params every two-component model appends: epsilon
-    (component 1's own weight w1 at component 1's own reference frequency
-    -- nu_min, the lowest frequency/longest wavelength currently plotted,
-    unless component 1's own shape is 'ssa'/'thermal', in which case it's
-    that component's own turnover nu0 instead; see
-    component_reference_nu/spectral_weights) and each component's own
-    power-law spectral index, used to weight that component's contribution
-    to the total by (nu/nu0)**alpha. alpha1=alpha2=0 reduces to a plain
-    eps/(1-eps) blend at every wavelength (see spectral_combine). Note
-    epsilon only equals I1/(I1+I2) *at that same reference frequency* when
-    component 2 also happens to equal 1 there -- true by default (both
-    components sharing the band-edge nu_min under 'powerlaw'/
-    'logparabola'), but not guaranteed once either component uses its own
-    independent turnover."""
-    return [Param('epsilon', r'$\varepsilon$', 'eps',
-                  "Component 1's own weight at its own reference frequency "
-                  "(the lowest plotted frequency, or its own turnover under "
-                  "SSA/thermal); sets which component dominates"),
-            Param('alpha1', r'$\alpha_1$', 'alpha',
-                  "Spectral index of component 1's intensity: I1(nu) ∝ nu^alpha1."),
-            Param('alpha2', r'$\alpha_2$', 'alpha',
-                  "Spectral index of component 2's intensity: I2(nu) ∝ nu^alpha2.")]
+def spectral_params(n=2):
+    """The 2n-1 trailing params every weighted n-component model appends: the
+    n-1 epsilons (stick-breaking, see spectral_weights_n: epsilon_k is
+    component k's own weight, among the flux left after components 1..k-1,
+    at its own reference frequency -- nu_min, the lowest plotted frequency,
+    unless that component's shape is 'ssa'/'thermal', in which case it's its
+    own turnover nu0 instead; see component_reference_nu) and each
+    component's own power-law spectral index, used to weight that
+    component's contribution to the total by (nu/nu0)**alpha. All alphas 0
+    reduces to a plain epsilon blend at every wavelength. For n=2 the single
+    epsilon is simply named 'epsilon' (w1 = epsilon I1', w2 = (1-epsilon) I2')."""
+    params = []
+    for k in range(1, n):
+        name = 'epsilon' if n == 2 else f'epsilon{k}'
+        latex = r'$\varepsilon$' if n == 2 else rf'$\varepsilon_{k}$'
+        what = ("Component 1's own weight" if k == 1 else
+                f"Component {k}'s share of the weight left after components 1-{k - 1}")
+        params.append(Param(name, latex, 'eps',
+                            what + " at its own reference frequency (the lowest plotted "
+                            "frequency, or its own turnover under SSA/thermal); sets which "
+                            "component dominates"))
+    for k in range(1, n + 1):
+        params.append(Param(f'alpha{k}', rf'$\alpha_{k}$', 'alpha',
+                            f"Spectral index of component {k}'s intensity: I{k}(nu) ∝ nu^alpha{k}."))
+    return params
 
 
 def spectral_param_single():
@@ -676,18 +642,18 @@ SPECTRAL_BOUNDS_HI_SINGLE = [3.0]
 
 
 register(burn,
-    label='External screen with depolarization (Burn)', title='Burn depolarization',
+    plot_name='Burn', label='External screen with depolarization (Burn)', title='Burn depolarization',
     params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
             Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
             Param('phi', r'$\phi$', 'phi', 'Faraday depth (RM-like): sets how fast EVPA rotates with lambda^2.'),
             Param('dphi', r'$\sigma_{\phi}$', 'dphi', 'Faraday depth dispersion across the external turbulent screen; drives depolarization at long wavelengths.')] + spectral_param_single(),
-    bounds=([0, -np.pi / 2, -5e6, 1e2] + SPECTRAL_BOUNDS_LO_SINGLE,
+    bounds=([0, -np.pi / 2, -5e6, 0] + SPECTRAL_BOUNDS_LO_SINGLE,
             [0.7, np.pi / 2, 5e6, 1e6] + SPECTRAL_BOUNDS_HI_SINGLE),
     n_components=1, n_live_points=500,
     equation=r'$P(\lambda)=p_0\,e^{-2\sigma_\phi^2\lambda^4}\,e^{\,2i(\chi_0+\phi\lambda^2)}$')
 
 register(tribble,
-    label='Partially resolved external screen (Tribble)', title='Tribble screen',
+    plot_name='Tribble', label='Partially resolved external screen (Tribble)', title='Tribble screen',
     params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
             Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
             Param('phi', r'$\phi$', 'phi', 'Faraday depth (RM-like): sets how fast EVPA rotates with lambda^2.'),
@@ -699,7 +665,7 @@ register(tribble,
     equation=r'$P(\lambda)=p_0\left[\dfrac{1-e^{-s^2/2-4\sigma_\phi^2\lambda^4}}{1+8\sigma_\phi^2\lambda^4/s^2}+e^{-s^2/2-4\sigma_\phi^2\lambda^4}\right]^{1/2}\!e^{\,2i(\chi_0+\phi\lambda^2)}$')
 
 register(partial,
-    label='Partial coverage external screen', title='Partial coverage external',
+    plot_name='Partial', label='Partial coverage external screen', title='Partial coverage external',
     params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
             Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
             Param('phi', r'$\phi$', 'phi', 'Faraday depth (RM-like): sets how fast EVPA rotates with lambda^2.'),
@@ -711,7 +677,7 @@ register(partial,
     equation=r'$P(\lambda)=p_0\left[f\,e^{-2\sigma_\phi^2\lambda^4}e^{\,2i(\chi_0+\phi\lambda^2)}+(1-f)\,e^{2i\chi_0}\right]$')
 
 register(field_gradient,
-    label='Field gradient', title='Field gradient external screen',
+    plot_name='Field grad', label='Field gradient', title='Field gradient external screen',
     params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
             Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
             Param('phi', r'$\phi$', 'phi', 'Mean Faraday depth: sets how fast EVPA rotates with lambda^2.'),
@@ -725,7 +691,7 @@ register(field_gradient,
 
 
 register(intern_slab,
-    label='Internal screen, slab (Burn)', title='Internal screen (slab)',
+    plot_name='Int slab', label='Internal screen, slab (Burn)', title='Internal screen (slab)',
     params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
             Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
             Param('phi', r'$\phi$', 'phi', 'Faraday depth (RM-like): sets how fast EVPA rotates with lambda^2.'),
@@ -736,7 +702,7 @@ register(intern_slab,
     equation=r'$P(\lambda)=p_0\,e^{2i\chi_0}\,\left[\frac{1-e^{-\left(2\sigma_\phi^2\lambda^4-2i\phi\lambda^2\right)}}{2\sigma_\phi^2\lambda^4-2i\phi\lambda^2}\right]$')
 
 register(intern_sphere,
-    label='Internal screen, sphere (Burn)', title='Internal screen (sphere)',
+    plot_name='Int sphere', label='Internal screen, sphere (Burn)', title='Internal screen (sphere)',
     params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
             Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
             Param('phi', r'$\phi$', 'phi', 'Faraday depth across the full diameter: sets how fast EVPA rotates with lambda^2.'),
@@ -749,127 +715,206 @@ register(intern_sphere,
 # Legacy name for intern_slab, so saved models/sidecars naming 'intern' still load.
 MODELS_BY_NAME['intern'] = intern_slab
 
-register(partial2,
-    label='Partial coverage internal screen', title='Partial coverage internal',
-    params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
-            Param('X_0', r'$\chi_0$', 'X', 'Intrinsic EVPA (polarization angle) at lambda=0.'),
-            Param('phi', r'$\phi$', 'phi', 'Faraday depth (RM-like): sets how fast EVPA rotates with lambda^2.'),
-            Param('dphi', r'$\sigma_{\phi}$', 'dphi', 'Faraday depth dispersion across the covering part of the internal screen; drives depolarization at long wavelengths.'),
-            Param('f', r'$f$', 'scale', 'Covering fraction of the depolarizing internal screen; the remaining (1-f) of the emission passes through unchanged.')] + spectral_param_single(),
-    bounds=([0, -np.pi / 2, -5e6, 0, 0] + SPECTRAL_BOUNDS_LO_SINGLE,
-            [0.7, np.pi / 2, 5e6, 5e6, 1] + SPECTRAL_BOUNDS_HI_SINGLE),
-    n_components=1, n_live_points=1200,  # no qu_fit.py counterpart -- reuses partial's own value (see ModelSpec.n_live_points)
-    equation=r'$P(\lambda)=p_0\,e^{2i\chi_0}\left\{f\left[\frac{1-e^{-\left(2\sigma_\phi^2\lambda^4-2i\phi\lambda^2\right)}}{2\sigma_\phi^2\lambda^4-2i\phi\lambda^2}\right]+(1-f)\right\}$')
+
+# ── Multi-component models, composed at runtime from the single-screen ones ──
+# A composite is `n` single-screen components (any mix of SCREENS below),
+# combined either by a plain sum ('class', the qu_fit.py convention: no
+# spectral weighting, one alpha) or by spectrally weighted blending
+# ('weight': n-1 stick-breaking epsilons and one alpha per component, see
+# spectral_weights_n). Building one registers it in MODELS/MODELS_BY_NAME
+# under a deterministic name -- e.g. 'weight_Ext_Intslb', or
+# 'class_Ext_Ext_Tribble' -- that get_model_by_name can rebuild from scratch,
+# which is what lets saved models, MultiNest output folders and the
+# standalone fitting scripts refer to a composite by name alone.
+#
+# Parameter layout: each component's own params (its single-screen model's,
+# minus the trailing alpha, suffixed by the component number: p_1, X_1,
+# phi1, dphi1, ...), then the weighted blend's spectral params
+# (spectral_params(n)) or, for 'class', one alpha.
+
+# code -> (single-screen func, short label, per-component P_k(lambda) latex
+# with '@' as the component index, extra latex line defining S_@ or '').
+_S_DEF = r',\;S_@=2\sigma_{\phi,@}^2\lambda^4-2i\phi_@\lambda^2'
+SCREENS = OrderedDict([
+    ('Ext', dict(func=burn, label='Burn external',
+                 term=r'p_@\,e^{-2\sigma_{\phi,@}^2\lambda^4}e^{\,2i(\chi_@+\phi_@\lambda^2)}', extra='')),
+    ('Tribble', dict(func=tribble, label='Tribble external',
+                     term=(r'p_@\left[\dfrac{1-e^{-s_@^2/2-4\sigma_{\phi,@}^2\lambda^4}}{1+8\sigma_{\phi,@}^2\lambda^4/s_@^2}'
+                           r'+e^{-s_@^2/2-4\sigma_{\phi,@}^2\lambda^4}\right]^{1/2}e^{\,2i(\chi_@+\phi_@\lambda^2)}'), extra='')),
+    ('pExt', dict(func=partial, label='Partial-coverage external',
+                  term=(r'p_@\left[f_@\,e^{-2\sigma_{\phi,@}^2\lambda^4}e^{\,2i(\chi_@+\phi_@\lambda^2)}'
+                        r'+(1-f_@)\,e^{2i\chi_@}\right]'), extra='')),
+    ('Grad', dict(func=field_gradient, label='Field gradient external',
+                  term=(r'p_@\,\dfrac{\sin(\Delta_{\phi,@}\lambda^2)}{\Delta_{\phi,@}\lambda^2}'
+                        r'\,e^{-2\sigma_{\phi,@}^2\lambda^4}e^{\,2i(\chi_@+\phi_@\lambda^2)}'), extra='')),
+    ('Intslb', dict(func=intern_slab, label='Internal slab',
+                    term=r'p_@\,e^{2i\chi_@}\,\dfrac{1-e^{-S_@}}{S_@}', extra=_S_DEF)),
+    ('Intsph', dict(func=intern_sphere, label='Internal sphere',
+                    term=r'p_@\,e^{2i\chi_@}\,\dfrac{3\left[(S_@+1)e^{-S_@}+S_@^2/2-1\right]}{S_@^3}', extra=_S_DEF)),
+])
+DEFAULT_SCREEN = 'Ext'
+
+# Per-component (name, latex) templates for each single-screen param name;
+# anything not listed gets a '_k' suffix.
+_COMP_NAME = {'p_0': 'p_{k}', 'X_0': 'X_{k}', 'phi': 'phi{k}', 'dphi': 'dphi{k}', 'D_phi': 'Dphi{k}'}
+_COMP_LATEX = {'p_0': r'p_{k}', 'X_0': r'\chi_{k}', 'phi': r'\phi_{k}', 'dphi': r'\sigma_{\phi,k}',
+               'D_phi': r'\Delta_{\phi,k}'}
+
+COMPOSITE_PREFIX = {'class': 'class', 'weight': 'weight'}
+COMPOSITE_LIVE_POINTS = {2: 2500, 3: 4000}
+_COMPOSITES = {}
 
 
-# ── qu_fit.py-style ("classic") two-component variants ────────────────────
-# Same polarization params/bounds as comp2RMdep/comp2mixdep above (so a
-# loaded qu_fit.py run's own p1/p2 samples are never out of range -- see
-# classic_sum_combine's docstring), just classic_sum_combine's plain sum
-# instead of spectral_combine's eps-weighted blend. No spectral weighting,
-# so a single spectral component (one alpha, n_components=1) rather than
-# comp2RMdep's eps/alpha1/alpha2.
-register(comp2RMdep_classic,
-    label='2 External screens (classic)', title='2 External components (classic)',
-    params=[Param('p_1', r'$p_1$', 'p', "Component 1's intrinsic fractional polarization."),
-            Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
-            Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
-            Param('dphi1', r'$\sigma_{\phi,1}$', 'dphi', "Component 1's Faraday depth dispersion across its external screen."),
-            Param('p_2', r'$p_2$', 'p', "Component 2's intrinsic fractional polarization."),
-            Param('X_2', r'$\chi_2$', 'X', "Component 2's intrinsic EVPA at lambda=0."),
-            Param('phi2', r'$\phi_2$', 'phi', "Component 2's Faraday depth (RM-like)."),
-            Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its external screen.")] + spectral_param_single(),
-    bounds=([0, -np.pi / 2, -5e6, 1, 0, -np.pi / 2, -5e6, 1] + SPECTRAL_BOUNDS_LO_SINGLE,
-            [0.7, np.pi / 2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
-    n_components=1, n_live_points=2500, hidden=False,
-    equation=(r'$P(\lambda)=p_1e^{-\sigma_{\phi,1}^2\lambda^4}e^{\,2i(\chi_1+\phi_1\lambda^2)}'
-              r'+p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
+def composite_name(mode, codes):
+    """Deterministic model-function name for a composite: 'weight_Ext_Intslb'."""
+    return '_'.join([COMPOSITE_PREFIX[mode], *codes])
 
 
-register(comp2RMdep,
-    label='2 External screens (weighted)', title='2 External components (weighted)',
-    params=[Param('p_1', r'$p_1$', 'p', "Component 1's intrinsic fractional polarization."),
-            Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
-            Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
-            Param('dphi1', r'$\sigma_{\phi,1}$', 'dphi', "Component 1's Faraday depth dispersion across its external screen."),
-            Param('p_2', r'$p_2$', 'p', "Component 2's intrinsic fractional polarization."),
-            Param('X_2', r'$\chi_2$', 'X', "Component 2's intrinsic EVPA at lambda=0."),
-            Param('phi2', r'$\phi_2$', 'phi', "Component 2's Faraday depth (RM-like)."),
-            Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its external screen.")] + spectral_params(),
-    bounds=([0, -np.pi / 2, -5e6, 1, 0, -np.pi / 2, -5e6, 1] + SPECTRAL_BOUNDS_LO,
-            [0.7, np.pi / 2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI),
-    n_components=2, n_live_points=2500,
-    equation=(r'$P(\lambda)=\frac{w_1}{w_1+w_2}p_1e^{-\sigma_{\phi,1}^2\lambda^4}e^{\,2i(\chi_1+\phi_1\lambda^2)}'
-              r'+\frac{w_2}{w_1+w_2}p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
+def parse_composite_name(name):
+    """(mode, codes) for a name composite_name produced, else None."""
+    prefix, _, rest = name.partition('_')
+    codes = tuple(rest.split('_')) if rest else ()
+    if prefix not in COMPOSITE_PREFIX or not 2 <= len(codes) <= 3 or any(c not in SCREENS for c in codes):
+        return None
+    return prefix, codes
 
 
-register(comp2intern_classic,
-    label='2 Internal screens (classic)', title='2 internal components (classic)',
-    params=[Param('p_1', r'$p_1$', 'p', "Component 1's intrinsic fractional polarization."),
-            Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
-            Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
-            Param('dphi1', r'$\sigma_{\phi,1}$', 'dphi', "Component 1's Faraday depth dispersion across its internal screen."),
-            Param('p_2', r'$p_2$', 'p', "Component 2's intrinsic fractional polarization, before Faraday depolarization."),
-            Param('X_2', r'$\chi_2$', 'X', "Component 2's intrinsic EVPA at lambda=0."),
-            Param('phi2', r'$\phi_2$', 'phi', "Component 2's Faraday depth (RM-like)."),
-            Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its internal screen.")] + spectral_param_single(),
-    bounds=([0, -np.pi / 2, -5e6, 1, 0, -np.pi / 2, -5e6, 1] + SPECTRAL_BOUNDS_LO_SINGLE,
-            [0.7, np.pi / 2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
-    n_components=1, n_live_points=2500, hidden=False,
-    equation=(r'$P(\lambda)=p_1\,e^{2i\chi_1}\left[\frac{1-e^{-\left(2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2\right)}}{2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2}\right]'
-              r'+p_2\,e^{2i\chi_2}\left[\frac{1-e^{-\left(2\sigma_{\phi,2}^2\lambda^4-2i\phi_2\lambda^2\right)}}{2\sigma_{\phi,2}^2\lambda^4-2i\phi_2\lambda^2}\right]$'))
+def _component_params(code, k):
+    """(Param list, lower bounds, upper bounds) of one component, taken from
+    the single-screen spec minus its trailing alpha."""
+    spec = MODELS[SCREENS[code]['func']]
+    params, lo, hi = [], [], []
+    for par, l, h in zip(spec.params[:-1], spec.bounds[0][:-1], spec.bounds[1][:-1]):
+        name = _COMP_NAME.get(par.name, par.name + '_{k}').replace('{k}', str(k))
+        sym = _COMP_LATEX.get(par.name, par.latex.strip('$') + '_{k}').replace('{k}', '{%d}' % k)
+        params.append(Param(name, f'${sym}$', par.kind, f"Component {k}: {par.description}"))
+        lo.append(l)
+        hi.append(h)
+    return params, lo, hi
 
 
-register(comp2intern,
-    label='2 Internal screens (weighted)', title='2 internal components (weighted)',
-    params=[Param('p_1', r'$p_1$', 'p', "Component 1's intrinsic fractional polarization."),
-            Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
-            Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
-            Param('dphi1', r'$\sigma_{\phi,1}$', 'dphi', "Component 1's Faraday depth dispersion across its internal screen."),
-            Param('p_2', r'$p_2$', 'p', "Component 2's intrinsic fractional polarization, before Faraday depolarization."),
-            Param('X_2', r'$\chi_2$', 'X', "Component 2's intrinsic EVPA at lambda=0."),
-            Param('phi2', r'$\phi_2$', 'phi', "Component 2's Faraday depth (RM-like)."),
-            Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its internal screen.")] + spectral_params(),
-    bounds=([0, -np.pi / 2, -5e6, 1, 0, -np.pi / 2, -5e6, 1] + SPECTRAL_BOUNDS_LO,
-            [0.7, np.pi / 2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI),
-    n_components=2, n_live_points=2500,
-    equation=(r'$P(\lambda)=\frac{w_1}{w_1+w_2}p_1\,e^{2i\chi_1}\left[\frac{1-e^{-\left(2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2\right)}}{2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2}\right]'
-    	      r'+\frac{w_2}{w_1+w_2}p_2\,e^{2i\chi_2}\left[\frac{1-e^{-\left(2\sigma_{\phi,2}^2\lambda^4-2i\phi_2\lambda^2\right)}}{2\sigma_{\phi,2}^2\lambda^4-2i\phi_2\lambda^2}\right]$'))
+def get_composite(mode, codes):
+    """The (cached, registered) composite model function for `mode` ('class'
+    or 'weight') and a tuple of 2-3 SCREENS codes."""
+    codes = tuple(codes)
+    key = (mode, codes)
+    if key in _COMPOSITES:
+        return _COMPOSITES[key]
+    n = len(codes)
+    params, lo, hi, terms = [], [], [], []
+    for k, code in enumerate(codes, start=1):
+        cp, cl, ch = _component_params(code, k)
+        terms.append((SCREENS[code]['func'], len(params), len(cp)))
+        params += cp
+        lo += cl
+        hi += ch
+    n_comp_pars = len(params)
+    if mode == 'weight':
+        params += spectral_params(n)
+        lo += [0.0] * (n - 1) + [-3.0] * n
+        hi += [1.0] * (n - 1) + [3.0] * n
+    else:
+        params += spectral_param_single()
+        lo += SPECTRAL_BOUNDS_LO_SINGLE
+        hi += SPECTRAL_BOUNDS_HI_SINGLE
+
+    if mode == 'class':
+        def func(x, params):
+            return sum(f(x, params[o:o + sz]) for f, o, sz in terms)
+    else:
+        def func(x, params):
+            comp = [f(x, params[o:o + sz]) for f, o, sz in terms]
+            return spectral_combine_n(x, comp, params[n_comp_pars:n_comp_pars + n - 1],
+                                      params[n_comp_pars + n - 1:n_comp_pars + 2 * n - 1])
+    func.__name__ = func.__qualname__ = composite_name(mode, codes)
+    func.__doc__ = f"{mode} composite of {', '.join(codes)} ({len(params)} pars)"
+    func.composite = dict(mode=mode, codes=codes, n=n, terms=terms)
+
+    lines = []
+    for k, code in enumerate(codes, start=1):
+        sc = SCREENS[code]
+        lines.append(r'$P_{%d}(\lambda)=%s%s$' % (k, sc['term'].replace('@', str(k)), sc['extra'].replace('@', str(k))))
+    if mode == 'weight':
+        den = '+'.join(f'w_{k}' for k in range(1, n + 1))
+        num = '+'.join(f'w_{k}P_{k}' for k in range(1, n + 1))
+        lines.append(r'$P(\lambda)=\dfrac{%s}{%s}$' % (num, den))
+    else:
+        lines.append(r'$P(\lambda)=%s$' % '+'.join(f'P_{k}' for k in range(1, n + 1)))
+
+    label = ' + '.join(SCREENS[c]['label'] for c in codes) + (' (weighted)' if mode == 'weight' else ' (classic)')
+    register(func,
+        plot_name='+'.join(codes), label=label, title=label, params=params, bounds=(lo, hi),
+        n_components=n if mode == 'weight' else 1, n_live_points=COMPOSITE_LIVE_POINTS[n],
+        equation='\n'.join(lines))
+    _COMPOSITES[key] = func
+    return func
 
 
-
-register(comp2mixdep_classic,
-    label='Internal and external screens (classic)', title='Internal + external components (classic)',
-    params=[Param('p_1', r'$p_1$', 'p', "Component 1's (internal screen) intrinsic fractional polarization."),
-            Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
-            Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
-            Param('dphi1', r'$\sigma_{\phi,1}$', 'dphi', "Component 1's Faraday depth dispersion across its internal screen."),
-            Param('p_2', r'$p_2$', 'p', "Component 2's (external screen) intrinsic fractional polarization."),
-            Param('X_2', r'$\chi_2$', 'X', "Component 2's intrinsic EVPA at lambda=0."),
-            Param('phi2', r'$\phi_2$', 'phi', "Component 2's Faraday depth (RM-like)."),
-            Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its external screen.")] + spectral_param_single(),
-    bounds=([0, -np.pi/2, -5e6, 1, 0, -np.pi/2, -5e6, 1] + SPECTRAL_BOUNDS_LO_SINGLE,
-            [0.7, np.pi/2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
-    n_components=1, n_live_points=2500, hidden=False,
-    equation=(r'$P(\lambda)=p_1\,e^{2i\chi_1}\left[\frac{1-e^{-\left(2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2\right)}}{2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2}\right]'
-              r'+p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
+def is_composite(func):
+    return hasattr(func, 'composite')
 
 
-register(comp2mixdep,
-    label='Internal and external screens (weighted)', title='Internal + external components (weighted)',
-    params=[Param('p_1', r'$p_1$', 'p', "Component 1's (internal screen) intrinsic fractional polarization."),
-            Param('X_1', r'$\chi_1$', 'X', "Component 1's intrinsic EVPA at lambda=0."),
-            Param('phi1', r'$\phi_1$', 'phi', "Component 1's Faraday depth (RM-like)."),
-            Param('dphi1', r'$\sigma_{\phi,1}$', 'dphi', "Component 1's Faraday depth dispersion across its internal screen."),
-            Param('p_2', r'$p_2$', 'p', "Component 2's (external screen) intrinsic fractional polarization."),
-            Param('X_2', r'$\chi_2$', 'X', "Component 2's intrinsic EVPA at lambda=0."),
-            Param('phi2', r'$\phi_2$', 'phi', "Component 2's Faraday depth (RM-like)."),
-            Param('dphi2', r'$\sigma_{\phi,2}$', 'dphi', "Component 2's Faraday depth dispersion across its external screen.")] + spectral_params(),
-    bounds=([0, -np.pi/2, -5e6, 1, 0, -np.pi/2, -5e6, 1] + SPECTRAL_BOUNDS_LO,
-            [0.7, np.pi/2, 5e6, 5e6, 0.7, np.pi / 2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI),
-    n_components=2, n_live_points=2500,
-    equation=(r'$P(\lambda)=\frac{w_1}{w_1+w_2}p_1e^{2i\chi_1}\left[\frac{1-e^{-\left(2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2\right)}}{2\sigma_{\phi,1}^2\lambda^4-2i\phi_1\lambda^2}\right]'
-              r'+\frac{w_2}{w_1+w_2}p_2e^{-\sigma_{\phi,2}^2\lambda^4}e^{\,2i(\chi_2+\phi_2\lambda^2)}$'))
+def component_terms(model, wl, pars):
+    """Each component's own complex fractional-polarization term P_k(lambda)."""
+    return [f(wl, pars[o:o + sz]) for f, o, sz in model.composite['terms']]
+
+
+# Names the old hardcoded two-component models were saved under, mapped to
+# the composite that replaces each. Their external components used
+# exp(-sigma^2 lambda^4) rather than the single-screen exp(-2 sigma^2
+# lambda^4), so sigma_phi of an old external component must be divided by
+# sqrt(2) to give the same curve -- see legacy_to_composite.
+LEGACY_MODELS = {
+    'comp2RMdep': ('weight', ('Ext', 'Ext')), 'comp2RMdep_classic': ('class', ('Ext', 'Ext')),
+    'comp2intern': ('weight', ('Intslb', 'Intslb')), 'comp2intern_classic': ('class', ('Intslb', 'Intslb')),
+    'comp2mixdep': ('weight', ('Intslb', 'Ext')), 'comp2mixdep_classic': ('class', ('Intslb', 'Ext')),
+    'comp2mixsph_classic': ('class', ('Intsph', 'Ext')),
+}
+
+
+def legacy_dphi_scale(func):
+    """{full param index: 1/sqrt(2)} for each Burn-external ('Ext')
+    component's sigma_phi of composite `func`: multiply a legacy
+    (exp(-sigma^2 lambda^4)) sigma_phi by it to get the same curve under the
+    single-screen exp(-2 sigma^2 lambda^4). {} for anything else."""
+    if not is_composite(func):
+        return {}
+    names = MODELS[func].param_names
+    return {names.index(f'dphi{k}'): 1.0 / np.sqrt(2.0)
+            for k, code in enumerate(func.composite['codes'], start=1) if code == 'Ext'}
+
+
+def legacy_to_composite(name, pars=None):
+    """(composite func, converted pars) for a legacy two-component model
+    `name`, or None if `name` isn't one. `pars` (optional) is converted from
+    the old convention: each external component's sigma_phi is divided by
+    sqrt(2)."""
+    if name not in LEGACY_MODELS:
+        return None
+    mode, codes = LEGACY_MODELS[name]
+    func = get_composite(mode, codes)
+    if pars is None:
+        return func, None
+    pars = list(pars)
+    for i, scale in legacy_dphi_scale(func).items():
+        pars[i] = pars[i] * scale
+    return func, pars
+
+
+def get_model_by_name(name):
+    """The model function registered under `name`: a built-in or custom
+    model, a composite (built on demand from its name), or a legacy
+    two-component name (mapped to its composite, without converting any
+    parameters -- see legacy_to_composite). Raises KeyError if unknown."""
+    if name in MODELS_BY_NAME:
+        return MODELS_BY_NAME[name]
+    parsed = parse_composite_name(name)
+    if parsed:
+        return get_composite(*parsed)
+    legacy = legacy_to_composite(name)
+    if legacy:
+        return legacy[0]
+    raise KeyError(name)
 
 
 
@@ -924,7 +969,7 @@ def _i_prime_component_latex(idx, shape):
     return r"I_{%d}'(\nu)=\left(\dfrac{\nu}{\nu_0}\right)^{\alpha_{%d}}" % (idx, idx)
 
 
-def i_prime_latex(n_components, shape1, shape2):
+def i_prime_latex(n_components, shape1, shape2, shape3=None):
     """LaTeX (no surrounding '$') for the I'(nu) normalized-intensity-shape
     definition(s) given `shape1`/`shape2`
     ('powerlaw'/'ssa'/'thermal'/'logparabola') -- `shape2` is ignored for a
@@ -936,19 +981,23 @@ def i_prime_latex(n_components, shape1, shape2):
     if n_components == 1:
         one, _ = templates.get(shape1, (I_PRIME_POWERLAW, None))
         return one
-    if shape1 == shape2:
-        _, two = templates.get(shape1, (None, I_PRIME_POWERLAW))
-        return two
-    return _i_prime_component_latex(1, shape1) + r"\ \ " + _i_prime_component_latex(2, shape2)
+    shapes = [shape1, shape2] + ([shape3 if shape3 is not None else shape1] if n_components == 3 else [])
+    if len(set(shapes)) == 1:
+        _, many = templates.get(shape1, (None, I_PRIME_POWERLAW))
+        return many.replace('(i=1,2)', '(i=1,2,3)') if n_components == 3 else many
+    return r"\ \ ".join(_i_prime_component_latex(k, sh) for k, sh in enumerate(shapes, start=1))
 
 
-def weights_latex(shape1, shape2):
+def weights_latex(shape1, shape2, shape3=None):
     """LaTeX (no surrounding '$') for a two-component model's w1/w2/epsilon
     line: how I'(nu) combines into each component's weight w_i and the
     epsilon that sets w1 vs w2 (Polvista paper Eq. 9-11). Each component's
     own reference frequency in the epsilon definition follows its own
     shape -- nu_0 (shared) under 'powerlaw', nu_{0,i} (its own) under
     'ssa'/'thermal' -- independently of the other component's."""
+    if shape3 is not None:
+        return (r"w_1=\varepsilon_1 I_1',\ \ w_2=(1-\varepsilon_1)\varepsilon_2 I_2',\ \ "
+                r"w_3=(1-\varepsilon_1)(1-\varepsilon_2) I_3'")
     nu0_1 = r'\nu_{0,1}' if shape1 in ('ssa', 'thermal') else r'\nu_0'
     nu0_2 = r'\nu_{0,2}' if shape2 in ('ssa', 'thermal') else r'\nu_0'
     eps_def = r"\varepsilon=\dfrac{I_1(%s)}{I_1(%s)+I_2(%s)}" % (nu0_1, nu0_1, nu0_2)
@@ -967,7 +1016,7 @@ def _insert_opacity_factor(latex):
     return latex.replace(r'\lambda^2}\,dz', r'\lambda^2}\,e^{-\tau_\lambda(z)}\,dz')
 
 
-def full_equation(spec, shape1, shape2):
+def full_equation(spec, shape1, shape2, shape3=None):
     """The full (centered, possibly multi-line) equation-card LaTeX for
     `spec` at the given spectral shape(s): its own P(lambda) equation, plus
     the I'(nu) definition(s) `shape1`/`shape2` imply. `shape2` is ignored
@@ -993,7 +1042,7 @@ def full_equation(spec, shape1, shape2):
     above the main P(lambda) integral -- in which case every line but the
     last is shown as-is, unchanged, and only the *last* line combines with
     I'(nu) (exactly like a plain single-line equation would on its own)."""
-    i_prime = i_prime_latex(spec.n_components, shape1, shape2)
+    i_prime = i_prime_latex(spec.n_components, shape1, shape2, shape3)
     lines = spec.equation.strip().split('\n')
     inner = lines[-1].strip()[1:-1]  # strip that line's own surrounding '$...$'
     if getattr(spec.func, 'is_custom', False) and shape1 in ('ssa', 'thermal'):
@@ -1002,7 +1051,7 @@ def full_equation(spec, shape1, shape2):
     extra_lines = lines[:-1]  # e.g. a custom model's own phi(z)=... line, if any
     if spec.n_components == 1:
         return '\n'.join(extra_lines + [main_line])
-    line1 = f'${weights_latex(shape1, shape2)}$'
+    line1 = f'${weights_latex(shape1, shape2, shape3 if spec.n_components == 3 else None)}$'
     return '\n'.join([line1] + extra_lines + [main_line])
 
 
@@ -2204,7 +2253,7 @@ def build_custom_model(label, emiss_str, phi_str, param_specs,
           + [param_specs[n][2] for n in const_names] + SPECTRAL_BOUNDS_HI_SINGLE)
     equation = custom_model_equation_latex(emiss_expr, phi_expr, j_lo_expr, j_hi_expr, p_lo_expr, p_hi_expr)
 
-    register(custom_func, label=label, title=title, params=params, bounds=(lo, hi),
+    register(custom_func, plot_name=label, label=label, title=title, params=params, bounds=(lo, hi),
              n_components=1, n_live_points=1000, equation=equation)
 
     CUSTOM_MODEL_DEFS[custom_func] = {

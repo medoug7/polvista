@@ -39,6 +39,23 @@ def band_colors(n):
     return [colorsys.hsv_to_rgb(RAINBOW_HUE_MAX * i / (n - 1), 1.0, 1.0) for i in range(n)]
 
 
+# Shaded-band colors used (in frequency order) when there are 3 bands or
+# fewer -- the B3/B6/B7 colors of the qu_fit.py plots.
+QU_FIT_BAND_COLORS = ('firebrick', 'limegreen', 'steelblue')
+
+
+def band_span_colors(centers_ghz):
+    """Color of each shaded band given the bands' center frequencies [GHz]:
+    qu_fit.py's palette by frequency rank for up to 3 bands, otherwise the
+    same red->violet rainbow the Measurements tab gives its bands."""
+    n = len(centers_ghz)
+    rank = np.argsort(centers_ghz).argsort()
+    if n <= len(QU_FIT_BAND_COLORS):
+        return [QU_FIT_BAND_COLORS[r] for r in rank]
+    rainbow = band_colors(n)
+    return [rainbow[r] for r in rank]
+
+
 # Pixel size of the Spectral parameters box's own per-band color swatch
 # (see band_marker_pixmap) -- deliberately close to the polarization plot's
 # own per-band marker size (ms=4 points, see app.ModelPlot.draw_reference)
@@ -516,11 +533,28 @@ class MeasurementsMixin:
         frame = 2 * self.bands_scroll.frameWidth()
         self.bands_scroll.setFixedHeight(content_h + frame + 6)
 
+    def on_band_edited(self, *_):
+        """A band was added or its frequency range edited: redraw the shaded
+        bands (skipped while the window is still being built)."""
+        if getattr(self, '_ui_ready', False):
+            self.request_update_plot()
+
+    def band_spans(self):
+        """[(nu_lo, nu_hi, color)] [GHz] for every band in the Bands box --
+        the shaded areas the plots draw when Preferences > Bands is On."""
+        centers = [row.center.value() for row in self.band_rows]
+        colors = band_span_colors(centers)
+        return [(c - row.bw.value() / 2, c + row.bw.value() / 2, color)
+                for c, row, color in zip(centers, self.band_rows, colors)]
+
     def add_band_row(self, center_ghz=93.3, bw_ghz=14.0, n_spw=4):
         row = BandRow(center_ghz, bw_ghz, n_spw)
         row.removed.connect(self.remove_band_row)
+        row.center.valueChanged.connect(self.on_band_edited)
+        row.bw.valueChanged.connect(self.on_band_edited)
         self.bands_container_layout.insertWidget(self.bands_container_layout.count() - 1, row)
         self.band_rows.append(row)
+        self.on_band_edited()
 
     def apply_default_bands(self, label, lo_mm, hi_mm):
         """Reset the Bands box to preset `label`'s own defaults (see

@@ -1,0 +1,244 @@
+Adding a new depolarization model to polvista
+==============================================
+
+This walks through everything `register()`-ing a new model function in
+models.py needs to hook up correctly with the rest of the app (sliders,
+Spectrum box, fitting, measurement generation, sampling, save/load). It
+does NOT cover the separate "Custom model..." builder (build_model.py) --
+that's a different, GUI-driven path for assembling a model at runtime out
+of j_p(z)/opacity terms; this doc is for a hand-written Python function
+registered at import time, like burn/intern/field_gradient.
+
+Registering a model is the *only* step needed -- app.py builds the Model
+dropdown straight from the MODELS registry (`for func, spec in
+MODELS.items(): ...`) at startup, so nothing else needs editing for a
+single-component model. Everything below is about getting the
+registration itself right, since nothing checks params/bounds/function
+consistency for you -- a mismatch fails silently (a hidden UI section) or
+loudly (a crash), often nowhere near the line that's actually wrong.
+
+
+1. The model function
+----------------------
+    def my_model(x, params):
+        p0, X0, phi, ... = params[:N]
+        return p0 * np.exp(2j * (X0 + phi * x**2)) * ...   # complex P/I
+
+- `x` is wavelength in METERS (not frequency, not lambda^2 -- squaring
+  happens inside the function, as in every existing model).
+- `params` is a flat list/array. Its order must exactly match the `params=`
+  list you pass to register() (see step 3) -- sliders are built from that
+  list positionally and read back positionally (self.sliders, app.py's
+  current_state()).
+- The function must return the *fractional* complex polarization P/I =
+  p*e^(2i*EVPA), not Q/U directly and not multiplied by Stokes I. Stokes
+  I is applied afterwards by stokes_I()/stokes_QU() (see step 4) -- your
+  function's own math should be independent of the spectral index/shape.
+
+IMPORTANT -- slice, don't unpack exactly:
+    Use `p0, X0, phi, dphi = params[:4]`, not `p0, X0, phi, dphi = params`.
+  Every single-component model gets a trailing spectral-index parameter
+  (`alpha`) appended to its params list (step 3) even though the model's
+  own P/I math never uses it -- see intern/partial/partial2 for the
+  pattern. An exact-length unpack raises "too many values to unpack" the
+  moment params carries that extra trailing value.
+
+
+2. Pick n_components
+---------------------
+Almost every new model is n_components=1 (one screen/component). Only use
+n_components=2 if you're genuinely blending two independently-weighted
+spectral components (see comp2RMdep/comp2intern/comp2mixdep) -- that path
+needs extra wiring beyond register() (see step 6). This doc mostly covers
+the single-component case; skip to step 6 if you do need two components.
+
+
+3. The register() call -- params and bounds must agree, in every sense
+------------------------------------------------------------------------
+    register(my_model,
+        label='Short dropdown label', title='Longer title for the param box',
+        params=[Param('p_0', r'$p_0$', 'p', 'Intrinsic fractional polarization.'),
+                Param('X_0', r'$X_0$', 'X', 'Intrinsic EVPA at lambda=0.'),
+                Param('phi', r'$\phi$', 'phi', 'Faraday depth.'),
+                Param('dphi', r'$\sigma_\phi$', 'dphi', 'Faraday depth dispersion.'),
+               ] + spectral_param_single(),
+        bounds=([0, -np.pi/2, -5e6, 0] + SPECTRAL_BOUNDS_LO_SINGLE,
+                [0.7, np.pi/2, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
+        n_components=1, n_live_points=1000,
+        equation=r'$P(\lambda) = ...$')
+
+Three separate things all have to be the SAME LENGTH and in the SAME
+ORDER, and this is not checked anywhere:
+
+  (a) `params`        -- the list of Param(...) entries
+  (b) `bounds[0]`      -- lower bounds, one per Param
+  (c) `bounds[1]`      -- upper bounds, one per Param
+
+...and that length must also match what your function's `params[:N]`
+slice expects (N = len(params)).
+
+- For a single-component model, always end `params` with
+  `+ spectral_param_single()` and end both bounds lists with
+  `+ SPECTRAL_BOUNDS_LO_SINGLE` / `+ SPECTRAL_BOUNDS_HI_SINGLE`. This
+  appends exactly one trailing Param of kind='alpha' -- the spectral
+  index slider.
+- If you add the trailing alpha to `bounds` but forget it in `params`
+  (or vice versa), you get a length mismatch between params and bounds.
+  Nothing raises immediately: rebuild_sliders() (app.py) only ever loops
+  `for i, param in enumerate(spec.params)`, so it silently ignores
+  whichever extra bounds entries don't have a matching Param, and simply
+  builds one slider short. The visible symptom is exactly "the Spectrum
+  box doesn't show up" (see step 5 for why), and the invisible symptom is
+  that models.stokes_I() -- which always reads the LAST element of your
+  params list as alpha (`pars[-1]`) -- ends up reading whatever your last
+  *real* physical parameter is (e.g. a dispersion or gradient term) as if
+  it were a spectral index. That parameter's value then silently
+  determines a bogus Stokes I(nu) shape; if the user drags that slider to
+  a large value, (nu/nu0)**alpha can overflow to inf/nan, and THAT is
+  what shows up later as an intermittent crash in Generate Measurements
+  or the Stokes I/Q/U plot -- not because measurement generation is
+  broken, but because it's the first place the bad alpha value actually
+  gets exercised numerically.
+
+- Param's 4 fields: `Param(name, latex, kind, description)`.
+    * `name`  -- plain identifier, e.g. 'p_0'. Only used for internal
+      bookkeeping/labels; doesn't need to match the function's local
+      variable name (but should, for your own sanity).
+    * `latex` -- raw string mathtext shown next to the slider, e.g.
+      r'$p_0$'.
+    * `kind`  -- THIS is what drives UI behavior; see step 4. Get this
+      wrong and the slider still appears, just with the wrong scale,
+      wrong default, wrong units label, or (for 'alpha'/'eps') routed to
+      the wrong box entirely.
+    * `description` -- tooltip text.
+
+
+4. `kind` reference
+--------------------
+Each Param's `kind` selects both the slider's working domain (linear /
+log / symlog / percent / degrees) and which box it's placed in
+(rebuild_sliders, app.py):
+
+    'p'     linear, worked in %, placed in the regular param box
+    'X'     linear, worked in degrees, placed in the regular param box
+    'phi'   symlog (continuous through 0), placed in the regular param box.
+            NOTE: the slider's actual on-screen range ignores your
+            registered bounds and always uses the global PHI_LOG_RANGE
+            (see ParamSlider.__init__) -- your bounds still matter for the
+            Sampling tab's prior range, just not this slider's displayed
+            span.
+    'dphi'  same as 'phi' but unsigned (>=0), uses DPHI_LOG_RANGE
+    'scale' plain linear over your own registered bounds (e.g. covering
+            fraction f, beam ratio s) -- use this for anything that isn't
+            one of the other named kinds
+    'alpha' the spectral index. Placed in the SPECTRUM BOX, not the
+            regular param box -- this is the only thing that makes the
+            Spectrum box appear at all for a single-component model (see
+            step 5). Must come from spectral_param_single(), don't build
+            it by hand.
+    'eps'   two-component-only: component-1 weight. From spectral_params().
+    'nu0'/'temp' -- never put these in your own `params` list; they're
+            separate sliders app.py builds itself (nu0_slider_1/2,
+            temp_slider_1/2) for the SSA/thermal Spectrum-box shapes and
+            aren't part of any model's own params/bounds at all.
+
+Reusing an existing kind for a parameter that isn't physically that
+quantity (e.g. giving a Faraday-depth-GRADIENT parameter kind='phi' just
+to get the same symlog slider behavior, which field_gradient's D_phi
+does) is fine and intentional -- kind is a UI/scaling choice, not a
+type system.
+
+
+5. Why the Spectrum box specifically disappears
+-------------------------------------------------
+rebuild_sliders() only inserts the Spectrum box's header/shape-dropdown
+widgets, and only sets `self.spectral_scroll.setVisible(True)`, when it
+encounters a Param of kind 'eps' or 'alpha' while walking `spec.params`.
+If your `params` list has no such Param -- e.g. because you appended the
+extra bounds but forgot `+ spectral_param_single()` on params itself --
+the whole Spectrum box (shape dropdown, nu0/T/beta controls) just never
+gets shown for that model, exactly as if the model had no spectral
+parameter at all. There is no separate flag for "does this model want a
+Spectrum box" -- it's entirely inferred from whether an 'alpha' (or
+'eps') Param is present.
+
+
+6. If you actually do need n_components=2
+--------------------------------------------
+Beyond `params = [...per-component Params...] + spectral_params()` and
+`bounds = (..., SPECTRAL_BOUNDS_LO)`/`(..., SPECTRAL_BOUNDS_HI)`
+(spectral_params()/SPECTRAL_BOUNDS_LO/HI are the 2-component analogues of
+spectral_param_single()/SPECTRAL_BOUNDS_LO/HI_SINGLE -- eps, alpha1,
+alpha2), your function must combine two per-component terms weighted by
+spectral_weights()/spectral_combine() the way comp2RMdep/comp2intern/
+comp2mixdep do, not just sum them (that's the legacy-only
+LEGACY_SUM_MODELS path). You'll also want to add your model to
+models.COMPONENT_TERM_FUNCS (so stokes_components() can decompose its
+plot into each component's own I/Q/U) and, if its two components are
+physically interchangeable (like comp2RMdep's), to
+fitting.DEGENERATE_PAIR_MODELS (so MultiNest's posterior mode-selection
+treats the two labelings as one family instead of two).
+
+
+7. Sanity checklist before testing in the app
+------------------------------------------------
+[ ] len(params) == len(bounds[0]) == len(bounds[1])
+[ ] my_model's own params[:N] slice, N == len(params)
+[ ] single-component: params ends with `+ spectral_param_single()`,
+    both bounds lists end with `+ SPECTRAL_BOUNDS_LO_SINGLE` /
+    `+ SPECTRAL_BOUNDS_HI_SINGLE`
+[ ] exactly one Param has kind='alpha' (single-component) -- confirms the
+    Spectrum box will show up
+[ ] no kind='nu0'/'temp' Params in your own list (those are built for you)
+[ ] equation= is optional but recommended (shown as the read-only formula
+    card); pure LaTeX/mathtext, doesn't need to be runnable
+
+Then: pick the model from the dropdown, confirm the Spectrum box appears
+with a working alpha slider, wiggle every slider once, then try Generate
+Measurements. If the Spectrum box appears and nothing crashes, the
+registration is consistent.
+
+
+8. Concrete diagnosis: your current field_gradient registration
+-------------------------------------------------------------------
+As of this writing, models.py has (models.py:730):
+
+    register(field_gradient,
+        label='Field gradient', title='Field gradient external screen',
+        params=[Param('p_0', ...), Param('X_0', ...), Param('phi', ...),
+                Param('D_phi', ...), Param('dphi', ...)],   # 5 Params, no alpha
+        bounds=([0, -np.pi/2, -5e6, -5e6, 0] + SPECTRAL_BOUNDS_LO_SINGLE,   # 6 values
+                [0.7, np.pi/2, 5e6, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
+        n_components=1, ...)
+
+and field_gradient() itself (models.py:274):
+
+    def field_gradient(x, params):
+        p0, X0, phi, D_phi, dphi = params   # exact unpack, not params[:5]
+
+This is exactly the mismatch in step 3/5: `params` is missing
+`+ spectral_param_single()`, so there's no kind='alpha' Param -> the
+Spectrum box never shows (your first symptom). The bounds lists DO carry
+the extra spectral entry (6 long vs. 5 Params), which today just gets
+silently dropped by rebuild_sliders -- harmless on its own. But
+models.stokes_I() still unconditionally treats your LAST params entry
+(`pars[-1]`) as the spectral index, which is currently dphi -- so
+whatever the dphi slider is set to gets fed into (nu/nu0)**alpha when
+computing Stokes I(nu). dphi's own bounds go up to 5e6, and a slider that
+large as an exponent overflows to inf/nan, which is very plausibly your
+"crashes sometimes when I generate measurements": it's not random, it
+depends on where the dphi slider happens to be when you generate.
+
+The fix is two small edits:
+
+    register(field_gradient,
+        ...
+        params=[Param('p_0', ...), Param('X_0', ...), Param('phi', ...),
+                Param('D_phi', ...), Param('dphi', ...)] + spectral_param_single(),
+        bounds=([0, -np.pi/2, -5e6, -5e6, 0] + SPECTRAL_BOUNDS_LO_SINGLE,
+                [0.7, np.pi/2, 5e6, 5e6, 5e6] + SPECTRAL_BOUNDS_HI_SINGLE),
+        ...)
+
+    def field_gradient(x, params):
+        p0, X0, phi, D_phi, dphi = params[:5]   # tolerate the trailing alpha
+        ...

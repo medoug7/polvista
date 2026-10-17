@@ -18,6 +18,7 @@ once here instead of per-function):
     style, which work around each respectively.
 """
 import os
+import math
 import io
 import re
 import html
@@ -473,3 +474,91 @@ class TexViewerDialog(QDialog):
 
         scrollbar = self.browser.verticalScrollBar()
         scrollbar.setValue(round(fraction * scrollbar.maximum()))
+
+
+# ── Comparison-tab tex table ─────────────────────────────────────────────────
+# Layout follows qu_fit.py's write_tex_block(): one column per model, one row
+# per parameter kind (p/X/phi/dphi/... with several terms comma-separated for
+# a multi-component model), then the goodness-of-fit rows.
+_TEX_KIND_ORDER = ('p', 'X', 'phi', 'dphi', 'scale', 'alpha')
+_TEX_KIND_SCALE = {'p': 100.0, 'X': 180.0 / 3.141592653589793, 'phi': 1e-5, 'dphi': 1e-5}
+_TEX_KIND_UNIT = {'p': r'(\%)', 'X': r'(deg)', 'phi': r'($10^5$ rad\,m$^{-2}$)',
+                  'dphi': r'($10^5$ rad\,m$^{-2}$)'}
+
+
+def _tex_escape(text):
+    return re.sub(r'([&%#_])', r'\\\1', text)
+
+
+def _tex_value(value, lo=0.0, hi=0.0):
+    """`$A^{+hi}_{-lo}$` with both sides rounded to two significant figures of
+    the tighter nonzero one (as qu_fit.py does), or a plain `$A$` when the
+    curve carries no uncertainty."""
+    nonzero = [abs(v) for v in (lo, hi) if v]
+    if not nonzero:
+        mantissa, _, exponent = f'{value:.4g}'.partition('e')
+        return f'${mantissa}\\times10^{{{int(exponent)}}}$' if exponent else f'${mantissa}$'
+    decimals = max(0, 1 - int(math.floor(math.log10(min(nonzero)))))
+    return f'${value:.{decimals}f}^{{+{abs(hi):.{decimals}f}}}_{{-{abs(lo):.{decimals}f}}}$'
+
+
+def comparison_tex_table(curves):
+    """LaTeX tabular for the Comparison tab's `curves` (MainWindow.curves
+    dicts): parameter values -- with asymmetric uncertainties for
+    MultiNest-samples curves -- then chi^2_k, the family ln Z and, when data
+    is loaded, AICc/BIC."""
+    from polvista.models import MODELS
+    from polvista.fitting import expand_pars_errs
+
+    entries = []  # per curve: {kind: [(value, lo, hi), ...]}
+    for c in curves:
+        spec = MODELS[c['func']]
+        errs = [(0.0, 0.0)] * len(spec.params)
+        if 'family' in c:
+            fam = c['family']
+            _, errs = expand_pars_errs(len(spec.params), c['pol_idx'], fam['pars'], fam['errs'], c['spectral_pars'])
+        terms = {}
+        for par, v, (lo, hi) in zip(spec.params, c['pars'], errs):
+            s = _TEX_KIND_SCALE.get(par.kind, 1.0)
+            terms.setdefault(par.kind, []).append((v * s, lo * s, hi * s))
+        entries.append(terms)
+
+    kinds = [k for k in _TEX_KIND_ORDER if any(k in e for e in entries)]
+    kinds += sorted({k for e in entries for k in e} - set(kinds))
+
+    def kind_label(kind):
+        names = []
+        for c in curves:
+            for par in MODELS[c['func']].params:
+                name = par.latex.strip('$')
+                if par.kind == kind and name not in names:
+                    names.append(name)
+        unit = _TEX_KIND_UNIT.get(kind, '')
+        return f"${' / '.join(names)}$" + (f' {unit}' if unit else '')
+
+    n = len(curves)
+    lines = [r'\begin{tabular}{%s}' % ('c' * (n + 1)), r'\hline\hline',
+             'Model & ' + ' & '.join(_tex_escape(c['name']) for c in curves) + r' \\', r'\hline']
+    for kind in kinds:
+        cells = [', '.join(_tex_value(*t) for t in e[kind]) if kind in e else '$-$' for e in entries]
+        lines.append(f'{kind_label(kind)} & ' + ' & '.join(cells) + r' \\')
+
+    def stat_row(label, values, fmt):
+        if all(v is None for v in values):
+            return
+        cells = ['$-$' if v is None else '$' + fmt % v + '$' for v in values]
+        lines.append(f'{label} & ' + ' & '.join(cells) + r' \\')
+
+    def stat(c, key):
+        return c['stats'][key] if c.get('stats') is not None else None
+
+    chi2_k = [stat(c, 'chi2_red') if stat(c, 'chi2_red') is not None else c['family']['chi2'] if 'family' in c else None
+              for c in curves]
+    lines.append(r'\hline')
+    stat_row(r'$\chi^2_k$', chi2_k, '%.2f')
+    stat_row(r'$\ln Z$', [c['family']['evidence_lnZ'] if 'family' in c else None for c in curves], '%.2f')
+    stat_row('AICc', [stat(c, 'aicc') if stat(c, 'aicc') is not None and math.isfinite(stat(c, 'aicc')) else None
+                      for c in curves], '%.1f')
+    stat_row('BIC', [stat(c, 'bic') for c in curves], '%.1f')
+    lines += [r'\hline\hline', r'\end{tabular}', '']
+    return '\n'.join(lines)

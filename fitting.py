@@ -29,7 +29,7 @@ never touched: (a, b) is converted back to physical (p, X) before every
 import numpy as np
 from scipy.optimize import least_squares
 
-from polvista.models import MODELS, comp2RMdep, comp2intern, comp2RMdep_classic, comp2intern_classic, intensity_shape
+from polvista.models import MODELS, intensity_shape, is_composite
 
 EPS = 1e-10
 
@@ -142,6 +142,34 @@ def qu_fit(wl, q, q_err, u, u_err, model, param_init, bounds, fixed=None):
     return from_cartesian(full_params(result.x), pX_pairs), result
 
 
+def curve_statistics(pars, n_free, wl, q, q_err, u, u_err, model):
+    """chi-squared (raw, reduced), ln L, AIC/AICc/BIC of `model(wl, pars)`
+    against q/u data, counting `n_free` free parameters -- see
+    fit_statistics, which wraps this for a qu_fit() result. Also used by the
+    Comparison tab's Stats button for curves that weren't fitted at all."""
+    y_obs = np.asarray(q) + 1j * np.asarray(u)
+    sigma = np.asarray(q_err) + 1j * np.asarray(u_err)
+    wres = weighted_residuals(pars, wl, y_obs, sigma, model)
+    chi2 = float(np.sum(wres**2))
+
+    n = 2 * len(wl)          # real+imag residuals count as separate data points
+    k = n_free
+    dof = n - k
+
+    loglike = -0.5 * chi2 - log_norm_const(sigma)
+
+    aic = 2 * k - 2 * loglike
+    aicc = aic + (2 * k * (k + 1)) / (dof - 1) if dof > 1 else float('nan')
+    bic = k * np.log(n) - 2 * loglike
+
+    return {
+        'chi2': chi2, 'dof': dof,
+        'chi2_red': chi2 / dof if dof > 0 else float('nan'),
+        'loglike': loglike, 'aic': aic, 'aicc': aicc, 'bic': bic,
+        'n_free': k, 'n_data': n,
+    }
+
+
 def fit_statistics(best_pars, result, wl, q, q_err, u, u_err, model):
     """Goodness-of-fit summary for a qu_fit() result: chi-squared (raw,
     reduced), the Gaussian log-likelihood of the whitened q/u residuals,
@@ -156,28 +184,10 @@ def fit_statistics(best_pars, result, wl, q, q_err, u, u_err, model):
     phi/dphi alias soft priors -- those regularize MultiNest's sampling,
     not this least-squares objective.
     """
-    y_obs = np.asarray(q) + 1j * np.asarray(u)
-    sigma = np.asarray(q_err) + 1j * np.asarray(u_err)
-    wres = weighted_residuals(best_pars, wl, y_obs, sigma, model)
-    chi2 = float(np.sum(wres**2))
-
-    n = 2 * len(wl)          # real+imag residuals count as separate data points
-    k = len(result.x)        # free (non-fixed) parameters actually optimized
-    dof = n - k
-
-    loglike = -0.5 * chi2 - log_norm_const(sigma)
-
-    aic = 2 * k - 2 * loglike
-    aicc = aic + (2 * k * (k + 1)) / (dof - 1) if dof > 1 else float('nan')
-    bic = k * np.log(n) - 2 * loglike
-
-    return {
-        'chi2': chi2, 'dof': dof,
-        'chi2_red': chi2 / dof if dof > 0 else float('nan'),
-        'loglike': loglike, 'aic': aic, 'aicc': aicc, 'bic': bic,
-        'n_free': k, 'n_data': n,
-        'converged': bool(result.success), 'nfev': int(result.nfev),
-    }
+    stats = curve_statistics(best_pars, len(result.x), wl, q, q_err, u, u_err, model)
+    # n_free: free (non-fixed) parameters actually optimized
+    stats.update(converged=bool(result.success), nfev=int(result.nfev))
+    return stats
 
 
 def estimate_alpha(freq, I):
@@ -392,18 +402,139 @@ import threading
 
 from scipy.special import logsumexp
 
-# Models with an exact 1<->2 component exchange symmetry: swapping
-# (p1,X1,phi1,dphi1) <-> (p2,X2,phi2,dphi2) leaves the model function
-# unchanged, so their raw posterior is doubly degenerate ("label
-# switching") -- every genuine solution appears twice, once under each
-# labeling. comp2mixdep (and comp2mixdep_classic) is excluded: its two
-# components use different functional forms (one internal, one external
-# screen), so they're not exchangeable and have no such degeneracy.
-# comp2RMdep_classic/comp2intern_classic have the same swap symmetry as
-# comp2RMdep/comp2intern themselves
-# (classic_sum_combine's plain term1+term2 is as swap-invariant as
-# spectral_combine's own blend) -- see models.comp2RMdep_classic.
-DEGENERATE_PAIR_MODELS = {comp2RMdep, comp2intern, comp2RMdep_classic, comp2intern_classic}
+# Label switching: when two components of a composite model are exchangeable
+# -- swapping their parameter blocks leaves the model function unchanged --
+# the raw posterior contains every genuine solution once under each
+# labeling. Which pairs those are is not fixed in advance: it depends on the
+# components' screen types and, for a weighted model, on the spectral
+# parameters (epsilon/alpha) the run held fixed, so it's checked numerically
+# once the run is done -- see exchange_pairs.
+EXCHANGE_TOL = 1e-6
+EXCHANGE_N_TEST = 6
+MAX_GROUP_SIZE = 720
+
+
+def _exchange_test_point(spec, rng):
+    """A random full-length parameter vector at physically moderate values
+    (so |P| stays well away from 0 or underflow at typical wavelengths, where
+    a lopsided test could pass vacuously)."""
+    pars = []
+    for par, lo, hi in zip(spec.params, spec.bounds[0], spec.bounds[1]):
+        k = par.kind
+        if k == 'p':
+            pars.append(rng.uniform(0.1, 0.6))
+        elif k == 'X':
+            pars.append(rng.uniform(-1.4, 1.4))
+        elif k == 'phi':
+            pars.append(rng.choice([-1, 1]) * 10 ** rng.uniform(2, 4.5))
+        elif k == 'dphi':
+            pars.append(10 ** rng.uniform(1, 3.5))
+        else:
+            pars.append(rng.uniform(max(lo, 0.1 * hi), hi) if hi > lo else lo)
+    return pars
+
+
+def exchange_pairs(model, spectral_pars, wl, idx_pol=None, force=False):
+    """Component pairs (i, j), 0-indexed, of a composite `model` that are
+    exchangeable for a run holding `spectral_pars` ({full index: value})
+    fixed: pairs whose parameter blocks have identical kinds and whose swap
+    leaves model(wl, pars) unchanged (to EXCHANGE_TOL, at EXCHANGE_N_TEST
+    random test points) -- so same-type components of a classic model, but of
+    a weighted model only where the fixed epsilon/alphas also make the two
+    equivalent. Pairs with a component not fully in `idx_pol` (a parameter
+    held fixed by a sampled_idx override) are skipped. `force` skips the
+    numeric test and accepts every pair of components with matching parameter
+    kinds (a caller's explicit degenerate_pair=True). [] for non-composites."""
+    if not is_composite(model):
+        return []
+    spec = MODELS[model]
+    blocks = [(o, sz) for _, o, sz in model.composite['terms']]
+    kinds = [p.kind for p in spec.params]
+    sampled = set(range(len(spec.params))) if idx_pol is None else set(idx_pol)
+    rng = np.random.default_rng(7)
+    tests = [_exchange_test_point(spec, rng) for _ in range(EXCHANGE_N_TEST)]
+    for t in tests:
+        for i, v in spectral_pars.items():
+            t[i] = v
+    wl = np.asarray(wl, dtype=float)
+    base = [model(wl, t) for t in tests]
+
+    pairs = []
+    for i in range(len(blocks)):
+        for j in range(i + 1, len(blocks)):
+            (oi, si), (oj, sj) = blocks[i], blocks[j]
+            if si != sj or kinds[oi:oi + si] != kinds[oj:oj + sj]:
+                continue
+            if not all(k in sampled for k in list(range(oi, oi + si)) + list(range(oj, oj + sj))):
+                continue
+            ok = True
+            for t, ref in ([] if force else zip(tests, base)):
+                sw = list(t)
+                sw[oi:oi + si], sw[oj:oj + sj] = t[oj:oj + sj], t[oi:oi + si]
+                scale = np.max(np.abs(ref)) + 1e-12
+                if np.max(np.abs(model(wl, sw) - ref)) > EXCHANGE_TOL * scale:
+                    ok = False
+                    break
+            if ok:
+                pairs.append((i, j))
+    return pairs
+
+
+def exchange_classes(model, spectral_pars, wl, idx_pol=None):
+    """Groups of mutually exchangeable components (lists of 0-indexed
+    component numbers, size >= 2) -- the connected components of
+    exchange_pairs()."""
+    pairs = exchange_pairs(model, spectral_pars, wl, idx_pol)
+    parent = {}
+
+    def find(x):
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i, j in pairs:
+        parent[find(i)] = find(j)
+    classes = {}
+    for x in list(parent):
+        classes.setdefault(find(x), []).append(x)
+    return [sorted(c) for c in classes.values() if len(c) > 1]
+
+
+def exchange_perms(model, spectral_pars, wl, idx_pol, force=False):
+    """Every non-identity label permutation under which the posterior is
+    symmetric, as index arrays local to `idx_pol` (the sampled params, in
+    order): the group generated by the swaps of exchange_pairs(). One array
+    for a single exchangeable pair, 5 for three mutually exchangeable
+    components (S3), and so on; [] when there is no symmetry."""
+    pairs = exchange_pairs(model, spectral_pars, wl, idx_pol, force)
+    if not pairs:
+        return []
+    pos = {full: loc for loc, full in enumerate(idx_pol)}
+    blocks = [(o, sz) for _, o, sz in model.composite['terms']]
+    ndim = len(idx_pol)
+    gens = []
+    for i, j in pairs:
+        g = np.arange(ndim)
+        for t in range(blocks[i][1]):
+            a, b = pos[blocks[i][0] + t], pos[blocks[j][0] + t]
+            g[a], g[b] = b, a
+        gens.append(g)
+    identity = tuple(range(ndim))
+    group = {identity}
+    frontier = [identity]
+    while frontier and len(group) <= MAX_GROUP_SIZE:
+        nxt = []
+        for h in frontier:
+            for g in gens:
+                c = tuple(np.asarray(h)[g])
+                if c not in group:
+                    group.add(c)
+                    nxt.append(c)
+        frontier = nxt
+    group.discard(identity)
+    return [np.array(g) for g in sorted(group)]
+
 
 # Non-winning families below this evidence_share (%) are dropped from
 # `other_families` entirely (folded into `dropped` instead) -- see
@@ -518,21 +649,6 @@ def mode_id_indices(kinds):
     return sorted(idx)
 
 
-def swap_perm(kinds):
-    """Index permutation (local to `kinds`) mapping each param to its
-    label-swapped counterpart, for models with an exact 1<->2
-    component-swap symmetry (DEGENERATE_PAIR_MODELS). Identity for any
-    kind that doesn't appear exactly twice (shouldn't happen for
-    DEGENERATE_PAIR_MODELS members)."""
-    ndim = len(kinds)
-    perm = np.arange(ndim)
-    for kind in ('p', 'X', 'phi', 'dphi'):
-        idx = [i for i, k in enumerate(kinds) if k == kind]
-        if len(idx) == 2:
-            perm[idx[0]], perm[idx[1]] = idx[1], idx[0]
-    return perm
-
-
 def mode_summary(pars_raw, weight, logz, kinds, rng):
     """Resample a raw MultiNest mode's samples (already in pol_idx-local
     order) by its own weight column, and compute a circular-safe
@@ -588,34 +704,38 @@ def circular_mean_pm_halfpi(x):
     return wrap_pm_halfpi(mean_theta / 2.0)
 
 
-def relabel_swap_symmetric(pooled, id_idx, kinds, swap_perm, rng, n_iter=10, n_restarts=20):
+def relabel_swap_symmetric(pooled, id_idx, kinds, perms, rng, n_iter=10, n_restarts=20):
     """Relabel `pooled` (N, ndim, pol_idx-local order) onto one consistent
-    labeling for a DEGENERATE_PAIR_MODELS family, swapping (via swap_perm)
-    whichever rows need it. Returns the relabeled (N, ndim) array.
+    labeling for an exchange-symmetric family, applying to each row
+    whichever of the symmetry group's `perms` (see exchange_perms; the
+    identity is implicit) brings it closest to the family's own centroid.
+    Returns the relabeled (N, ndim) array.
 
     Needed because MultiNest's own mode-finding isn't symmetry-aware: it
-    can lump both label-swapped branches of an exact component-swap-
-    degenerate posterior into one raw mode, so `pooled` may itself be an
-    even direct/swapped mix rather than one consistent labeling.
+    can lump several label-permuted branches of an exactly degenerate
+    posterior into one raw mode, so `pooled` may itself be an even mix of
+    labelings rather than one consistent one.
 
-    Uses constrained Lloyd's-algorithm clustering (k=2, one swap-symmetric
-    pair of clusters): each pass reassigns every row to whichever of a
-    running direct/swapped centroid it's closer to (by normalized
-    per-parameter distance over the "identifying" params, mode_id_indices()),
-    then refits the centroid from its own newly-assigned rows, denoising
-    the same way a whole-mode weighted mean does but from a self-
-    consistently-labeled subset. Since this only converges to *a* fixed
-    point, not necessarily the best one, `n_restarts` independent random
-    starting pivots are tried and the split with the lowest total
-    per-sample assignment distance is kept; only which side ends up called
-    "swapped" is arbitrary (downstream stats only need one consistent
-    labeling, see best_family())."""
+    Uses constrained Lloyd's-algorithm clustering (one symmetry-related
+    cluster per group element): each pass reassigns every row to whichever
+    labeling is closest to a running centroid (by normalized per-parameter
+    distance over the "identifying" params, mode_id_indices()), then refits
+    the centroid from its own newly-aligned rows, denoising the same way a
+    whole-mode weighted mean does but from a self-consistently-labeled
+    subset. Since this only converges to *a* fixed point, not necessarily the
+    best one, `n_restarts` independent random starting pivots are tried and
+    the labeling with the lowest total per-sample distance is kept; only
+    which labeling ends up called "identity" is arbitrary (downstream stats
+    only need one consistent labeling, see best_family())."""
     n = len(pooled)
     ndim = pooled.shape[1]
+    all_perms = [np.arange(ndim)] + [np.asarray(p) for p in perms]
+    permuted = np.stack([pooled[:, p] for p in all_perms])  # (G, N, ndim)
+    rows = np.arange(n)
 
-    # Fixed per-parameter scale from the *unswapped* pool as a whole
+    # Fixed per-parameter scale from the *unpermuted* pool as a whole
     # (combines between/within-cluster spread either way -- circular/linear
-    # std, unlike mean, doesn't cancel out under an even swap mix, so it's
+    # std, unlike mean, doesn't cancel out under an even label mix, so it's
     # a safe normalization even before any relabeling has happened, and
     # -- being restart-independent -- makes restarts' costs comparable).
     sigma = np.ones(ndim)
@@ -628,45 +748,47 @@ def relabel_swap_symmetric(pooled, id_idx, kinds, swap_perm, rng, n_iter=10, n_r
             sigma[k] = max(float(np.std(col)), 1e-6)
 
     def assign(ref):
-        direct = id_param_distance_rows(pooled, ref, sigma, id_idx, kinds)
-        swapped = id_param_distance_rows(pooled[:, swap_perm], ref, sigma, id_idx, kinds)
-        return swapped < direct, direct, swapped
+        dist = np.stack([id_param_distance_rows(permuted[g], ref, sigma, id_idx, kinds)
+                         for g in range(len(all_perms))], axis=1)
+        label = dist.argmin(axis=1)
+        return label, float(dist[rows, label].sum())
 
-    best_mask, best_cost = None, np.inf
+    best_label, best_cost = None, np.inf
     for _ in range(n_restarts):
-        mask, direct, swapped = assign(pooled[rng.integers(n)])
+        label, cost = assign(pooled[rng.integers(n)])
         for _ in range(n_iter):
-            aligned = np.where(mask[:, None], pooled[:, swap_perm], pooled)
+            aligned = permuted[label, rows]
             ref = np.zeros(ndim)
             for k in id_idx:
                 col = aligned[:, k]
                 ref[k] = circular_mean_pm_halfpi(col) if kinds[k] == 'X' else np.mean(col)
-            new_mask, direct, swapped = assign(ref)
-            if np.array_equal(new_mask, mask):
+            new_label, cost = assign(ref)
+            if np.array_equal(new_label, label):
                 break
-            mask = new_mask
-        cost = float(np.sum(np.where(mask, swapped, direct)))
+            label = new_label
         if cost < best_cost:
-            best_cost, best_mask = cost, mask
+            best_cost, best_label = cost, label
 
-    return np.where(best_mask[:, None], pooled[:, swap_perm], pooled)
+    return permuted[best_label, rows]
 
 
-def union_find_merge(modes, threshold, id_idx, kinds, swap_perm=None):
+def union_find_merge(modes, threshold, id_idx, kinds, perms=None):
     """Group raw mode indices [0, len(modes)) into families. Every raw
     mode is its own family by default (no proximity-based merging -- a
     broad/multi-peaked pooled posterior would poorly represent its family
     even with a fine total evidence_share). The only merge is for
-    DEGENERATE_PAIR_MODELS (`swap_perm` given): two raw modes are the same
-    physical solution under the component-swap symmetry, merged since
-    they're one solution labeled 1<->2 the other way, not two distinct
-    ones. This merge is a strict mutual-nearest-neighbor pairing by
-    swapped distance (each mode merges only with the one mode that is
-    *also* its own nearest match, and only below `threshold`), not
-    transitive union-find over a distance graph -- a real exact-symmetry
-    solution has exactly one label-swapped twin, so this caps every merged
-    group at 2 raw modes and makes chaining (A-B-C lumped together despite
-    A/C being unrelated) structurally impossible."""
+    exchange-symmetric models (`perms` given, see exchange_perms): two raw
+    modes are the same physical solution under a label permutation, merged
+    since they're one solution labeled differently, not two distinct ones.
+    For a single swap (len(perms)==1) this is a strict mutual-nearest-
+    neighbor pairing by permuted distance (each mode merges only with the one
+    mode that is *also* its own nearest match, and only below `threshold`),
+    not transitive union-find over a distance graph -- a real exact-symmetry
+    solution has exactly one twin, so this caps every merged group at 2 raw
+    modes and makes chaining (A-B-C lumped together despite A/C being
+    unrelated) structurally impossible. A larger group (|perms|+1 labelings)
+    merges greedily by increasing distance, capping each merged group at that
+    size, for the same reason."""
     n = len(modes)
     parent = list(range(n))
 
@@ -681,18 +803,29 @@ def union_find_merge(modes, threshold, id_idx, kinds, swap_perm=None):
         if rx != ry:
             parent[ry] = rx
 
-    if swap_perm is not None and n > 1:
+    if perms and n > 1:
         dist = np.full((n, n), np.inf)
         for i in range(n):
             for j in range(n):
                 if i != j:
-                    dist[i, j] = id_param_distance(
-                        modes[i], modes[j]['mean'][swap_perm], modes[j]['sigma'][swap_perm], id_idx, kinds)
-        nearest = dist.argmin(axis=1)
-        for i in range(n):
-            j = int(nearest[i])
-            if nearest[j] == i and dist[i, j] < threshold:
-                union(i, j)
+                    dist[i, j] = min(id_param_distance(
+                        modes[i], modes[j]['mean'][pm], modes[j]['sigma'][pm], id_idx, kinds) for pm in perms)
+        if len(perms) == 1:
+            nearest = dist.argmin(axis=1)
+            for i in range(n):
+                j = int(nearest[i])
+                if nearest[j] == i and dist[i, j] < threshold:
+                    union(i, j)
+        else:
+            size = {i: 1 for i in range(n)}
+            cap = len(perms) + 1
+            order = sorted((dist[i, j], i, j) for i in range(n) for j in range(i + 1, n)
+                           if min(dist[i, j], dist[j, i]) < threshold)
+            for _, i, j in order:
+                ri, rj = find(i), find(j)
+                if ri != rj and size[ri] + size[rj] <= cap:
+                    union(ri, rj)
+                    size[find(ri)] = size[ri] + size[rj]
 
     groups = {}
     for i in range(n):
@@ -806,7 +939,7 @@ def filter_fd_lines(fd_num, block_substrings, hold_substrings=()):
 
 
 def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
-                  idx_pol, order_cube, threshold=2.0, prob=0.68, degenerate_pair=None):
+                  idx_pol, order_cube, threshold=2.0, prob=0.68, degenerate_pair=None, param_scale=None):
     """Identify the raw-MultiNest-mode family for `model`'s already-
     completed run at `outputfiles_basename` (matching multinest_fit()'s
     own outputfiles_basename convention), and return (pooled_samples,
@@ -828,7 +961,7 @@ def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
     analyzer.get_mode_stats() for each raw mode's samples/local evidence,
     undoes the cube reordering (`order_cube`), groups modes into families
     (union_find_merge() -- one family per raw mode, except
-    DEGENERATE_PAIR_MODELS pairs merged under the component-swap symmetry;
+    exchange-symmetric components merged under their label permutations;
     see its own docstring), pools each family's members by weight and, for
     a swap-symmetric family, relabels the pool onto one consistent side
     (relabel_swap_symmetric()), then picks the winner among families
@@ -837,6 +970,12 @@ def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
     (`bayesian_loglike`) -- not the same as `evidence_share`, since a
     broad/multi-peaked family can have a large evidence_share while its
     marginal median sits in a low-density gap between sub-peaks.
+
+    `param_scale` ({full param index: factor}, optional) rescales those
+    sampled columns as they're read -- how a run sampled under a legacy
+    parameter convention (see models.legacy_dphi_scale) is reinterpreted
+    under the current one; the likelihood is then evaluated on the rescaled
+    values, with the (constant) Jacobian leaving evidences unchanged.
 
     Raises FileNotFoundError if post_separate.dat is missing (e.g. the run
     wasn't sampled with multimodal=True) rather than silently degrading.
@@ -878,12 +1017,14 @@ def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
         pars_cube_order = rows[:, 2:2 + ndim]
         pars_pol = np.zeros_like(pars_cube_order)
         pars_pol[:, order_cube] = pars_cube_order
+        for full, scale in (param_scale or {}).items():
+            pars_pol[:, list(idx_pol).index(full)] *= scale
         modes.append(mode_summary(pars_pol, weight, logz, kinds_pol, rng))
 
     id_idx = mode_id_indices(kinds_pol)
-    is_degenerate_pair = model in DEGENERATE_PAIR_MODELS if degenerate_pair is None else degenerate_pair
-    perm = swap_perm(kinds_pol) if is_degenerate_pair else None
-    groups = union_find_merge(modes, threshold, id_idx, kinds_pol, perm)
+    perms = [] if degenerate_pair is False else exchange_perms(model, spectral_pars, wl, idx_pol,
+                                                              force=degenerate_pair is True)
+    groups = union_find_merge(modes, threshold, id_idx, kinds_pol, perms)
 
     family_logz = [logsumexp([modes[k]['logz'] for k in g]) for g in groups]
     total_logz  = logsumexp(family_logz)
@@ -903,8 +1044,8 @@ def best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars,
             parts.append(modes[k]['pars_raw'][idx])
         pooled_samples = np.concatenate(parts, axis=0)
 
-        if perm is not None:
-            pooled_samples = relabel_swap_symmetric(pooled_samples, id_idx, kinds_pol, perm, pool_rng)
+        if perms:
+            pooled_samples = relabel_swap_symmetric(pooled_samples, id_idx, kinds_pol, perms, pool_rng)
 
         pars, errs = median_pctl_errs(pooled_samples, prob=prob)
         for j, k in enumerate(kinds_pol):
@@ -1158,7 +1299,7 @@ def assemble_result(spec, pol_idx, spectral_pars, best_family_result,
 
 
 def load_previous_run(wl, q, q_err, u, u_err, model, spectral_pars, outputfiles_basename,
-                        sampled_idx=None, degenerate_pair=None):
+                        sampled_idx=None, degenerate_pair=None, param_scale=None):
     """Re-run best_family()'s mode-family clustering against an already-
     completed MultiNest run at `outputfiles_basename` -- no sampling, just
     re-reads that run's own output files -- for the Sampling tab's "Load
@@ -1183,14 +1324,14 @@ def load_previous_run(wl, q, q_err, u, u_err, model, spectral_pars, outputfiles_
     `spectral_pars` (same mechanism already used for alpha/eps). See
     sampling.SamplingMixin's qu_fit.py-import path (load_samples_action).
 
-    `degenerate_pair` (optional): override for whether the winning-family
-    search treats `model` as having an exact component-swap symmetry (see
-    best_family/DEGENERATE_PAIR_MODELS) -- defaults to `model in
-    DEGENERATE_PAIR_MODELS`, but a `sampled_idx` override that fixes only
-    one component's dphi (not both, not neither) breaks the symmetry a
-    *full* run of a DEGENERATE_PAIR_MODELS member would otherwise have;
-    pass False in that case (mirrors qu_fit.py's own DEGENERATE_PAIR_MODELS,
-    which excludes exactly these same asymmetric "mid" variants)."""
+    `degenerate_pair` (optional): pass False to skip the exchange-symmetry
+    search (see exchange_perms) in the winning-family step, or True to treat
+    every kind-compatible component pair as exchangeable -- by default the
+    symmetric component pairs are detected numerically (exchange_pairs), and
+    a `sampled_idx` override that fixes only one component's dphi (not both,
+    not neither) already breaks the symmetry there, so the override is only
+    a shortcut for callers that know better (mirrors qu_fit.py's own
+    treatment of its asymmetric "mid" variants)."""
     import pymultinest
 
     spec = MODELS[model]
@@ -1213,6 +1354,6 @@ def load_previous_run(wl, q, q_err, u, u_err, model, spectral_pars, outputfiles_
     stats = analyzer.get_mode_stats()
 
     best_family_result = best_family(model, outputfiles_basename, wl, y, y_errs, spectral_pars, idx_pol, order_cube,
-                                       degenerate_pair=degenerate_pair)
+                                       degenerate_pair=degenerate_pair, param_scale=param_scale)
     return assemble_result(spec, idx_pol, spectral_pars, best_family_result,
                              stats['global evidence'], stats['global evidence error'], 2 * len(wl))

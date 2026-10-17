@@ -54,26 +54,33 @@ import traceback
 
 import numpy as np
 import matplotlib as mpl
+import matplotlib.colors as mcolors
 from PyQt5.QtCore import Qt, pyqtSignal, QLocale, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QSlider, QComboBox,
     QVBoxLayout, QHBoxLayout, QGroupBox, QScrollArea, QDoubleSpinBox,
     QSpinBox, QCheckBox, QTabWidget, QPushButton, QProgressBar,
-    QFileDialog, QMessageBox, QAction)
+    QFileDialog, QMessageBox, QAction, QLineEdit, QColorDialog, QGridLayout,
+    QDialog, QRadioButton, QButtonGroup)
+from PyQt5.QtGui import QColor
+from matplotlib.lines import Line2D
 
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 
 from polvista.models import (
-    MODELS, MODELS_BY_NAME, C, Param, stokes_I, stokes_QU, evpa, pol,
-    set_spectral_shape, full_equation, build_custom_model, CUSTOM_MODEL_DEFS,
-    CustomModelError, SPECTRAL_SHAPES, TEMP_BOUNDS_K, BETA_BOUNDS)
+    spectral_state, MODELS, MODELS_BY_NAME, C, Param, stokes_I, stokes_QU, evpa, pol,
+    set_spectral_shape, get_spectral_state, full_equation, build_custom_model, CUSTOM_MODEL_DEFS,
+    CustomModelError, SPECTRAL_SHAPES, TEMP_BOUNDS_K, BETA_BOUNDS,
+    SCREENS, DEFAULT_SCREEN, get_composite, is_composite, get_model_by_name, LEGACY_MODELS, legacy_dphi_scale)
 from polvista.build_model import CustomModel
 from polvista.fitting import (
     qu_fit, estimate_alpha, estimate_spectral_shape, estimate_shape_2comp, fit_statistics,
-    multinest_fit, load_previous_run)
-from polvista.latex_stuff import latex_pixmap, fit_equation_pixmap, TexViewerDialog
+    multinest_fit, load_previous_run, curve_statistics, expand_pars_errs)
+from polvista.latex_stuff import latex_pixmap, fit_equation_pixmap, TexViewerDialog, comparison_tex_table
 from polvista.widgets import (
-    ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDEST_UNIT, ModelPlot, StokesPlot, RMSynthPlot)
+    ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDEST_UNIT, ModelPlot, StokesPlot, RMSynthPlot,
+    CURVE_LINESTYLES, WL_UNITS_M, set_suptitle, set_drag_mode, RESIZE_SETTLE_MS,
+    PLOT_PREFS, DEFAULT_PLOT_PREFS, COMPARISON_PALETTES, apply_plot_prefs)
 from polvista.sampling import SamplingMixin, warm_up_sampling_imports
 from polvista.measurements import MeasurementsMixin, DEFAULT_BANDS_BY_PRESET
 from polvista.rm_synthesis import compute_faraday_spectrum, phi_axis_half_width, FaradaySpectrumError
@@ -93,10 +100,20 @@ from polvista.rm_synthesis import compute_faraday_spectrum, phi_axis_half_width,
 # q, u data alone can't constrain it (see spectral_weights).
 FIT_FIXED_EPSILON = 0.5
 
+def fixed_epsilons(spec):
+    """{param index: value} holding a weighted model's epsilons at the
+    equal-weight split (FIT_FIXED_EPSILON for two components; for n, the
+    stick-breaking values 1/n, 1/(n-1), ..., 1/2 giving every component the
+    same weight at its reference frequency)."""
+    eps = spec.indices('eps')
+    n = len(eps) + 1
+    return {i: 1.0 / (n - k) for k, i in enumerate(eps)}
+
+
 # Figure default parameters
 mpl.rcParams['mathtext.fontset'] = 'stix'
 mpl.rcParams['font.family'] = 'STIXGeneral'
-mpl.rcParams['font.size'] = 16
+mpl.rcParams['font.size'] = 20
 ##############################################
 
 
@@ -511,6 +528,191 @@ class ParamSlider(QWidget):
         self.update_label()
 
 
+class PreferencesDialog(QDialog):
+    """Small non-modal window for figure preferences (Preferences menu):
+    curves, markers, font sizes and grid. Changes apply live to every canvas
+    through MainWindow.apply_plot_preferences, which stores them in
+    PLOT_PREFS; Restore puts DEFAULT_PLOT_PREFS back."""
+
+    FONT_ROWS = (('title', 'Plot title'), ('label', 'Axis label'),
+                 ('tick', 'Tick labels'), ('legend', 'Legend'))
+    GRID_WHICH = (('both', 'Both'), ('major', 'Major'), ('none', 'None'))
+    GRID_STYLES = (('solid', 'Solid'), ('dashed', 'Dashed'), ('dotted', 'Dotted'))
+
+    def __init__(self, main):
+        super().__init__(main)
+        self.main = main
+        self._refreshers = {}  # PLOT_PREFS key -> callable(value) updating its widget silently
+        self.setWindowTitle('Preferences')
+        layout = QVBoxLayout(self)
+
+        curve_box = QGroupBox('Curve')
+        curve_grid = QGridLayout(curve_box)
+        curve_grid.addWidget(QLabel('Linewidth'), 0, 0)
+        curve_grid.addWidget(self._spin('curve_width', 0.5, 10.0, 0.5), 0, 1)
+        curve_grid.addWidget(QLabel('Linestyle'), 1, 0)
+        style_combo = QComboBox()
+        style_combo.addItems(list(CURVE_LINESTYLES))
+        style_combo.currentTextChanged.connect(lambda t: self.main.apply_plot_preferences(curve_style=t))
+        self._register('curve_style', style_combo, style_combo.setCurrentText)
+        curve_grid.addWidget(style_combo, 1, 1)
+        curve_grid.addWidget(QLabel('Color scheme'), 2, 0)
+        scheme_row = QHBoxLayout()
+        scheme_buttons = {}
+        for value, text in (('default', 'Default'), ('custom', '')):
+            button = QRadioButton(text)
+            button.toggled.connect(lambda on, v=value: on and self.main.apply_plot_preferences(curve_scheme=v))
+            scheme_row.addWidget(button)
+            scheme_buttons[value] = button
+        scheme_group = QButtonGroup(self)
+        for button in scheme_buttons.values():
+            scheme_group.addButton(button)
+        scheme_row.addWidget(self._color_button('curve_color', curve_scheme='custom'))
+        scheme_row.addStretch(1)
+        curve_grid.addLayout(scheme_row, 2, 1)
+        curve_grid.addWidget(QLabel('Comparison'), 3, 0)
+        palette_combo = QComboBox()
+        palette_combo.addItems(list(COMPARISON_PALETTES))
+        palette_combo.setToolTip('Color palette of the curves added to the Comparison tab (applies to new curves).')
+        palette_combo.currentTextChanged.connect(lambda t: self.main.apply_plot_preferences(comparison_palette=t))
+        self._register('comparison_palette', palette_combo, palette_combo.setCurrentText)
+        curve_grid.addWidget(palette_combo, 3, 1)
+        self._register('curve_scheme', scheme_group, lambda v: scheme_buttons[v].setChecked(True))
+        layout.addWidget(curve_box)
+
+        marker_box = QGroupBox('Markers')
+        marker_grid = QGridLayout(marker_box)
+        marker_grid.addWidget(QLabel('Format'), 0, 0)
+        format_combo = QComboBox()
+        for symbol, name in Line2D.markers.items():
+            if isinstance(symbol, str) and symbol.strip() and symbol != 'None' and name != 'nothing':
+                format_combo.addItem(f'{name} ({symbol})', symbol)
+        format_combo.currentIndexChanged.connect(
+            lambda i, c=format_combo: self.main.apply_plot_preferences(marker=c.itemData(i)))
+        self._register('marker', format_combo, lambda v, c=format_combo: c.setCurrentIndex(max(0, c.findData(v))))
+        marker_grid.addWidget(format_combo, 0, 1, 1, 2)
+        marker_grid.addWidget(QLabel('Fill'), 1, 0)
+        size_spin = self._spin('marker_size', 1, 30, 1, decimals=0)
+        size_spin.setToolTip('Marker size')
+        marker_grid.addWidget(size_spin, 1, 1)
+        marker_grid.addWidget(self._color_button('marker_fill'), 1, 2)
+        marker_grid.addWidget(QLabel('Contour'), 2, 0)
+        edge_spin = self._spin('marker_edge_width', 0.0, 10.0, 0.1)
+        edge_spin.setToolTip('Width of the marker contour and of the error lines (both take the contour color)')
+        marker_grid.addWidget(edge_spin, 2, 1)
+        marker_grid.addWidget(self._color_button('marker_edge_color'), 2, 2)
+        layout.addWidget(marker_box)
+
+        font_box = QGroupBox('Fontsize')
+        font_grid = QGridLayout(font_box)
+        for row, (key, text) in enumerate(self.FONT_ROWS):
+            font_grid.addWidget(QLabel(text), row, 0)
+            font_grid.addWidget(self._spin(key, 4, 60, 1, decimals=0), row, 1)
+            font_grid.addWidget(self._color_button(key + '_color'), row, 2)
+        layout.addWidget(font_box)
+
+        grid_box = QGroupBox('Grid')
+        grid_layout = QGridLayout(grid_box)
+        grid_layout.addWidget(QLabel('Linewidth'), 0, 0)
+        grid_layout.addWidget(self._spin('grid_width', 0.1, 10.0, 0.1), 0, 1)
+        for row, (key, text, options) in enumerate((
+                ('grid_which', 'Axis', self.GRID_WHICH), ('grid_style', 'Linestyle', self.GRID_STYLES)),
+                start=1):
+            grid_layout.addWidget(QLabel(text), row, 0)
+            group = QButtonGroup(self)
+            buttons = {}
+            for col, (value, name) in enumerate(options, start=1):
+                button = QRadioButton(name)
+                button.toggled.connect(lambda on, k=key, v=value: on and self.main.apply_plot_preferences(**{k: v}))
+                group.addButton(button)
+                grid_layout.addWidget(button, row, col)
+                buttons[value] = button
+
+            def refresh(value, group=group, buttons=buttons):
+                group.blockSignals(True)
+                for button in buttons.values():
+                    button.blockSignals(True)
+                buttons[value].setChecked(True)
+                for button in buttons.values():
+                    button.blockSignals(False)
+                group.blockSignals(False)
+            self._refreshers[key] = refresh
+        layout.addWidget(grid_box)
+
+        bands_box = QGroupBox('Bands')
+        bands_row = QHBoxLayout(bands_box)
+        bands_buttons = {}
+        bands_group = QButtonGroup(self)
+        for value, text in ((True, 'On'), (False, 'Off')):
+            button = QRadioButton(text)
+            button.toggled.connect(lambda on, v=value: on and self.main.apply_plot_preferences(bands_on=v))
+            bands_group.addButton(button)
+            bands_row.addWidget(button)
+            bands_buttons[value] = button
+        self._register('bands_on', bands_group, lambda v: bands_buttons[v].setChecked(True))
+        bands_row.addStretch(1)
+        bands_row.addWidget(QLabel('Alpha'))
+        alpha_spin = self._spin('bands_alpha', 0.0, 1.0, 0.05, decimals=2)
+        alpha_spin.setToolTip('Opacity of the shaded Measurements-tab bands')
+        bands_row.addWidget(alpha_spin)
+        layout.addWidget(bands_box)
+
+        restore_button = QPushButton('Restore')
+        restore_button.setToolTip('Reset every figure preference to its default.')
+        restore_button.clicked.connect(self.restore_defaults)
+        restore_button.setAutoDefault(False)  # Enter must not trigger Restore or a color box
+        ok_button = QPushButton('Ok')
+        ok_button.setDefault(True)  # Enter closes the window
+        ok_button.clicked.connect(self.accept)
+        bottom = QHBoxLayout()
+        bottom.addWidget(restore_button)
+        bottom.addStretch(1)
+        bottom.addWidget(ok_button)
+        layout.addLayout(bottom)
+
+        self.refresh_widgets()
+        self.setFixedSize(self.sizeHint())
+
+    def _register(self, key, widget, setter):
+        def refresh(value):
+            widget.blockSignals(True)
+            setter(value)
+            widget.blockSignals(False)
+        self._refreshers[key] = refresh
+
+    def _spin(self, key, lo, hi, step, decimals=1):
+        spin = QDoubleSpinBox()
+        spin.setRange(lo, hi)
+        spin.setSingleStep(step)
+        spin.setDecimals(decimals)
+        spin.valueChanged.connect(lambda v: self.main.apply_plot_preferences(**{key: v}))
+        self._register(key, spin, spin.setValue)
+        return spin
+
+    def _color_button(self, key, **also):
+        button = QPushButton()
+        button.setFixedSize(26, 26)
+        button.setAutoDefault(False)  # otherwise Enter in the dialog opens this color picker
+
+        def pick():
+            color = QColorDialog.getColor(QColor(PLOT_PREFS[key]), self, 'Color')
+            if color.isValid():
+                button.setStyleSheet(f"background-color: {color.name()};")
+                self.main.apply_plot_preferences(**{key: color.name()}, **also)
+                self.refresh_widgets()  # `also` may flip another control (e.g. the color scheme)
+        button.clicked.connect(pick)
+        self._register(key, button, lambda v: button.setStyleSheet(f"background-color: {v};"))
+        return button
+
+    def refresh_widgets(self):
+        for key, refresh in self._refreshers.items():
+            refresh(PLOT_PREFS[key])
+
+    def restore_defaults(self):
+        self.main.apply_plot_preferences(**DEFAULT_PLOT_PREFS)
+        self.refresh_widgets()
+
+
 class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
     NO_FIT_TEXT = 'Fit some data to get statistics'
 
@@ -520,6 +722,13 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.resize(1500, 700) # size of the window
 
         self.sliders = []
+        # Curves frozen by the Add curve button, oldest first -- shared by
+        # reference with the p/EVPA and Stokes canvases (see __init__) and
+        # listed in the Comparison tab. Each is a dict: id, func,
+        # n_components, pars, spectral (models.get_spectral_state snapshot),
+        # name, color ('#rrggbb'), linestyle (a CURVE_LINESTYLES key).
+        self.curves = []
+        self._next_curve_id = 0
         self.fit_data = None  # (wl, q, q_err, u, u_err, freq, I) from the Load Data... button, or None
         self.data_nu_min = None  # [MHz] loaded data's own nu_min, set by Fitting -- see run_fit
 
@@ -572,9 +781,12 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
 
         self._build_left_panel(root)
         self._build_right_panel(root)
+        self.canvas.perm_curves = self.curves
+        self.stokes_canvas.perm_curves = self.curves
 
         self.build_menu()
         self.rebuild_sliders()
+        self._ui_ready = True  # see MeasurementsMixin.on_band_edited
 
     def _build_left_panel(self, root):
         """Left control panel: wavelength range, model/spectrum choice,
@@ -591,7 +803,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # set wavelength/frequency range
         # QGroupBox draws a titled border/frame around its contents --
         # used throughout this panel to visually group related controls.
-        wl_box = QGroupBox('Wavelength range [mm]')
+        wl_box = QGroupBox('Wavelength range')
         wl_box_layout = QVBoxLayout(wl_box)
 
         self.wl_preset = QComboBox()
@@ -631,7 +843,17 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.log_xscale = QCheckBox('log x-scale')
         self.log_xscale.setChecked(True)
         self.log_xscale.stateChanged.connect(self.request_update_plot)
-        wl_box_layout.addWidget(self.log_xscale)
+        # Unit the min/max boxes above are read in (see wl_unit_m); the
+        # presets themselves are stored in mm and converted when applied.
+        self.wl_unit_combo = QComboBox()
+        self.wl_unit_combo.addItems(list(WL_UNITS_M))
+        self.wl_unit_combo.setToolTip('Unit of the min/max wavelengths')
+        self.wl_unit_combo.currentTextChanged.connect(self.on_wl_unit_changed)
+        log_row = QHBoxLayout()
+        log_row.addWidget(self.log_xscale)
+        log_row.addStretch(1)
+        log_row.addWidget(self.wl_unit_combo)
+        wl_box_layout.addLayout(log_row)
 
         left_layout.addWidget(wl_box)
 
@@ -640,24 +862,58 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # (here the model function) retrievable later via currentData().
         self.model_combo = QComboBox()
         for func, spec in MODELS.items():
-            if spec.hidden:
+            if spec.hidden or is_composite(func):
                 continue
             self.model_combo.addItem(spec.label, func)
+        # One dropdown row per multi-component family. The row's own data is
+        # the composite currently chosen for it (model_combo.currentData()
+        # stays "the model function" everywhere); picking each component's
+        # screen type or the combination scheme (see on_composite_changed)
+        # swaps that data for the matching composite, built on demand.
+        self.composite_state = {n: [DEFAULT_SCREEN] * n for n in (2, 3)}  # screen types, shared by both modes
+        for n in (2, 3):
+            for mode, word in (('class', 'classic'), ('weight', 'weighted')):
+                self.model_combo.addItem(f'{n}-component model ({word})', self.composite_func(mode, n))
         # "Custom model..." always stays the last row (see
         # open_custom_model_dialog, which inserts newly-built custom models
         # just above it) -- picking it doesn't select a model itself, it
         # opens the builder dialog instead (see on_model_combo_changed).
         self.model_combo.addItem('Custom model...', CUSTOM_MODEL_SENTINEL)
         self._last_model_index = 0
+        self._slider_names = []  # param names of the sliders currently shown, see rebuild_sliders
+        self._eq_resize_timer = None  # see resizeEvent
+        self._syncing_composite = False  # guards on_composite_changed while rebuild_sliders sets the combos
         # Qt's signal/slot mechanism: connect() wires the combo box's
         # "selection changed" signal to a method that runs whenever the
         # user picks a different model.
         self.model_combo.currentIndexChanged.connect(self.on_model_combo_changed)
         left_layout.addWidget(self.model_combo)
 
+        # Per-component screen-type headers, placed at the top of each
+        # component's own parameters (see rebuild_sliders).
+        self.comp_type_headers, self.comp_type_combos = [], []
+        for k in (1, 2, 3):
+            container = QWidget()
+            row = QHBoxLayout(container)
+            row.setContentsMargins(0, 6, 0, 0)
+            label = QLabel(f'<b>Component {k}</b>')
+            row.addWidget(label)
+            row.addStretch(1)
+            combo = QComboBox()
+            for code, sc in SCREENS.items():
+                combo.addItem(sc['label'], code)
+            combo.currentIndexChanged.connect(self.on_composite_changed)
+            row.addWidget(combo)
+            self.comp_type_headers.append(container)
+            self.comp_type_combos.append(combo)
+
         # spectral weighting parameters -- more relevant for two-component models
-        self.spectral_box = QGroupBox()
+        # Plain (frameless) container -- spectral_box and pol_box below are
+        # stacked inside one shared scroll area/group box (see param_box),
+        # so they read as a single box rather than two.
+        self.spectral_box = QWidget()
         self.spectral_layout = QVBoxLayout(self.spectral_box)
+        self.spectral_layout.setContentsMargins(0, 0, 0, 0)
 
         # Dropdown(s) selecting the normalized intensity shape I'(nu) used to
         # weight each component's spectral contribution (see
@@ -673,8 +929,9 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # component count -- none of them are placed into spectral_layout
         # here.
         self.shape_header_single, self.shape_combo = self.build_spectrum_header('Spectrum')
-        self.comp1_header, self.shape_combo_1 = self.build_spectrum_header('Component 1')
-        self.comp2_header, self.shape_combo_2 = self.build_spectrum_header('Component 2')
+        self.comp1_header, self.shape_combo_1 = self.build_spectrum_header('Spectrum')
+        self.comp2_header, self.shape_combo_2 = self.build_spectrum_header('Spectrum')
+        self.comp3_header, self.shape_combo_3 = self.build_spectrum_header('Spectrum')
 
         # Turnover-frequency nu_0 slider(s) -- log-scale, like phi/dphi,
         # since a turnover can plausibly sit many decades from the plotted
@@ -692,6 +949,8 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             nu0_lo, nu0_hi, default_nu0, r'$\nu_0$', 'SSA/thermal turnover frequency.')
         self.nu0_slider_2 = self.build_nu0_slider(
             nu0_lo, nu0_hi, default_nu0, r'$\nu_{0,2}$', "Component 2's SSA/thermal turnover frequency.")
+        self.nu0_slider_3 = self.build_nu0_slider(
+            nu0_lo, nu0_hi, default_nu0, r'$\nu_{0,3}$', "Component 3's SSA/thermal turnover frequency.")
 
         # Electron-temperature T slider(s) -- log-scale (see TEMP_BOUNDS_K),
         # only shown once its own component's shape dropdown is set to
@@ -702,6 +961,8 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             temp_lo, temp_hi, DEFAULT_TEMP_K, r'$T$', 'Thermal free-free electron temperature.')
         self.temp_slider_2 = self.build_temp_slider(
             temp_lo, temp_hi, DEFAULT_TEMP_K, r'$T_2$', "Component 2's thermal free-free electron temperature.")
+        self.temp_slider_3 = self.build_temp_slider(
+            temp_lo, temp_hi, DEFAULT_TEMP_K, r'$T_3$', "Component 3's thermal free-free electron temperature.")
 
         # Curvature-index beta slider(s) -- linear (see BETA_BOUNDS), only
         # shown once its own component's shape dropdown is set to
@@ -714,37 +975,60 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             beta_lo, beta_hi, DEFAULT_BETA, r'$\beta$', 'Log-parabola curvature index.')
         self.beta_slider_2 = self.build_beta_slider(
             beta_lo, beta_hi, DEFAULT_BETA, r'$\beta_2$', "Component 2's log-parabola curvature index.")
+        self.beta_slider_3 = self.build_beta_slider(
+            beta_lo, beta_hi, DEFAULT_BETA, r'$\beta_3$', "Component 3's log-parabola curvature index.")
+        # Per-component views of the widgets above, index 0 = component 1
+        # (also the single-component model's own shape/nu_0/T/beta).
+        self.comp_headers = [self.comp1_header, self.comp2_header, self.comp3_header]
+        self.shape_combos = [self.shape_combo_1, self.shape_combo_2, self.shape_combo_3]
+        self.nu0_sliders = [self.nu0_slider_1, self.nu0_slider_2, self.nu0_slider_3]
+        self.temp_sliders = [self.temp_slider_1, self.temp_slider_2, self.temp_slider_3]
+        self.beta_sliders = [self.beta_slider_1, self.beta_slider_2, self.beta_slider_3]
 
-        self.spectral_layout.addStretch(1)
+        # The polarization-parameter sliders sit immediately below the
+        # spectral ones, in the same box (see param_scroll below).
+        self.pol_box = QWidget()
+        self.param_layout = QVBoxLayout(self.pol_box)
+        self.param_layout.setContentsMargins(0, 0, 0, 0)
 
         # QScrollArea adds scrollbars around a widget that may not fit its
         # allotted space -- here it lets the (variable-length) list of
-        # sliders in spectral_box scroll instead of resizing the window.
-        self.spectral_scroll = QScrollArea()
-        self.spectral_scroll.setWidgetResizable(True)
-        self.spectral_scroll.setWidget(self.spectral_box)
-        self.spectral_scroll.setMinimumHeight(140)  # fits its max of 3 rows
-        self.spectral_scroll.setVisible(False)
-
-        # the polarization-parameter sliders, in their own titled group box
-        # (like spectral_box above) and scrollable area nested inside
-        # param_box below -- separately from spectral_scroll, so each
-        # scrolls independently
-        self.pol_box = QGroupBox('Polarization')
-        self.param_layout = QVBoxLayout(self.pol_box)
-        self.param_layout.addStretch(1)
-
-        pol_scroll = QScrollArea()
-        pol_scroll.setWidgetResizable(True)
-        pol_scroll.setWidget(self.pol_box)
-        pol_scroll.setMinimumHeight(290)  # fits its max of 8 rows (2-component models)
+        # sliders scroll instead of resizing the window.
+        sliders_box = QWidget()
+        sliders_layout = QVBoxLayout(sliders_box)
+        sliders_layout.addWidget(self.spectral_box)
+        sliders_layout.addWidget(self.pol_box)
+        sliders_layout.addStretch(1)
+        self.param_scroll = QScrollArea()
+        self.param_scroll.setWidgetResizable(True)
+        self.param_scroll.setWidget(sliders_box)
+        self.param_scroll.setMinimumHeight(290)  # fits its max of 8 rows (2-component models); see rebuild_sliders
 
         # param_box is just the outer, per-model container -- its title is
         # set to the current model's name in rebuild_sliders.
         self.param_box = QGroupBox()
         param_box_layout = QVBoxLayout(self.param_box)
-        param_box_layout.addWidget(self.spectral_scroll)
-        param_box_layout.addWidget(pol_scroll)
+        param_box_layout.addWidget(self.param_scroll)
+
+        # "Add curve" freezes the current model as a permanent curve on the
+        # p/EVPA and I/Q/U plots (see add_curve_action); the box on its left
+        # shows (and lets the user override) the name it will be labeled with.
+        curve_row = QHBoxLayout()
+        self.curve_name_edit = QLineEdit()
+        self.curve_name_edit.setToolTip('Name the next added curve will be labeled with.')
+        self.curve_name_edit.setMaximumWidth(150)
+        curve_row.addWidget(self.curve_name_edit)
+        curve_row.addStretch(1)
+        self.clear_curves_button = QPushButton('Clear last')
+        self.clear_curves_button.setToolTip('Delete the most recently added curve.')
+        self.clear_curves_button.setEnabled(False)
+        self.clear_curves_button.clicked.connect(self.clear_last_curve_action)
+        curve_row.addWidget(self.clear_curves_button)
+        self.add_curve_button = QPushButton('Add curve')
+        self.add_curve_button.setToolTip('Keep the current model as a permanent curve in all the plots.')
+        self.add_curve_button.clicked.connect(self.add_curve_action)
+        curve_row.addWidget(self.add_curve_button)
+        param_box_layout.addLayout(curve_row)
 
         # The parameter sliders live under a "Visualization" tab; the
         # "Sampling" tab (MultiNest fit options) is always built -- whether
@@ -754,6 +1038,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.left_tabs.addTab(self.param_box, 'Visualization')
         self.build_measurements_tab()
         self.build_sampling_tab()  # greyed out until data is loaded, see load_data_action
+        self.build_comparison_tab()
         left_layout.addWidget(self.left_tabs)
 
         # Reset Parameters on the left, Load/Clear Data grouped together in
@@ -830,12 +1115,11 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.eq_scroll.setFixedHeight(130)
         self.eq_scroll.setWidgetResizable(False)
         self.eq_scroll.setAlignment(Qt.AlignCenter)
-        # The equation is always re-fit (see refit_equation) to the
-        # viewport size, so it should never actually need to scroll --
-        # scrollbars are disabled outright rather than "as needed" so a
-        # transient one-frame overflow during a resize can't flash one.
-        self.eq_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.eq_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # Fixed-height card: refit_equation shrinks a short equation to fit,
+        # and fits a tall multi-component one to the width, so it scrolls
+        # vertically instead of squeezing the plots.
+        self.eq_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.eq_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.eq_scroll.setStyleSheet('QScrollArea { background-color: white; border: 1px solid #999; }')
         self.eq_label = QLabel()
         self.eq_label.setStyleSheet('background-color: white; padding: 6px;')
@@ -864,7 +1148,10 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         p_evpa_tab = QWidget()
         p_evpa_layout = QVBoxLayout(p_evpa_tab)
         p_evpa_layout.setContentsMargins(0, 0, 0, 0)
-        p_evpa_layout.addWidget(self.toolbar)
+        # Centered suptitle box (blank by default; Load data fills it with
+        # the file's name, see load_data_action).
+        self.p_title_edit = self.build_title_edit(self.canvas)
+        p_evpa_layout.addLayout(self.build_title_row(self.toolbar, self.p_title_edit))
         p_evpa_layout.addWidget(self.canvas, stretch=1)
 
         self.stokes_canvas = StokesPlot(self)
@@ -873,15 +1160,16 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         stokes_layout = QVBoxLayout(stokes_tab)
         stokes_layout.setContentsMargins(0, 0, 0, 0)
 
-        stokes_top_row = QHBoxLayout()
-        stokes_top_row.addWidget(self.stokes_toolbar)
-        stokes_top_row.addStretch(1)
-        stokes_top_row.addWidget(QLabel('Q, U view:'))
+        self.stokes_title_edit = self.build_title_edit(self.stokes_canvas)
+        stokes_view = QWidget()
+        stokes_view_layout = QHBoxLayout(stokes_view)
+        stokes_view_layout.setContentsMargins(0, 0, 0, 0)
+        stokes_view_layout.addWidget(QLabel('Q, U view:'))
         self.stokes_mode_combo = QComboBox()
         self.stokes_mode_combo.addItems(['Polar', 'Spectra'])
         self.stokes_mode_combo.currentIndexChanged.connect(self.request_update_plot)
-        stokes_top_row.addWidget(self.stokes_mode_combo)
-        stokes_layout.addLayout(stokes_top_row)
+        stokes_view_layout.addWidget(self.stokes_mode_combo)
+        stokes_layout.addLayout(self.build_title_row(self.stokes_toolbar, self.stokes_title_edit, stokes_view))
 
         stokes_layout.addWidget(self.stokes_canvas, stretch=1)
 
@@ -957,6 +1245,34 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         right_layout.addWidget(self.plot_tabs, stretch=1)
         root.addWidget(right, stretch=1)
 
+    def build_title_edit(self, canvas):
+        """A line edit that sets `canvas`'s suptitle as it's typed in."""
+        edit = QLineEdit()
+        edit.setPlaceholderText('Plot title')
+        edit.setFixedWidth(260)
+        edit.setAlignment(Qt.AlignCenter)
+        edit.textChanged.connect(lambda text, c=canvas: self.on_title_edited(c, text))
+        return edit
+
+    @staticmethod
+    def build_title_row(toolbar, title_edit, right_widget=None):
+        """Toolbar on the left, the title box in the true center, and an
+        optional widget on the right -- equal-stretch side columns keep the
+        box centered whatever the sides' own widths."""
+        row = QGridLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setColumnStretch(0, 1)
+        row.setColumnStretch(2, 1)
+        row.addWidget(toolbar, 0, 0, Qt.AlignLeft)
+        row.addWidget(title_edit, 0, 1)
+        if right_widget is not None:
+            row.addWidget(right_widget, 0, 2, Qt.AlignRight)
+        return row
+
+    def on_title_edited(self, canvas, text):
+        set_suptitle(canvas.fig, text)
+        canvas.draw_idle()
+
     def on_model_combo_changed(self, index):
         """model_combo's own slot: opens the custom-model builder when its
         sentinel "Custom model..." row is picked (always the last row, see
@@ -968,7 +1284,57 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             self.open_custom_model_dialog(revert_index=self._last_model_index)
             return
         self._last_model_index = index
+        old = dict(zip(self._slider_names, [(sl.value(), sl.is_fixed()) for sl in self.sliders]))
+        self.refresh_composite_entries()
         self.rebuild_sliders()
+        if is_composite(self.model_combo.currentData()) and old:
+            self.restore_values(old)
+
+    def restore_values(self, old):
+        """Re-apply {param name: (value, fixed)} to every current slider whose
+        name is in `old`."""
+        for name, sl in zip(self._slider_names, self.sliders):
+            if name in old:
+                sl.set_value(old[name][0])
+                sl.fix_checkbox.setChecked(old[name][1])
+
+    def refresh_composite_entries(self):
+        """Point every multi-component dropdown row at the composite for its
+        mode and the family's current (shared) screen types."""
+        for i in range(self.model_combo.count()):
+            data = self.model_combo.itemData(i)
+            if is_composite(data):
+                self.model_combo.setItemData(i, self.composite_func(data.composite['mode'], data.composite['n']))
+
+    def composite_func(self, mode, n):
+        """The composite model function for `mode` and the n-component
+        family's current screen types (see composite_state)."""
+        return get_composite(mode, tuple(self.composite_state[n]))
+
+    def model_index_for(self, func):
+        """Dropdown row for `func`, or -1. A composite lives in the row of its
+        mode and component count: the shared screen types are set to `func`'s,
+        and every composite row refreshed to match."""
+        if not is_composite(func):
+            return self.model_combo.findData(func)
+        self.composite_state[func.composite['n']] = list(func.composite['codes'])
+        self.refresh_composite_entries()
+        return self.model_combo.findData(func)
+
+    def on_composite_changed(self, *_):
+        """A component's screen-type dropdown changed: re-point the family's
+        rows at the matching composites (built and registered on demand),
+        rebuild the sliders, and carry over every parameter value (and fixed
+        flag) whose name survives the change."""
+        func = self.model_combo.currentData()
+        if not is_composite(func) or self._syncing_composite:
+            return
+        n = func.composite['n']
+        old = dict(zip(self._slider_names, [(sl.value(), sl.is_fixed()) for sl in self.sliders]))
+        self.composite_state[n] = [c.currentData() for c in self.comp_type_combos[:n]]
+        self.refresh_composite_entries()
+        self.rebuild_sliders()
+        self.restore_values(old)
 
     def build_custom_model_menu_action(self):
         """Models menu's "Build Custom Model..." entry -- same dialog as
@@ -1074,24 +1440,33 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         lo_bounds, hi_bounds = spec.bounds
         self.edit_custom_model_action.setEnabled(func in CUSTOM_MODEL_DEFS)
 
-        # remove the trailing stretch, re-add sliders, then put stretch back
-        self.param_layout.takeAt(self.param_layout.count() - 1)
-        self.spectral_layout.takeAt(self.spectral_layout.count() - 1)
+        # re-add sliders
         # None of the Spectrum-box header/nu_0 widgets below are one of
         # self.sliders (see _build_ui) so they survive the setParent(None)
         # loop above untouched -- pull them all out of spectral_layout too,
         # so each can be re-inserted below at the spot matching this
         # model's own component count and spectral params (see the loop's
         # comment).
-        for w in (self.shape_header_single, self.comp1_header, self.comp2_header,
-                  self.nu0_slider_1, self.nu0_slider_2, self.temp_slider_1, self.temp_slider_2,
-                  self.beta_slider_1, self.beta_slider_2):
+        for w in ([self.shape_header_single] + self.comp_headers + self.nu0_sliders + self.temp_sliders
+                  + self.beta_sliders):
             self.spectral_layout.removeWidget(w)
+            self.param_layout.removeWidget(w)
+        for w in self.comp_type_headers:
+            self.param_layout.removeWidget(w)
 
-        has_spectral = False
-        two_comp = spec.n_components == 2
-        if not two_comp:
-            self.spectral_layout.addWidget(self.shape_header_single)
+        # A composite's screen-type dropdowns mirror the function actually
+        # selected (e.g. after Load Model or Load samples switched it).
+        composite = func.composite if is_composite(func) else None
+        if composite is not None:
+            self._syncing_composite = True
+            try:
+                for combo, code in zip(self.comp_type_combos, composite['codes']):
+                    combo.setCurrentIndex(combo.findData(code))
+            finally:
+                self._syncing_composite = False
+
+        multi = spec.n_components >= 2
+        self._slider_names = spec.param_names
         for i, param in enumerate(spec.params):
             sl = ParamSlider(param, lo_bounds[i], hi_bounds[i])
             sl.valueChanged.connect(self.request_update_plot)
@@ -1101,36 +1476,50 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             # which box a slider is displayed in -- update_plot() reads this
             # list positionally, matching the model function's param order.
             self.sliders.append(sl)
-            if param.kind == 'eps':
-                # Display order for a two-component model: epsilon, then
-                # "Component 1" (its own shape dropdown, nu_0, and alpha1),
-                # then "Component 2" (likewise) -- see the 'alpha' branch
-                # below for where each component's own header/nu_0 land.
-                self.spectral_layout.addWidget(sl)
-                has_spectral = True
-                if two_comp:
-                    self.spectral_layout.addWidget(self.comp1_header)
-            elif param.kind == 'alpha':
-                has_spectral = True
-                if param.name == 'alpha2':
-                    self.spectral_layout.addWidget(self.nu0_slider_2)
-                    self.spectral_layout.addWidget(self.temp_slider_2)
-                    self.spectral_layout.addWidget(sl)
-                    self.spectral_layout.addWidget(self.beta_slider_2)
-                else:
-                    self.spectral_layout.addWidget(self.nu0_slider_1)
-                    self.spectral_layout.addWidget(self.temp_slider_1)
-                    self.spectral_layout.addWidget(sl)
-                    self.spectral_layout.addWidget(self.beta_slider_1)
-                    if two_comp:
-                        self.spectral_layout.addWidget(self.comp2_header)
-            else:
-                self.param_layout.addWidget(sl)
 
-        self.param_layout.addStretch(1)
-        self.spectral_layout.addStretch(1)
+        # Layout. A weighted multi-component model shows only its epsilons in
+        # the top (spectral) box; each component's own block (screen-type
+        # dropdown, its spectrum: shape, nu_0/T, alpha, beta, then its polarization
+        # sliders) sits in the parameter box. Any other model keeps its
+        # alpha(s) under a "Spectrum" header in the top box, ahead of the
+        # polarization sliders.
+        has_spectral = False
+        eps_idx = spec.indices('eps')
+        alpha_idx = spec.indices('alpha')
+        shown_type_headers = set()
+        if not multi:
+            self.spectral_layout.addWidget(self.shape_header_single)
+        for i in eps_idx:
+            self.spectral_layout.addWidget(self.sliders[i])
+            has_spectral = True
+        if not multi:
+            for k, i in enumerate(alpha_idx):
+                has_spectral = True
+                self.spectral_layout.addWidget(self.nu0_sliders[k])
+                self.spectral_layout.addWidget(self.temp_sliders[k])
+                self.spectral_layout.addWidget(self.sliders[i])
+                self.spectral_layout.addWidget(self.beta_sliders[k])
+        spectral_idx = set(eps_idx) | set(alpha_idx)
+        if composite is not None:
+            for k, (_, start, size) in enumerate(composite['terms']):
+                self.param_layout.addWidget(self.comp_type_headers[k])
+                shown_type_headers.add(k)
+                if multi:
+                    self.param_layout.addWidget(self.comp_headers[k])
+                    self.param_layout.addWidget(self.nu0_sliders[k])
+                    self.param_layout.addWidget(self.temp_sliders[k])
+                    self.param_layout.addWidget(self.sliders[alpha_idx[k]])
+                    self.param_layout.addWidget(self.beta_sliders[k])
+                for i in range(start, start + size):
+                    self.param_layout.addWidget(self.sliders[i])
+        else:
+            for i, sl in enumerate(self.sliders):
+                if i not in spectral_idx:
+                    self.param_layout.addWidget(sl)
+
         self.param_box.setTitle(spec.title)
-        self.spectral_scroll.setVisible(has_spectral)
+        self.spectral_box.setVisible(has_spectral)
+        self.param_scroll.setMinimumHeight(430 if has_spectral else 290)  # all rows fit without scrolling
 
         # removeWidget above only detaches a widget from the layout -- it
         # doesn't hide it, so whichever of these wasn't re-added this pass
@@ -1141,14 +1530,18 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # a still-parentless QWidget visible makes Qt treat it as its own
         # top-level window instead, which then breaks the *next* addWidget
         # reparenting.
-        self.shape_header_single.setVisible(not two_comp)
-        self.comp1_header.setVisible(two_comp)
-        self.comp2_header.setVisible(two_comp)
+        self.shape_header_single.setVisible(not multi)
+        for k, header in enumerate(self.comp_headers):
+            header.setVisible(multi and k < spec.n_components)
+        for k, header in enumerate(self.comp_type_headers):
+            header.setVisible(k in shown_type_headers)
 
         if hasattr(self, 'results_label'):
             self.results_label.setText(self.NO_FIT_TEXT)
 
         self.rebuild_sampling_bounds()
+        if hasattr(self, 'curve_name_edit'):
+            self.curve_name_edit.setText(self.suggested_curve_name())
 
         # A model switch can change the component count (single- vs
         # two-component), which the SSA/thermal turnover-frequency (and
@@ -1225,10 +1618,9 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         when the Spectrum box is built -- its *default* bounds, not
         something that tracks later changes to the wavelength range (like
         PHI_LOG_RANGE/DPHI_LOG_RANGE, just not shared across every model)."""
-        lo_mm = min(self.wl_min.value(), self.wl_max.value())
-        hi_mm = max(self.wl_min.value(), self.wl_max.value())
-        nu_min_ghz = C / (hi_mm * 1e-3) / 1e9
-        nu_max_ghz = C / (lo_mm * 1e-3) / 1e9
+        lo_m, hi_m = self.rmsynth_wl_bounds_m()
+        nu_min_ghz = C / hi_m / 1e9
+        nu_max_ghz = C / lo_m / 1e9
         lo_mult, hi_mult = NU0_BOUNDS_MULT
         return lo_mult * nu_min_ghz, hi_mult * nu_max_ghz
 
@@ -1237,23 +1629,24 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         [GHz] -- default value for the SSA turnover-frequency sliders, both
         their initial one (see _build_ui) and the one Reset model restores
         (see reset_parameters)."""
-        hi_mm = max(self.wl_min.value(), self.wl_max.value())  # longest wavelength -> nu_min
-        nu_min_ghz = C / (hi_mm * 1e-3) / 1e9
+        hi_m = self.rmsynth_wl_bounds_m()[1]  # longest wavelength -> nu_min
+        nu_min_ghz = C / hi_m / 1e9
         return 0.01 * nu_min_ghz
 
     def current_shapes(self):
-        """(shape1, shape2) currently selected in the Spectrum box --
+        """(shape1, shape2, shape3) currently selected in the Spectrum box --
         `shape1` is the single-component shape dropdown for a
         single-component model, or component 1's own dropdown for a
-        two-component model; `shape2` is component 2's own dropdown,
-        meaningful only for a two-component model (mirrors `shape1`
-        otherwise, since a single-component model has no second
-        component)."""
+        multi-component one; `shape2`/`shape3` are components 2/3's own
+        dropdowns, meaningful only for a model with that many weighted
+        components (they mirror `shape1` otherwise)."""
         n_components = MODELS[self.model_combo.currentData()].n_components
-        if n_components == 2:
-            return self.shape_combo_1.currentData(), self.shape_combo_2.currentData()
+        if n_components >= 2:
+            shapes = [self.shape_combos[k].currentData() if k < n_components
+                      else self.shape_combo_1.currentData() for k in range(3)]
+            return tuple(shapes)
         shape = self.shape_combo.currentData()
-        return shape, shape
+        return shape, shape, shape
 
     def sync_spectrum_ui(self):
         """Keep the Spectrum box's nu_0/T/beta slider(s) -- and each
@@ -1263,48 +1656,41 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         spectral-shape state (see models.set_spectral_shape) -- called
         whenever any shape dropdown, a nu_0/T/beta slider, or the model
         itself changes."""
-        shape1, shape2 = self.current_shapes()
+        shapes = self.current_shapes()
         spec = MODELS[self.model_combo.currentData()]
-        two_comp = spec.n_components == 2
-        needs_nu0_1 = shape1 in ('ssa', 'thermal')
-        needs_nu0_2 = two_comp and shape2 in ('ssa', 'thermal')
-        needs_temp_1 = shape1 == 'thermal'
-        needs_temp_2 = two_comp and shape2 == 'thermal'
-        needs_beta_1 = shape1 == 'logparabola'
-        needs_beta_2 = two_comp and shape2 == 'logparabola'
-        self.nu0_slider_1.setVisible(needs_nu0_1)
-        self.nu0_slider_2.setVisible(needs_nu0_2)
-        self.temp_slider_1.setVisible(needs_temp_1)
-        self.temp_slider_2.setVisible(needs_temp_2)
-        self.beta_slider_1.setVisible(needs_beta_1)
-        self.beta_slider_2.setVisible(needs_beta_2)
+        multi = spec.n_components >= 2
+        n_active = spec.n_components if multi else 1
+        active = [k < n_active for k in range(3)]
+        needs_nu0 = [active[k] and shapes[k] in ('ssa', 'thermal') for k in range(3)]
+        needs_temp = [active[k] and shapes[k] == 'thermal' for k in range(3)]
+        needs_beta = [active[k] and shapes[k] == 'logparabola' for k in range(3)]
+        for k in range(3):
+            self.nu0_sliders[k].setVisible(needs_nu0[k])
+            self.temp_sliders[k].setVisible(needs_temp[k])
+            self.beta_sliders[k].setVisible(needs_beta[k])
         self.nu0_slider_1.name_label.setPixmap(
-            latex_pixmap(r'$\nu_{0,1}$' if two_comp else r'$\nu_0$'))
+            latex_pixmap(r'$\nu_{0,1}$' if multi else r'$\nu_0$'))
         self.temp_slider_1.name_label.setPixmap(
-            latex_pixmap(r'$T_1$' if two_comp else r'$T$'))
+            latex_pixmap(r'$T_1$' if multi else r'$T$'))
         self.beta_slider_1.name_label.setPixmap(
-            latex_pixmap(r'$\beta_1$' if two_comp else r'$\beta$'))
+            latex_pixmap(r'$\beta_1$' if multi else r'$\beta$'))
         # A thermal component's own spectral index is emergent from T, not
         # a free parameter (see intensity_shape/thermal_intensity_shape) -- hide
         # its alpha slider rather than show an inert control (log-parabola
         # still uses alpha directly, alongside its own beta, so its alpha
         # slider stays visible). alpha_indices follows spec.params' own
-        # order: index 0 is the single alpha for a single-component model,
-        # or alpha1 (tied to shape1) for a two-component one; index 1,
-        # when present, is alpha2 (shape2).
-        alpha_indices = spec.indices('alpha')
-        if alpha_indices:
-            self.sliders[alpha_indices[0]].setVisible(shape1 != 'thermal')
-            if len(alpha_indices) > 1:
-                self.sliders[alpha_indices[1]].setVisible(shape2 != 'thermal')
-        nu0 = self.nu0_slider_1.value() * 1e3 if needs_nu0_1 else None  # GHz -> MHz
-        nu0_2 = self.nu0_slider_2.value() * 1e3 if needs_nu0_2 else None
-        T = self.temp_slider_1.value() if needs_temp_1 else None
-        T2 = self.temp_slider_2.value() if needs_temp_2 else None
-        beta = self.beta_slider_1.value() if needs_beta_1 else None
-        beta2 = self.beta_slider_2.value() if needs_beta_2 else None
-        set_spectral_shape(shape1, nu0=nu0, shape2=shape2, nu0_2=nu0_2, T=T, T2=T2,
-                            beta=beta, beta2=beta2)
+        # order: index k is component k+1's alpha (tied to shapes[k]).
+        for k, ai in enumerate(spec.indices('alpha')):
+            self.sliders[ai].setVisible(shapes[k] != 'thermal')
+        kwargs = {}
+        for k, (shape_key, nu0_key, T_key, beta_key) in enumerate(
+                (('shape', 'nu0', 'T', 'beta'), ('shape2', 'nu0_2', 'T2', 'beta2'),
+                 ('shape3', 'nu0_3', 'T3', 'beta3'))):
+            kwargs[shape_key] = shapes[k]
+            kwargs[nu0_key] = self.nu0_sliders[k].value() * 1e3 if needs_nu0[k] else None  # GHz -> MHz
+            kwargs[T_key] = self.temp_sliders[k].value() if needs_temp[k] else None
+            kwargs[beta_key] = self.beta_sliders[k].value() if needs_beta[k] else None
+        set_spectral_shape(**kwargs)
 
     def on_spectral_shape_changed(self, *_):
         """Slot for the Spectrum box's shape dropdown(s) and nu_0/T spin
@@ -1316,21 +1702,53 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
 
     def refit_equation(self):
         spec = MODELS[self.model_combo.currentData()]
-        shape1, shape2 = self.current_shapes()
-        eq = full_equation(spec, shape1, shape2)
+        shape1, shape2, shape3 = self.current_shapes()
+        eq = full_equation(spec, shape1, shape2, shape3)
         viewport = self.eq_scroll.viewport().size()
         # Leave room for the label's own padding (6px/side, see its
         # stylesheet) plus a little breathing room.
         max_w = max(viewport.width() - 20, 50)
-        max_h = max(viewport.height() - 20, 20)
+        # The card keeps its fixed height so it never squeezes the plots. A
+        # short equation is shrunk to fit it; a multi-component one (a line
+        # per component plus the weights and the combined P(lambda)) is
+        # fitted to the width only and scrolled vertically.
+        max_h = max(viewport.height() - 20, 20) if eq.count('\n') < 2 else 10 ** 6
         pixmap = fit_equation_pixmap(eq, max_w, max_h)
         self.eq_label.setPixmap(pixmap)
         self.eq_label.adjustSize()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        # The equation card is re-rendered (a LaTeX pixmap) only once the
+        # resizing has settled, not on every event.
         if hasattr(self, 'eq_scroll'):
-            self.refit_equation()
+            if self._eq_resize_timer is None:
+                self._eq_resize_timer = QTimer(self)
+                self._eq_resize_timer.setSingleShot(True)
+                self._eq_resize_timer.timeout.connect(self.refit_equation)
+            self._eq_resize_timer.start(RESIZE_SETTLE_MS)
+
+    # min/max spin-box limits and decimals, as set up for mm in _build_left_panel
+    WL_MIN_RANGE_MM = (1e-4, 1000.0)
+    WL_MAX_RANGE_MM = (2e-4, 40000.0)
+
+    def wl_unit_m(self):
+        """Meters per unit of the Wavelength range box's selected unit."""
+        return WL_UNITS_M[self.wl_unit_combo.currentText()]
+
+    def on_wl_unit_changed(self, unit):
+        """Re-read the min/max numbers as `unit` (they are *not* converted --
+        the range they describe changes), rescale their limits/decimals
+        to match, and relabel the lambda^2 axis."""
+        scale = 1e-3 / WL_UNITS_M[unit]  # mm -> unit
+        decimals = {'mm': 6, 'cm': 6, 'm': 7}[unit]  # the range's lower limit is 1e-4 mm in any unit
+        self.wl_min.setDecimals(decimals)
+        self.wl_max.setDecimals(decimals)
+        self.wl_min.setRange(self.WL_MIN_RANGE_MM[0] * scale, self.WL_MIN_RANGE_MM[1] * scale)
+        self.wl_max.setRange(self.WL_MAX_RANGE_MM[0] * scale, self.WL_MAX_RANGE_MM[1] * scale)
+        self.canvas.set_wl_unit(unit)
+        self.refresh_rmsynth_empty_axis()
+        self.update_plot()
 
     def apply_wl_preset(self, index):
         """Fill wl_min/wl_max from the selected preset's stored (lo, hi)
@@ -1338,8 +1756,9 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         Also resets the Measurements tab's Bands box to that preset's own
         defaults (see measurements.DEFAULT_BANDS_BY_PRESET)."""
         lo_mm, hi_mm = self.wl_preset.itemData(index)
-        self.wl_min.setValue(lo_mm)
-        self.wl_max.setValue(hi_mm)
+        scale = 1e-3 / self.wl_unit_m()  # presets are stored in mm
+        self.wl_min.setValue(lo_mm * scale)
+        self.wl_max.setValue(hi_mm * scale)
         self.apply_default_bands(self.wl_preset.itemText(index), lo_mm, hi_mm)
 
     def current_state(self):
@@ -1350,8 +1769,9 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         spec = MODELS[func]
         pars = [sl.value() for sl in self.sliders]
 
-        wl_min_mm = min(self.wl_min.value(), self.wl_max.value())
-        wl_max_mm = max(self.wl_min.value(), self.wl_max.value())
+        unit_m = self.wl_unit_m()
+        wl_min_mm = min(self.wl_min.value(), self.wl_max.value()) * unit_m / 1e-3
+        wl_max_mm = max(self.wl_min.value(), self.wl_max.value()) * unit_m / 1e-3
         if wl_max_mm <= wl_min_mm:
             wl_max_mm = wl_min_mm + 0.01
         # Points evenly spaced in log-space when the plot itself is log-x --
@@ -1372,6 +1792,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         current_state() re-reads everything from scratch anyway."""
         func, spec, pars, wl_ext = self.current_state()
         log_xscale = self.log_xscale.isChecked()
+        self.canvas.band_spans = self.stokes_canvas.band_spans = self.band_spans()
         self.canvas.update_plot(wl_ext, func, pars, log_xscale=log_xscale)
         self.stokes_canvas.update_plot(wl_ext, func, spec.n_components, pars,
                                         log_xscale=log_xscale, nu_min=self.data_nu_min,
@@ -1382,6 +1803,380 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # wl_ext/pars; non-custom models never set the attribute at all.
         self.custom_resolution_warning.setVisible(
             getattr(func, 'last_call_underresolved', False))
+
+    # ── Added curves / Comparison tab ──────────────────────────────────────
+    def suggested_curve_name(self, spec=None):
+        """plot_name of the current model, suffixed ' 2', ' 3', ... to the
+        first free number among the existing curves' names -- so a second
+        Int+Ext curve is 'Int+Ext 2' and so on."""
+        base = (spec or MODELS[self.model_combo.currentData()]).display_name
+        taken = {c['name'] for c in self.curves}
+        name, n = base, 1
+        while name in taken:
+            n += 1
+            name = f'{base} {n}'
+        return name
+
+    def n_free_params(self, spec):
+        """Free parameters of the current model for curve statistics --
+        same count a Fit! would optimize: sliders not held fixed, minus eps
+        and alpha, which QU data can't constrain (see fit_spectrum_lsq)."""
+        return sum(1 for p, sl in zip(spec.params, self.sliders)
+                   if p.kind not in ('eps', 'alpha') and not sl.is_fixed())
+
+    def reset_curve_stats(self):
+        """Re-evaluate every curve against the current data (or drop the
+        stats if there's none) and rebuild the Comparison rows."""
+        for c in self.curves:
+            c['stats'] = self.curve_stats_vs_data(c) if self.fit_data is not None else None
+        self.rebuild_comparison_rows()
+
+    def curve_stats_vs_data(self, curve):
+        wl, q, q_err, u, u_err, _freq, _I = self.fit_data
+        with spectral_state(curve['spectral']):
+            return curve_statistics(curve['pars'], curve['n_free'], wl, q, q_err, u, u_err, curve['func'])
+
+    @staticmethod
+    def format_curve_stats(stats):
+        aicc = f"{stats['aicc']:.4g}" if np.isfinite(stats['aicc']) else 'n/a'
+        return (f"χ²_k = {stats['chi2_red']:.4g}\n"
+                f"ln L = {stats['loglike']:.4g}\n"
+                f"AICc = {aicc}\n"
+                f"BIC = {stats['bic']:.4g}")
+
+    def next_curve_color(self):
+        """The next color of the Preferences > Curve > Comparison palette,
+        wrapping around, by how many curves have been added so far."""
+        colors = COMPARISON_PALETTES[PLOT_PREFS['comparison_palette']]
+        return mcolors.to_hex(colors[self._next_curve_id % len(colors)])
+
+    def add_curve_action(self):
+        """Freeze the current model (parameters and spectral shape) as a
+        permanent curve on every p/EVPA and I/Q/U plot (not RM-synth)."""
+        func, spec, pars, _ = self.current_state()
+        self.append_curve(func, spec, pars, get_spectral_state(), self.n_free_params(spec),
+                          self.curve_name_edit.text().strip() or self.suggested_curve_name())
+
+    def append_curve(self, func, spec, pars, spectral, n_free, name, **extra):
+        """Add a curve. Its fit statistics are computed straight away whenever
+        data is loaded -- now, and again on each later Load data (see
+        reset_curve_stats)."""
+        curve = dict(
+            id=self._next_curve_id, func=func, n_components=spec.n_components, pars=list(pars),
+            spectral=spectral, n_free=n_free, stats=None, name=name,
+            color=self.next_curve_color(), linestyle=PLOT_PREFS['curve_style'], linewidth=PLOT_PREFS['curve_width'],
+            rev=0,  # bumped when the curve's own data changes (see widgets._curve_data_key)
+            **extra)
+        if self.fit_data is not None:
+            curve['stats'] = self.curve_stats_vs_data(curve)
+        self.curves.append(curve)
+        self._next_curve_id += 1
+        self.refresh_curves()
+
+    # MultiNest-samples curves (Comparison tab's Load samples): the family's
+    # marginal solution (the same point estimate the Sampling tab's sliders
+    # take) drawn as the curve itself, plus `n_samples` faint posterior draws.
+    MIN_FAMILY_MASS_PCT = 1.0  # families below this evidence share aren't added as curves
+
+    def on_curve_samples_finished(self, model, best_pars, errs, info):
+        """Add one curve per mode family holding at least MIN_FAMILY_MASS_PCT
+        of the evidence (the winner always), each in its own palette color."""
+        self._set_sampling_busy(False)
+        self.cs_worker = None
+        spec = MODELS[model]
+        pol_idx = info['pol_idx']
+        winner_errs_pol = np.array([[errs[i][0] for i in pol_idx], [errs[i][1] for i in pol_idx]])
+        winner = dict(
+            pars=[best_pars[i] for i in pol_idx], errs=winner_errs_pol,
+            samples=info['winner_samples'], evidence_share=info['evidence_share'],
+            chi2=info['winner_chi2'], lnZ=info['winner_lnZ'], evidence_lnZ=info['winner_evidence_lnZ'])
+        spectral_pars = {i: best_pars[i] for i in spec.indices('alpha') + spec.indices('eps')}
+        families = [winner] + [f for f in info['other_families'] if f['evidence_share'] >= self.MIN_FAMILY_MASS_PCT]
+        spectral = get_spectral_state()
+        for fam in families:
+            extra = dict(
+                func=model, family=fam, pol_idx=pol_idx, spectral_pars=spectral_pars,
+                n_samples=PLOT_PREFS['curve_samples'])
+            pars, extra['sample_pars'] = self._family_pars_and_samples(extra)
+            extra.pop('func')
+            self.append_curve(model, spec, pars, spectral, info['n_free'],
+                              self.suggested_curve_name(spec), **extra)
+
+    def _family_pars_and_samples(self, curve):
+        """(full-length mean parameters, (n_samples, n_params) draws) for a
+        MultiNest-samples curve dict's family -- the same expansion/draw
+        recipe as stash_posterior_samples."""
+        spec = MODELS[curve['func']]
+        fam = curve['family']
+        pol_idx, spectral_pars = curve['pol_idx'], curve['spectral_pars']
+        pars, _ = expand_pars_errs(len(spec.params), pol_idx, fam['pars'], fam['errs'], spectral_pars)
+        samples = fam['samples']
+        rng = np.random.default_rng(0)
+        n = min(curve['n_samples'], len(samples))
+        subset = samples[rng.choice(len(samples), size=n, replace=False)]
+        draws = np.zeros((n, len(spec.params)))
+        draws[:, pol_idx] = subset
+        for i, v in spectral_pars.items():
+            draws[:, i] = v
+        return pars, draws
+
+    def update_curve_draws(self, curve, n_samples):
+        curve['n_samples'] = n_samples
+        _, curve['sample_pars'] = self._family_pars_and_samples(curve)
+        curve['rev'] += 1
+        self.request_update_plot()
+
+    @staticmethod
+    def curve_evidence_lines(curve):
+        return [f"mass = {curve['family']['evidence_share']:.1f}%",
+                f"ln Z = {curve['family']['evidence_lnZ']:.4g}"]
+
+    def load_curve_from_file_action(self):
+        """Comparison tab's Load Model: read a Save Model JSON file and add
+        it straight to the curve list -- unlike Import > Load Model, the
+        visualizer's own model, sliders and Spectrum box are left alone."""
+        path, _ = QFileDialog.getOpenFileName(self, 'Load Model', '', 'JSON files (*.json)')
+        if not path:
+            return
+        parsed = self.read_model_file(path)
+        if parsed is None:
+            return
+        func, params, states = parsed
+        spec = MODELS[func]
+        # eps/alpha default to a neutral value if the file lacks them (older
+        # saves); QU-only stats don't depend on them anyway.
+        defaults = {'eps': 0.5, 'alpha': 0.0}
+        try:
+            pars = [params[p.name] if p.name in params else defaults[p.kind] for p in spec.params]
+        except KeyError as e:
+            QMessageBox.warning(self, 'Load Model', f'Model file is missing parameter {e}.')
+            return
+        spectral = self.spectral_kwargs(spec, states)
+        n_free = sum(1 for p in spec.params if p.kind not in ('eps', 'alpha'))
+        self.append_curve(func, spec, pars, spectral, n_free, self.suggested_curve_name(spec))
+
+    def apply_plot_preferences(self, **changes):
+        """Store `changes` (PLOT_PREFS keys) and restyle every canvas."""
+        PLOT_PREFS.update(changes)
+        for canvas in (self.canvas, self.stokes_canvas, self.rmsynth_canvas):
+            apply_plot_prefs(canvas)
+        self.update_plot()
+
+    def show_preferences(self):
+        if getattr(self, 'preferences_dialog', None) is None:
+            self.preferences_dialog = PreferencesDialog(self)
+        self.preferences_dialog.show()
+        self.preferences_dialog.raise_()
+        self.preferences_dialog.activateWindow()
+
+    def clear_last_curve_action(self):
+        if self.curves:
+            self.curves.pop()
+            self.refresh_curves()
+
+    def clear_all_curves_action(self):
+        if self.curves:
+            self.curves.clear()  # in place: the canvases share this list
+            self.refresh_curves()
+
+    def remove_curve(self, curve):
+        self.curves.remove(curve)
+        self.refresh_curves()
+
+    def refresh_curves(self):
+        """Sync everything that follows self.curves' membership: buttons,
+        the next-name box, the Comparison tab's rows/enabled state, plots."""
+        self.clear_curves_button.setEnabled(bool(self.curves))
+        self.clear_all_curves_button.setEnabled(bool(self.curves))
+        self.export_tex_button.setEnabled(bool(self.curves))
+        self.curve_name_edit.setText(self.suggested_curve_name())
+        self.rebuild_comparison_rows()
+        # The visualizer curve can only be hidden while there's an added
+        # curve to show instead -- see on_show_main_toggled.
+        if not self.curves:
+            self.show_main_check.setChecked(True)
+        self.show_main_check.setEnabled(bool(self.curves))
+        self.update_plot()
+
+    def build_comparison_tab(self):
+        """The "Comparison" tab: one row per added curve (name, linestyle,
+        color, delete) followed by its parameters -- rebuilt by
+        rebuild_comparison_rows whenever the curve list changes."""
+        self.comparison_tab = QWidget()
+        outer = QVBoxLayout(self.comparison_tab)
+        self.show_main_check = QCheckBox('Show visualizer curve')
+        self.show_main_check.setChecked(True)
+        self.show_main_check.setEnabled(False)  # needs at least one added curve to be unchecked, see refresh_curves
+        self.show_main_check.toggled.connect(self.on_show_main_toggled)
+        top_row = QHBoxLayout()
+        top_row.addWidget(self.show_main_check)
+        top_row.addStretch(1)
+        outer.addLayout(top_row)
+        self.load_curve_button = QPushButton('Load Model')
+        self.load_curve_button.setToolTip(
+            "Add a saved model file to the curves below, without changing the Visualization tab's model.")
+        self.load_curve_button.clicked.connect(self.load_curve_from_file_action)
+        self.load_curve_samples_button = QPushButton('Load samples')
+        self.load_curve_samples_button.setToolTip(
+            'Add a MultiNest run (mean solution plus posterior draws) to the curves below, '
+            "without changing the Visualization tab's model.")
+        self.load_curve_samples_button.clicked.connect(self.load_curve_samples_action)
+        load_row = QHBoxLayout()
+        load_row.addWidget(self.load_curve_button)
+        load_row.addWidget(self.load_curve_samples_button)
+        load_row.addStretch(1)
+        self.clear_all_curves_button = QPushButton('Clear curves')
+        self.clear_all_curves_button.setToolTip('Delete every added curve.')
+        self.clear_all_curves_button.setEnabled(False)
+        self.clear_all_curves_button.clicked.connect(self.clear_all_curves_action)
+        load_row.addWidget(self.clear_all_curves_button)
+        outer.addLayout(load_row)
+        self.comparison_rows_widget = QWidget()
+        self.comparison_rows_layout = QVBoxLayout(self.comparison_rows_widget)
+        self.comparison_rows_layout.setAlignment(Qt.AlignTop)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(self.comparison_rows_widget)
+        outer.addWidget(scroll)
+        self.export_tex_button = QPushButton('Export tex')
+        self.export_tex_button.setToolTip('Save the added curves as a LaTeX table: parameters, reduced chi-squared and ln Z.')
+        self.export_tex_button.setEnabled(False)  # needs at least one added curve, see refresh_curves
+        self.export_tex_button.clicked.connect(self.export_tex_action)
+        export_row = QHBoxLayout()
+        export_row.addStretch(1)
+        export_row.addWidget(self.export_tex_button)
+        outer.addLayout(export_row)
+        self.left_tabs.addTab(self.comparison_tab, 'Comparison')
+
+    def export_tex_action(self):
+        path, _ = QFileDialog.getSaveFileName(self, 'Export tex', 'comparison.tex', 'LaTeX (*.tex)')
+        if not path:
+            return
+        if not path.endswith('.tex'):
+            path += '.tex'
+        try:
+            with open(path, 'w') as f:
+                f.write(comparison_tex_table(self.curves))
+        except OSError as e:
+            QMessageBox.warning(self, 'Export tex', f'Could not save the table:\n{e}')
+
+    def on_show_main_toggled(self, checked):
+        self.canvas.show_main = self.stokes_canvas.show_main = checked
+        self.update_plot()
+
+    def rebuild_comparison_rows(self):
+        layout = self.comparison_rows_layout
+        while layout.count():
+            widget = layout.takeAt(0).widget()
+            if widget is not None:
+                widget.setParent(None)  # off-screen immediately; deleteLater alone leaves it painted until the event loop runs
+                widget.deleteLater()
+        for curve in self.curves:
+            layout.addWidget(self.build_curve_row(curve))
+
+    def build_curve_row(self, curve):
+        box = QGroupBox()
+        box_layout = QVBoxLayout(box)
+        box_layout.setContentsMargins(6, 6, 6, 6)
+        row = QHBoxLayout()
+        row.setSpacing(3)
+
+        color_button = QPushButton()
+        color_button.setFixedSize(26, 26)
+        color_button.setStyleSheet(f"background-color: {curve['color']};")
+        color_button.setToolTip('Curve color')
+        color_button.clicked.connect(lambda _=False, c=curve, b=color_button: self.pick_curve_color(c, b))
+        row.addWidget(color_button)
+
+        name_edit = QLineEdit(curve['name'])
+        name_edit.textEdited.connect(lambda text, c=curve: self.on_curve_style_edited(c, name=text))
+        row.addWidget(name_edit, stretch=1)
+
+        style_combo = QComboBox()
+        style_combo.addItems(list(CURVE_LINESTYLES))
+        style_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        style_combo.setMinimumContentsLength(8)
+        style_combo.setCurrentText(curve['linestyle'])
+        style_combo.currentTextChanged.connect(lambda text, c=curve: self.on_curve_style_edited(c, linestyle=text))
+        row.addWidget(style_combo)
+
+        width_spin = QDoubleSpinBox()
+        width_spin.setRange(0.5, 10.0)
+        width_spin.setSingleStep(0.5)
+        width_spin.setDecimals(1)
+        width_spin.setValue(curve['linewidth'])
+        width_spin.setFixedWidth(52)
+        width_spin.setToolTip('Line width')
+        width_spin.valueChanged.connect(lambda v, c=curve: self.on_curve_style_edited(c, linewidth=v))
+        row.addWidget(width_spin)
+
+        delete_button = QPushButton('X')
+        delete_button.setFixedSize(26, 26)
+        delete_button.setToolTip('Delete this curve')
+        delete_button.clicked.connect(lambda _=False, c=curve: self.remove_curve(c))
+        row.addWidget(delete_button)
+        box_layout.addLayout(row)
+
+        # Shown in the sliders' own units: p in percent, X in degrees.
+        lines = []
+        for par, v in zip(MODELS[curve['func']].params, curve['pars']):
+            if par.kind == 'p':
+                lines.append(f'{par.name} = {100 * v:.4g} %')
+            elif par.kind == 'X':
+                lines.append(f'{par.name} = {np.degrees(v):.4g} deg')
+            else:
+                lines.append(f'{par.name} = {v:.4g}')
+        params_label = QLabel('\n'.join(lines))
+        params_label.setStyleSheet('font-family: monospace; font-size: 8pt;')
+        # Parameters on the left; on the right, top-aligned with them, the
+        # curve-vs-data statistics (when data is loaded), with an Export
+        # model button at the bottom right.
+        body = QHBoxLayout()
+        body.addWidget(params_label, alignment=Qt.AlignTop)
+        body.addStretch(1)
+        right = QVBoxLayout()
+        right_lines = self.curve_evidence_lines(curve) if 'family' in curve else []
+        if curve['stats'] is not None:
+            right_lines += self.format_curve_stats(curve['stats']).split('\n')
+        if right_lines:
+            stats_label = QLabel('\n'.join(right_lines))
+            stats_label.setStyleSheet('font-family: monospace; font-size: 8pt;')
+            right.addWidget(stats_label, alignment=Qt.AlignTop)
+        right.addStretch(1)
+        if 'family' in curve:
+            # MultiNest-samples curve: how many posterior draws to plot,
+            # right above the Export button's spot.
+            samples_row = QHBoxLayout()
+            samples_row.addStretch(1)
+            samples_row.addWidget(QLabel('# samples'))
+            samples_spin = QSpinBox()
+            samples_spin.setRange(0, 1000)
+            samples_spin.setValue(curve['n_samples'])
+            samples_spin.setFixedWidth(56)
+            samples_spin.setToolTip('Number of posterior samples drawn from this mode')
+            samples_spin.valueChanged.connect(lambda v, c=curve: self.update_curve_draws(c, v))
+            samples_row.addWidget(samples_spin)
+            right.addLayout(samples_row)
+        export_button = QPushButton('Export model')
+        export_button.setToolTip('Save this curve as a model file (loadable with Load Model).')
+        export_button.clicked.connect(lambda _=False, c=curve: self.export_curve_action(c))
+        right.addWidget(export_button, alignment=Qt.AlignRight | Qt.AlignBottom)
+        body.addLayout(right)
+        box_layout.addLayout(body)
+        return box
+
+    def on_curve_style_edited(self, curve, **changes):
+        curve.update(changes)
+        self.curve_name_edit.setText(self.suggested_curve_name())
+        self.request_update_plot()
+
+    def pick_curve_color(self, curve, button):
+        color = QColorDialog.getColor(QColor(curve['color']), self, 'Curve color')
+        if color.isValid():
+            curve['color'] = color.name()
+            button.setStyleSheet(f"background-color: {curve['color']};")
+            self.request_update_plot()
 
     def request_update_plot(self, *_):
         """Throttled entry point for update_plot -- see PLOT_THROTTLE_MS.
@@ -1413,9 +2208,14 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         connects both this and on_slider_drag_ended to its own QSlider's
         sliderPressed/sliderReleased."""
         self._dragging = True
+        # Minor ticks/grid roughly double a redraw's cost; hide them for the drag.
+        for canvas in (self.canvas, self.stokes_canvas):
+            set_drag_mode(canvas, True)
 
     def on_slider_drag_ended(self):
         self._dragging = False
+        for canvas in (self.canvas, self.stokes_canvas):
+            set_drag_mode(canvas, False)
         self._plot_pending = False  # this call's own full-res redraw supersedes any coalesced one
         self.update_plot()  # one final full-resolution redraw once the drag settles
 
@@ -1424,9 +2224,9 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         """(wl_min, wl_max) [m] of the Wavelength range box's own current
         selection -- shared by refresh_rmsynth_empty_axis and
         rmsynth_from_model (which synthesizes over this same full range)."""
-        wl_min_mm = min(self.wl_min.value(), self.wl_max.value())
-        wl_max_mm = max(self.wl_min.value(), self.wl_max.value())
-        return wl_min_mm * 1e-3, wl_max_mm * 1e-3
+        unit_m = self.wl_unit_m()
+        return (min(self.wl_min.value(), self.wl_max.value()) * unit_m,
+                max(self.wl_min.value(), self.wl_max.value()) * unit_m)
 
     def refresh_rmsynth_empty_axis(self, *_):
         """Keep the RM-synth tab's own empty-plot phi range matched to the
@@ -1578,6 +2378,11 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.edit_custom_model_action.triggered.connect(self.edit_custom_model_menu_action)
         models_menu.addAction(self.edit_custom_model_action)
 
+        preferences_menu = menubar.addMenu('&Preferences')
+        figure_prefs_action = QAction('Figures...', self)
+        figure_prefs_action.triggered.connect(self.show_preferences)
+        preferences_menu.addAction(figure_prefs_action)
+
         help_menu = menubar.addMenu('&Help')
         complex_pol_action = QAction('Complex polarization', self)
         complex_pol_action.triggered.connect(self.show_complex_polarization_help)
@@ -1615,18 +2420,15 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.clear_posterior_samples()
         self.remove_corner_tab()
         default_nu0 = self.default_nu0_ghz()
-        self.nu0_slider_1.set_value(default_nu0)
-        self.nu0_slider_2.set_value(default_nu0)
-        self.nu0_slider_1.fix_checkbox.setChecked(True)
-        self.nu0_slider_2.fix_checkbox.setChecked(True)
-        self.temp_slider_1.set_value(DEFAULT_TEMP_K)
-        self.temp_slider_2.set_value(DEFAULT_TEMP_K)
-        self.temp_slider_1.fix_checkbox.setChecked(True)
-        self.temp_slider_2.fix_checkbox.setChecked(True)
-        self.beta_slider_1.set_value(DEFAULT_BETA)
-        self.beta_slider_2.set_value(DEFAULT_BETA)
-        self.beta_slider_1.fix_checkbox.setChecked(True)
-        self.beta_slider_2.fix_checkbox.setChecked(True)
+        for sl in self.nu0_sliders:
+            sl.set_value(default_nu0)
+            sl.fix_checkbox.setChecked(True)
+        for sl in self.temp_sliders:
+            sl.set_value(DEFAULT_TEMP_K)
+            sl.fix_checkbox.setChecked(True)
+        for sl in self.beta_sliders:
+            sl.set_value(DEFAULT_BETA)
+            sl.fix_checkbox.setChecked(True)
         self.rebuild_sliders()
 
     def clear_data(self):
@@ -1643,7 +2445,16 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         with this data and survives it."""
         self.canvas.clear_reference_data()
         self.stokes_canvas.clear_reference_data()
+        # Drop the file-name titles Load data filled in, but not anything
+        # the user has since typed over them.
+        for edit in (self.p_title_edit, self.stokes_title_edit):
+            if getattr(self, 'auto_title', None) and edit.text() == self.auto_title:
+                edit.clear()
+        self.auto_title = None
+        had_data = self.fit_data is not None
         self.fit_data = None
+        if had_data:  # repeated clicks with nothing loaded shouldn't rebuild (flicker) the Comparison rows
+            self.reset_curve_stats()
         self.data_nu_min = None
         self.remove_corner_tab()
         self.fit_button.setEnabled(False)
@@ -1723,7 +2534,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         wl, q, q_err, u, u_err, freq, I = self.fit_data
 
         alpha_indices = spec.indices('alpha')
-        shape1, shape2 = self.current_shapes()
+        shape1, shape2, _ = self.current_shapes()
         NEEDS_REGRESSION = ('ssa', 'thermal', 'logparabola')
         if spec.n_components == 2 and alpha_indices and (shape1 in NEEDS_REGRESSION or shape2 in NEEDS_REGRESSION):
             alpha_init = self.sliders[alpha_indices[0]].value()
@@ -1804,7 +2615,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         else:
             alpha_est = estimate_alpha(freq, I)
 
-        fixed = {i: FIT_FIXED_EPSILON for i in spec.indices('eps')}
+        fixed = fixed_epsilons(spec)
         fixed.update({i: alpha_est for i in alpha_indices})
         fixed.update({i: sl.value() for i, sl in enumerate(self.sliders) if sl.is_fixed()})
         lo = [sl.bounds()[0] for sl in self.sliders]
@@ -1839,7 +2650,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         conv = 'yes' if stats['converged'] else 'NO -- check bounds/initial guess'
         return (
             f"χ² = {stats['chi2']:.4g}   dof = {stats['dof']}\n"
-            f"χ²_red = {stats['chi2_red']:.4g}\n"
+            f"χ²_k = {stats['chi2_red']:.4g}\n"
             f"ln L = {stats['loglike']:.4g}\n"
             f"AIC = {stats['aic']:.4g}   AICc = {aicc}\n"
             f"BIC = {stats['bic']:.4g}\n"
@@ -1864,31 +2675,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             return
         if not path.endswith('.json'):
             path += '.json'
-        shape1, shape2 = self.current_shapes()
-        data = {
-            'model': func.__name__,
-            'parameters': dict(zip(spec.param_names, pars)),
-            'spectral_shape': shape1,
-        }
-        if spec.n_components == 2:
-            data['spectral_shape_2'] = shape2
-        if shape1 in ('ssa', 'thermal'):
-            data['nu0_ghz'] = self.nu0_slider_1.value()
-        if spec.n_components == 2 and shape2 in ('ssa', 'thermal'):
-            data['nu0_2_ghz'] = self.nu0_slider_2.value()
-        if shape1 == 'thermal':
-            data['temp_k'] = self.temp_slider_1.value()
-        if spec.n_components == 2 and shape2 == 'thermal':
-            data['temp_2_k'] = self.temp_slider_2.value()
-        if shape1 == 'logparabola':
-            data['beta'] = self.beta_slider_1.value()
-        if spec.n_components == 2 and shape2 == 'logparabola':
-            data['beta_2'] = self.beta_slider_2.value()
-        if func in CUSTOM_MODEL_DEFS:
-            # eps(z)/phi(z)/bounds needed to rebuild+re-register this exact
-            # model in a fresh session, where func.__name__ won't already be
-            # in MODELS_BY_NAME -- see load_model_action.
-            data['custom_definition'] = CUSTOM_MODEL_DEFS[func]
+        data = self.model_file_data(func, spec, pars, get_spectral_state())
         try:
             with open(path, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -1896,6 +2683,51 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             # QMessageBox.warning shows a small popup dialog with an icon,
             # title, and message -- used throughout for user-facing errors.
             QMessageBox.warning(self, 'Save Model', f'Could not save model file:\n{e}')
+
+    def model_file_data(self, func, spec, pars, state):
+        """The Save Model JSON dict for `func` at `pars`, with each component's
+        spectral shape/nu_0/T/beta taken from `state` (a get_spectral_state()
+        snapshot: the live Spectrum box, or a curve's frozen one)."""
+        comps = [(state['shape'], state['nu0'], state['T'], state['beta']),
+                 (state['shape2'], state['nu0_2'], state['T2'], state['beta2']),
+                 (state['shape3'], state['nu0_3'], state['T3'], state['beta3'])]
+        data = {
+            'model': func.__name__,
+            'parameters': dict(zip(spec.param_names, pars)),
+        }
+        for k in range(max(spec.n_components, 1)):
+            shape, nu0, T, beta = comps[k]
+            keys = self.MODEL_FILE_KEYS[k]
+            data[keys['shape']] = shape
+            if shape in ('ssa', 'thermal') and nu0 is not None:
+                data[keys['nu0']] = nu0 / 1e3  # MHz -> GHz
+            if shape == 'thermal' and T is not None:
+                data[keys['temp']] = T
+            if shape == 'logparabola' and beta is not None:
+                data[keys['beta']] = beta
+        if func in CUSTOM_MODEL_DEFS:
+            # eps(z)/phi(z)/bounds needed to rebuild+re-register this exact
+            # model in a fresh session, where func.__name__ won't already be
+            # in MODELS_BY_NAME -- see load_model_action.
+            data['custom_definition'] = CUSTOM_MODEL_DEFS[func]
+        return data
+
+    def export_curve_action(self, curve):
+        """Comparison tab's Export model: write this curve (model, parameters,
+        spectral shapes) as a Save Model JSON file."""
+        func = curve['func']
+        default = re.sub(r'[^\w.+-]+', '_', curve['name']) or func.__name__
+        path, _ = QFileDialog.getSaveFileName(self, 'Export Model', f'{default}.json', 'JSON files (*.json)')
+        if not path:
+            return
+        if not path.endswith('.json'):
+            path += '.json'
+        data = self.model_file_data(func, MODELS[func], curve['pars'], curve['spectral'])
+        try:
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            QMessageBox.warning(self, 'Export Model', f'Could not save model file:\n{e}')
 
     def save_spectra_action(self):
         """Write the current model's p/EVPA and I/Q/U spectra to a CSV."""
@@ -1936,30 +2768,45 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             return
         if not path.endswith('.tex'):
             path += '.tex'
-        shape1, shape2 = self.current_shapes()
+        shape1, shape2, shape3 = self.current_shapes()
         try:
             with open(path, 'w') as f:
-                f.write(full_equation(spec, shape1, shape2) + '\n')
+                f.write(full_equation(spec, shape1, shape2, shape3) + '\n')
         except OSError as e:
             QMessageBox.warning(self, 'Save Equation', f'Could not save equation file:\n{e}')
 
-    def load_model_action(self):
-        """Read a model + parameters (+ per-component spectral
-        shape/nu_0/T/beta) JSON file (as written by save_model_action) and
-        apply it: switch the Spectrum box's shape dropdown(s) and
-        nu_0/T/beta slider(s), switch the model dropdown, then move each
-        slider to the saved value.
+    # JSON keys of each component's own spectral state in a Save Model file
+    # (component 1's are the original, un-numbered ones).
+    MODEL_FILE_KEYS = [
+        dict(shape='spectral_shape', nu0='nu0_ghz', temp='temp_k', beta='beta'),
+        dict(shape='spectral_shape_2', nu0='nu0_2_ghz', temp='temp_2_k', beta='beta_2'),
+        dict(shape='spectral_shape_3', nu0='nu0_3_ghz', temp='temp_3_k', beta='beta_3'),
+    ]
 
-        `spectral_shape` defaults to 'powerlaw' (and nu_0/T/beta are left
-        alone) for files saved before this was tracked, so older Save
-        Model output still loads the same as it always did;
-        `spectral_shape_2` similarly defaults to `spectral_shape` for
-        files saved before the two components could have independent
-        shapes."""
-        # getOpenFileName is the read-side counterpart of getSaveFileName.
-        path, _ = QFileDialog.getOpenFileName(self, 'Load Model', '', 'JSON files (*.json)')
-        if not path:
-            return
+    @staticmethod
+    def spectral_kwargs(spec, states):
+        """models.set_spectral_shape kwargs for a loaded model's per-component
+        `states` (dicts of shape/nu0_ghz/temp_k/beta, see read_model_file),
+        keeping a value only where that component's own shape uses it."""
+        n = spec.n_components if spec.n_components >= 2 else 1
+        out = {}
+        for k, (shape_key, nu0_key, T_key, beta_key) in enumerate(
+                (('shape', 'nu0', 'T', 'beta'), ('shape2', 'nu0_2', 'T2', 'beta2'),
+                 ('shape3', 'nu0_3', 'T3', 'beta3'))):
+            st = states[k] if k < n else states[0]
+            shape = st['shape']
+            out[shape_key] = shape
+            out[nu0_key] = st['nu0_ghz'] * 1e3 if shape in ('ssa', 'thermal') and st['nu0_ghz'] is not None else None  # GHz -> MHz
+            out[T_key] = st['temp_k'] if shape == 'thermal' else None
+            out[beta_key] = st['beta'] if shape == 'logparabola' else None
+        return out
+
+    def read_model_file(self, path):
+        """Parse a Save Model JSON file (registering and inserting into the
+        dropdown a custom model this session hasn't seen), returning (func,
+        params, states), or None (after warning) if it can't be loaded; `states`
+        is one dict per component (up to 3) with its shape/nu0_ghz/temp_k/beta. Shared by
+        load_model_action and load_curve_from_file_action."""
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -1986,19 +2833,49 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
                     title=cd.get('title'), name=model_name)
                 insert_at = self.model_combo.count() - 1  # just above the sentinel
                 self.model_combo.insertItem(insert_at, MODELS[func].label, func)
-            func = MODELS_BY_NAME[model_name]
-            params = data['parameters']
-            shape1 = data.get('spectral_shape', 'powerlaw')
-            shape2 = data.get('spectral_shape_2', shape1)
-            nu0_ghz = data.get('nu0_ghz')
-            nu0_2_ghz = data.get('nu0_2_ghz', nu0_ghz)
-            temp_k = data.get('temp_k')
-            temp_2_k = data.get('temp_2_k', temp_k)
-            beta = data.get('beta')
-            beta_2 = data.get('beta_2', beta)
+            func = get_model_by_name(model_name)
+            params = dict(data['parameters'])
+            if model_name in LEGACY_MODELS:
+                # Saved from a legacy two-component model (now a composite):
+                # its external sigma_phi used the old exp(-sigma^2 lambda^4).
+                for i, scale in legacy_dphi_scale(func).items():
+                    name = MODELS[func].params[i].name
+                    if name in params:
+                        params[name] = params[name] * scale
+            states = []
+            for k, keys in enumerate(self.MODEL_FILE_KEYS):
+                first = states[0] if states else None
+                states.append(dict(
+                    shape=data.get(keys['shape'], first['shape'] if first else 'powerlaw'),
+                    nu0_ghz=data.get(keys['nu0'], first['nu0_ghz'] if first else None),
+                    temp_k=data.get(keys['temp'], first['temp_k'] if first else None),
+                    beta=data.get(keys['beta'], first['beta'] if first else None)))
         except (OSError, ValueError, KeyError, CustomModelError) as e:
             QMessageBox.warning(self, 'Load Model', f'Could not load model file:\n{e}')
+            return None
+        return func, params, states
+
+    def load_model_action(self):
+        """Read a model + parameters (+ per-component spectral
+        shape/nu_0/T/beta) JSON file (as written by save_model_action) and
+        apply it: switch the Spectrum box's shape dropdown(s) and
+        nu_0/T/beta slider(s), switch the model dropdown, then move each
+        slider to the saved value.
+
+        `spectral_shape` defaults to 'powerlaw' (and nu_0/T/beta are left
+        alone) for files saved before this was tracked, so older Save
+        Model output still loads the same as it always did;
+        `spectral_shape_2` similarly defaults to `spectral_shape` for
+        files saved before the two components could have independent
+        shapes."""
+        # getOpenFileName is the read-side counterpart of getSaveFileName.
+        path, _ = QFileDialog.getOpenFileName(self, 'Load Model', '', 'JSON files (*.json)')
+        if not path:
             return
+        parsed = self.read_model_file(path)
+        if parsed is None:
+            return
+        func, params, states = parsed
 
         # Set the Spectrum box's own state first -- rebuild_sliders below
         # (triggered by the model switch) re-syncs it from whatever's
@@ -2009,27 +2886,22 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # pair matches the loaded model's own component count, so setting
         # the other is harmless (and keeps a later model switch's own
         # starting point sane).
-        for combo, shape in ((self.shape_combo, shape1), (self.shape_combo_1, shape1),
-                              (self.shape_combo_2, shape2)):
-            idx = combo.findData(shape)
+        combos = [(self.shape_combo, states[0])] + list(zip(self.shape_combos, states))
+        for combo, st in combos:
+            idx = combo.findData(st['shape'])
             if idx >= 0:
                 combo.blockSignals(True)
                 combo.setCurrentIndex(idx)
                 combo.blockSignals(False)
-        if nu0_ghz is not None:
-            self.nu0_slider_1.set_value(nu0_ghz)
-        if nu0_2_ghz is not None:
-            self.nu0_slider_2.set_value(nu0_2_ghz)
-        if temp_k is not None:
-            self.temp_slider_1.set_value(temp_k)
-        if temp_2_k is not None:
-            self.temp_slider_2.set_value(temp_2_k)
-        if beta is not None:
-            self.beta_slider_1.set_value(beta)
-        if beta_2 is not None:
-            self.beta_slider_2.set_value(beta_2)
+        for k, st in enumerate(states):
+            if st['nu0_ghz'] is not None:
+                self.nu0_sliders[k].set_value(st['nu0_ghz'])
+            if st['temp_k'] is not None:
+                self.temp_sliders[k].set_value(st['temp_k'])
+            if st['beta'] is not None:
+                self.beta_sliders[k].set_value(st['beta'])
 
-        idx = self.model_combo.findData(func)
+        idx = self.model_index_for(func)
         self.model_combo.blockSignals(True)
         self.model_combo.setCurrentIndex(idx)
         self.model_combo.blockSignals(False)
@@ -2090,6 +2962,11 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         w2 = wl ** 2 * 1e6  # lambda^2 [mm^2]
         nu_ghz = freq / 1e9
 
+        # Both plots get the file's name (minus extension) as their title.
+        self.auto_title = os.path.splitext(os.path.basename(path))[0]
+        self.p_title_edit.setText(self.auto_title)
+        self.stokes_title_edit.setText(self.auto_title)
+
         self.canvas.set_reference_data(w2, p_pct, p_err_pct, evpa_deg, evpa_err_deg)
         self.stokes_canvas.set_reference_data(nu_ghz, I_n, I_err_n, Q_n, Q_err_n, U_n, U_err_n)
 
@@ -2101,6 +2978,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # the user clicks Fitting.
         wl, q, q_err, u, u_err = fractional_qu(freq, I, Q, U, I_err, Q_err, U_err)
         self.fit_data = (wl, q, q_err, u, u_err, freq, I)
+        self.reset_curve_stats()
         self.fit_button.setEnabled(True)
         self.rmsynth_data_button.setEnabled(True)
 
