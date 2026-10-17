@@ -2962,8 +2962,10 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         w2 = wl ** 2 * 1e6  # lambda^2 [mm^2]
         nu_ghz = freq / 1e9
 
-        # Both plots get the file's name (minus extension) as their title.
-        self.auto_title = os.path.splitext(os.path.basename(path))[0]
+        # Both plots get the file's name as their title, minus the extension
+        # and 'VAPOLA', with underscores shown as spaces.
+        stem = os.path.splitext(os.path.basename(path))[0]
+        self.auto_title = ' '.join(stem.replace('VAPOLA', '').replace('_', ' ').split())
         self.p_title_edit.setText(self.auto_title)
         self.stokes_title_edit.setText(self.auto_title)
 

@@ -42,7 +42,8 @@ from polvista.rm_synthesis import sci_latex
 # (all of the visualizer's model curves in curve_color); curve_samples is the
 # number of posterior draws a Comparison-tab samples curve starts with;
 # ylim_err_factor_p/_evpa are how many max-errors beyond the data the p/EVPA
-# y-limits extend when points are loaded; bands_on shades the
+# y-limits extend when points are loaded; EVPA points spanning more than
+# evpa_full_span degrees get the fixed y-limits evpa_full_ylim instead; bands_on shades the
 # Measurements tab's bands on the plots at opacity bands_alpha; marker is a matplotlib marker symbol.
 DEFAULT_PLOT_PREFS = {
     'title': 27, 'label': 25, 'tick': 22, 'legend': 20,
@@ -55,6 +56,7 @@ DEFAULT_PLOT_PREFS = {
     'marker_edge_width': 1.5, 'marker_edge_color': '#000000',
     'bands_on': False, 'bands_alpha': 0.3,
     'ylim_err_factor_p': 8, 'ylim_err_factor_evpa': 4,
+    'evpa_full_span': 170, 'evpa_full_ylim': (-100, 100),
 }
 
 SLIDER_STEPS = 10000  # integer resolution backing each QSlider
@@ -952,6 +954,10 @@ class ModelPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
                 p_ylim = (max(lo, 0.0), hi)
             if any(np.isfinite(np.concatenate(x_pts))):
                 x_ylim = data_ylim(x_pts, x_errs, PLOT_PREFS['ylim_err_factor_evpa'])
+                x_all = np.concatenate(x_pts)
+                x_all = x_all[np.isfinite(x_all)]
+                if np.ptp(x_all) > PLOT_PREFS['evpa_full_span']:
+                    x_ylim = PLOT_PREFS['evpa_full_ylim']  # points spread over (nearly) the full EVPA range
 
         self.line_p.set_data(w2, p)
         self.ax_p.set_xlim(xlo, xhi)
@@ -1185,7 +1191,7 @@ class StokesPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
             else:
                 handles_I = ([self.line_I, self.line_I1, self.line_I2] + ([self.line_I3] if self.ax_I_two_comp == 3 else [])
                              if self.ax_I_two_comp else [self.line_I])
-            self.ax_I.legend(handles_I, [h.get_label() for h in handles_I], loc='lower right',
+            self.ax_I.legend(handles_I, [h.get_label() for h in handles_I], loc='lower left',
                              fontsize=self.legend_fontsize)
             if self.mode == 'Spectra':
                 legend = self.ax_QU.get_legend()
@@ -1227,7 +1233,8 @@ class StokesPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
             # labelpad=25, not the default ~4 -- see ModelPlot.ax_x's own
             # comment (same rotation=270 + tick_right() crowding).
             self.ax_QU.set_ylabel(r'$u$ [ % ]', rotation=270, labelpad=45)
-            _bound_yaxis_ticklabels(self.ax_QU)
+            # Percent values: plain tick labels, never an x10^n offset above the axis.
+            self.ax_QU.ticklabel_format(axis='both', style='plain', useOffset=False)
             self.line_Q = self.line_U = None
             self.line_Q1 = self.line_U1 = self.line_Q2 = self.line_U2 = self.line_Q3 = self.line_U3 = None
             self.line_QU = LineCollection([], cmap=QU_RAINBOW_CMAP, norm=mcolors.Normalize(0, 1), zorder=3)
