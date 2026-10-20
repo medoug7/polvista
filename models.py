@@ -771,12 +771,46 @@ def composite_name(mode, codes):
 
 
 def parse_composite_name(name):
-    """(mode, codes) for a name composite_name produced, else None."""
+    """(mode, codes) for a name composite_name produced, else None. A code
+    may itself contain underscores (a custom model's func.__name__, see
+    register_custom_screen), so the part after the prefix is split by
+    matching known SCREENS codes rather than on every '_'."""
     prefix, _, rest = name.partition('_')
-    codes = tuple(rest.split('_')) if rest else ()
-    if prefix not in COMPOSITE_PREFIX or not 2 <= len(codes) <= 3 or any(c not in SCREENS for c in codes):
+    if prefix not in COMPOSITE_PREFIX or not rest:
         return None
-    return prefix, codes
+
+    def split(text, found):
+        if not text:
+            return found if 2 <= len(found) <= 3 else None
+        if len(found) == 3:
+            return None
+        for code in SCREENS:
+            if text == code or text.startswith(code + '_'):
+                got = split(text[len(code) + 1:], found + [code])
+                if got:
+                    return got
+        return None
+    codes = split(rest, [])
+    return (prefix, tuple(codes)) if codes else None
+
+
+def register_custom_screen(func):
+    """Offer custom model `func` as a single-screen component of the
+    multi-component models, under its own func.__name__ as the SCREENS code.
+    Calling it again for a name already registered (an edited model reusing
+    its name) swaps in the new function and drops every cached composite
+    built from the old one, so they get rebuilt on next use."""
+    code = func.__name__
+    if code in SCREENS and not SCREENS[code].get('custom'):
+        return
+    label = MODELS[func].label
+    tag = re.sub(r'[^0-9a-zA-Z]+', '', label) or 'custom'
+    SCREENS[code] = dict(func=func, label=label, custom=True,
+                         term=r'\mathrm{%s}_{@}(\lambda)' % tag, extra='')
+    for key in [k for k in _COMPOSITES if code in k[1]]:
+        stale = _COMPOSITES.pop(key)
+        MODELS.pop(stale, None)
+        MODELS_BY_NAME.pop(stale.__name__, None)
 
 
 def _component_params(code, k):
@@ -786,11 +820,25 @@ def _component_params(code, k):
     params, lo, hi = [], [], []
     for par, l, h in zip(spec.params[:-1], spec.bounds[0][:-1], spec.bounds[1][:-1]):
         name = _COMP_NAME.get(par.name, par.name + '_{k}').replace('{k}', str(k))
-        sym = _COMP_LATEX.get(par.name, par.latex.strip('$') + '_{k}').replace('{k}', '{%d}' % k)
+        sym = _COMP_LATEX.get(par.name, '{' + par.latex.strip('$') + '}_{k}').replace('{k}', '{%d}' % k)  # braces: a custom param's latex may already be subscripted
         params.append(Param(name, f'${sym}$', par.kind, f"Component {k}: {par.description}"))
         lo.append(l)
         hi.append(h)
     return params, lo, hi
+
+
+def _screen_term(code):
+    """The callable computing one component's P_k(lambda) from its own
+    params (the single-screen params minus the trailing alpha). A custom
+    model's function reads its alpha from the end of its params, which a
+    composite keeps elsewhere, so it gets a fixed 0 appended -- harmless
+    unless SSA/thermal opacity is on, where it enters the per-z optical
+    depth (and the opacity follows the Spectrum box's component-1 shape)."""
+    sc = SCREENS[code]
+    if not sc.get('custom'):
+        return sc['func']
+    func = sc['func']
+    return lambda x, p: func(x, np.append(p, 0.0))
 
 
 def get_composite(mode, codes):
@@ -804,7 +852,7 @@ def get_composite(mode, codes):
     params, lo, hi, terms = [], [], [], []
     for k, code in enumerate(codes, start=1):
         cp, cl, ch = _component_params(code, k)
-        terms.append((SCREENS[code]['func'], len(params), len(cp)))
+        terms.append((_screen_term(code), len(params), len(cp)))
         params += cp
         lo += cl
         hi += ch
@@ -829,6 +877,7 @@ def get_composite(mode, codes):
     func.__name__ = func.__qualname__ = composite_name(mode, codes)
     func.__doc__ = f"{mode} composite of {', '.join(codes)} ({len(params)} pars)"
     func.composite = dict(mode=mode, codes=codes, n=n, terms=terms)
+    func.is_custom = any(SCREENS[c].get('custom') for c in codes)  # same Fit!/Sampling guard as a custom model
 
     lines = []
     for k, code in enumerate(codes, start=1):
@@ -2255,6 +2304,8 @@ def build_custom_model(label, emiss_str, phi_str, param_specs,
 
     register(custom_func, plot_name=label, label=label, title=title, params=params, bounds=(lo, hi),
              n_components=1, n_live_points=1000, equation=equation)
+
+    register_custom_screen(custom_func)
 
     CUSTOM_MODEL_DEFS[custom_func] = {
         'label': label, 'title': title, 'emiss_expr': emiss_str, 'phi_expr': phi_str,

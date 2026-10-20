@@ -14,7 +14,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QPointF
 from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPolygonF
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QGroupBox,
-    QScrollArea, QDoubleSpinBox, QSpinBox, QFileDialog, QMessageBox, QSizePolicy)
+    QScrollArea, QDoubleSpinBox, QSpinBox, QFileDialog, QMessageBox, QSizePolicy, QCheckBox)
 
 from polvista.models import C, stokes_I
 from polvista.latex_stuff import latex_pixmap
@@ -245,6 +245,17 @@ SKA_MID_ALL_BANDS = [SKA_MID_B1, SKA_MID_B2, SKA_MID_B3, SKA_MID_B4,
 SKA_LOW = (0.20, 0.30, 50)       # 50-350 MHz
 SKA_LOW_ALL_BANDS = [SKA_LOW]
 
+# SPHERE/IRDIS's 4 broadband filters offered for dual-polarization imaging
+# (BB_Y, BB_J, BB_H, BB_Ks), per de Boer et al. 2020 (central wavelength /
+# bandwidth: Y 1043/140, J 1245/240, H 1625/290, Ks 2182/300 nm); center/bw
+# follow the same nu_min/nu_max geometric-mean/difference convention as
+# SDSS_G below, taking each band's wavelength edges as lambda_c +/- bw/2.
+IRDIS_Y = (288082.4, 38756.2, 1)    # Y band: 973-1113 nm / 269-308 THz
+IRDIS_J = (241923.5, 46854.0, 1)    # J band: 1125-1365 nm / 220-266 THz
+IRDIS_H = (185226.5, 33188.2, 1)    # H band: 1480-1770 nm / 169-203 THz
+IRDIS_KS = (137719.2, 18979.7, 1)   # Ks band: 2032-2332 nm / 129-148 THz
+IRDIS_ALL_BANDS = [IRDIS_Y, IRDIS_J, IRDIS_H, IRDIS_KS]
+
 # SDSS-like optical filters (g, r, i, z) -- SPARC4's own 4 simultaneous
 # channels, per its instrument papers -- using the same round-number
 # Fukugita et al. 1996 band edges as app.WAVELENGTH_PRESETS; center is
@@ -303,6 +314,7 @@ DEFAULT_BANDS_BY_PRESET = {
     'Full LOFAR (1.25 - 30 m / 10 - 240 MHz)': LOFAR_ALL_BANDS,
     'Full MHz (8.6 cm - 30 m / 10 - 3500 GHz)': FULL_MHZ_BANDS,
     'Full radio (0.25mm - 30 m / 500 MHz - 1200 GHz)': FULL_RADIO_BANDS,
+    'Full SPHERE/IRDIS NIR (0.95 - 2.35 um / 128 - 316 THz)': IRDIS_ALL_BANDS,
     'Full SPARC4 optical (400 - 1000 nm / 300 - 750 THz)': SDSS_ALL_BANDS,
     'Full HAWC+ FIR (40 - 250 um / 1.2 - 7.5 THz)': HAWC_ALL_BANDS,
 }
@@ -405,8 +417,21 @@ class MeasurementsMixin:
         outer_layout = QVBoxLayout(self.measurements_tab)
 
         # ── Bands box ──────────────────────────────────────────────────
-        bands_box = QGroupBox('Bands')
+        # The title row is a plain label + checkbox rather than the group
+        # box's own title, which can't hold a right-aligned widget. Show is
+        # the same setting as Preferences > Bands On/Off (see
+        # MainWindow.apply_plot_preferences).
+        bands_box = QGroupBox()
         bands_layout = QVBoxLayout(bands_box)
+        bands_title_row = QHBoxLayout()
+        bands_title_row.addWidget(QLabel('Bands'))
+        bands_title_row.addStretch(1)
+        self.show_bands_check = QCheckBox('Show')
+        self.show_bands_check.setChecked(False)  # PLOT_PREFS' default; widgets.py imports this module, so no PLOT_PREFS here
+        self.show_bands_check.setToolTip('Shade the bands on the plots (same as Preferences > Bands).')
+        self.show_bands_check.toggled.connect(self.on_show_bands_toggled)
+        bands_title_row.addWidget(self.show_bands_check)
+        bands_layout.addLayout(bands_title_row)
 
         self.bands_container = QWidget()
         self.bands_container_layout = QVBoxLayout(self.bands_container)

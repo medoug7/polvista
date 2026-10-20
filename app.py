@@ -80,7 +80,7 @@ from polvista.latex_stuff import latex_pixmap, fit_equation_pixmap, TexViewerDia
 from polvista.widgets import (
     ValueLineEdit, NUMBER_RE, SLIDER_STEPS, UNITS, WIDEST_UNIT, ModelPlot, StokesPlot, RMSynthPlot,
     CURVE_LINESTYLES, WL_UNITS_M, set_suptitle, set_drag_mode, RESIZE_SETTLE_MS,
-    PLOT_PREFS, DEFAULT_PLOT_PREFS, COMPARISON_PALETTES, apply_plot_prefs)
+    PLOT_PREFS, DEFAULT_PLOT_PREFS, COMPARISON_PALETTES, apply_plot_prefs, DragHandle, CurveDropArea, sync_legend_visibility)
 from polvista.sampling import SamplingMixin, warm_up_sampling_imports
 from polvista.measurements import MeasurementsMixin, DEFAULT_BANDS_BY_PRESET
 from polvista.rm_synthesis import compute_faraday_spectrum, phi_axis_half_width, FaradaySpectrumError
@@ -177,6 +177,10 @@ DEFAULT_BETA = 0.0
 # 2018) -- its five broadband filters run 40-250 um, though Band B (63 um)
 # has a known oversaturation issue and is left out of DEFAULT_BANDS_BY_PRESET
 # below in favor of the 4 bands (A/C/D/E) actually used in science papers.
+# Full SPHERE/IRDIS NIR spans ESO's quoted 0.95-2.32 um IRDIS range, padded
+# to 2.35 um so the Ks band's own upper edge (2.332 um) fits -- its bands are
+# the 4 broadband filters offered for dual-polarization imaging (de Boer et
+# al. 2020), see measurements.IRDIS_ALL_BANDS.
 WAVELENGTH_PRESETS = [
     ('Standard ALMA (0.75 - 3.7 mm / 80 - 350 GHz)', 0.75, 3.7),
     ('Full ALMA (0.25 - 9 mm / 30 - 1200 GHz)', 0.25, 9.0),
@@ -191,6 +195,7 @@ WAVELENGTH_PRESETS = [
     ('SKA-Low (86 cm - 6 m / 50 MHz - 350 MHz)', 860, 6000),
     ('Full radio (0.25mm - 30 m / 500 MHz - 1200 GHz)', 0.25, 30000),
     ('Full HAWC+ FIR (40 - 250 um / 1.2 - 7.5 THz)', 0.04, 0.25),
+    ('Full SPHERE/IRDIS NIR (0.95 - 2.35 um / 128 - 316 THz)', 9.5e-4, 2.35e-3),
     ('Full SPARC4 optical (400 - 1000 nm / 300 - 750 THz)', 4.0e-4, 1.0e-3),
 ]
 
@@ -847,11 +852,14 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # presets themselves are stored in mm and converted when applied.
         self.wl_unit_combo = QComboBox()
         self.wl_unit_combo.addItems(list(WL_UNITS_M))
+        self.wl_unit_combo.setCurrentText('mm')  # the presets/limits below start out in mm
+        self._wl_unit_prev = self.wl_unit_combo.currentText()  # unit the min/max values are currently in
         self.wl_unit_combo.setToolTip('Unit of the min/max wavelengths')
         self.wl_unit_combo.currentTextChanged.connect(self.on_wl_unit_changed)
         log_row = QHBoxLayout()
         log_row.addWidget(self.log_xscale)
         log_row.addStretch(1)
+        log_row.addWidget(QLabel('units'))
         log_row.addWidget(self.wl_unit_combo)
         wl_box_layout.addLayout(log_row)
 
@@ -1014,6 +1022,10 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # p/EVPA and I/Q/U plots (see add_curve_action); the box on its left
         # shows (and lets the user override) the name it will be labeled with.
         curve_row = QHBoxLayout()
+        self.load_model_button = QPushButton('Load model')
+        self.load_model_button.setToolTip("Load a saved model file into the visualizer (same as Import > Load Model).")
+        self.load_model_button.clicked.connect(self.load_model_action)
+        curve_row.addWidget(self.load_model_button)
         self.curve_name_edit = QLineEdit()
         self.curve_name_edit.setToolTip('Name the next added curve will be labeled with.')
         self.curve_name_edit.setMaximumWidth(150)
@@ -1036,9 +1048,9 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         # pressed there (see run_fit/run_multinest_fit), not before.
         self.left_tabs = QTabWidget()
         self.left_tabs.addTab(self.param_box, 'Visualization')
+        self.build_comparison_tab()
         self.build_measurements_tab()
         self.build_sampling_tab()  # greyed out until data is loaded, see load_data_action
-        self.build_comparison_tab()
         left_layout.addWidget(self.left_tabs)
 
         # Reset Parameters on the left, Load/Clear Data grouped together in
@@ -1342,6 +1354,48 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         user cancels (the combo box selection isn't touched by opening it)."""
         self.open_custom_model_dialog()
 
+    def sync_screen_combos(self):
+        """Make every component's screen-type dropdown list exactly SCREENS
+        (a custom model is added there when built or loaded, see
+        models.register_custom_screen), refreshing the text of one whose
+        label changed. Signals are blocked: this only changes the lists, not
+        what's selected."""
+        for combo in self.comp_type_combos:
+            combo.blockSignals(True)
+            for code, sc in SCREENS.items():
+                i = combo.findData(code)
+                if i < 0:
+                    combo.addItem(sc['label'], code)
+                else:
+                    combo.setItemText(i, sc['label'])
+            combo.blockSignals(False)
+
+    def register_saved_custom(self, name, cd):
+        """Rebuild the custom model saved as `cd` (a 'custom_definition'
+        block, see save_model_action) under `name` -- unless this session
+        already has that name -- and insert it into model_combo just above
+        the sentinel, exactly like open_custom_model_dialog does for a
+        freshly-built one. It becomes available as a component screen too
+        (see sync_screen_combos)."""
+        if name in MODELS_BY_NAME:
+            return
+        # j_lo/j_hi/p_lo/p_hi replaced the old single-sided z1/z2
+        # bounds -- a file saved before that change only has
+        # z1/z2, so fall back to the closest equivalent under the
+        # new scheme (z1 was always emiss's upper bound with an
+        # implicit 0 lower bound; z2 was always phi''s lower bound
+        # with an implicit 1 upper bound) rather than silently
+        # reverting to the new all-purpose (0, 1) defaults.
+        func = build_custom_model(
+            cd['label'], cd['emiss_expr'], cd['phi_expr'],
+            {n: tuple(v) for n, v in cd['param_specs'].items()},
+            j_lo=cd.get('j_lo', 0.0), j_hi=cd.get('j_hi', cd.get('z1', 1.0)),
+            p_lo=cd.get('p_lo', cd.get('z2', 0.0)), p_hi=cd.get('p_hi', 1.0),
+            title=cd.get('title'), name=name)
+        insert_at = self.model_combo.count() - 1  # just above the sentinel
+        self.model_combo.insertItem(insert_at, MODELS[func].label, func)
+        self.sync_screen_combos()
+
     def open_custom_model_dialog(self, revert_index=None):
         """Open the "Build Custom Model" window (models.build_custom_model
         does the actual parsing/registration). If the user completes it,
@@ -1377,6 +1431,7 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             self.model_combo.setCurrentIndex(insert_at)
             self.model_combo.blockSignals(False)
             self._last_model_index = insert_at
+            self.sync_screen_combos()
             # Whatever Spectral model the builder dialog's own (preview-only)
             # dropdown was left on becomes this new model's *initial* live
             # Spectrum-box selection -- so opacity (if SSA/Thermal was
@@ -1428,6 +1483,10 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         if new_func is not func:
             CUSTOM_MODEL_DEFS.pop(func, None)
             MODELS.pop(func, None)
+        # Composites using this model were rebuilt around the edited one
+        # (see models.register_custom_screen).
+        self.sync_screen_combos()
+        self.refresh_composite_entries()
         self.rebuild_sliders()
 
     def rebuild_sliders(self, *_):
@@ -1737,15 +1796,27 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         return WL_UNITS_M[self.wl_unit_combo.currentText()]
 
     def on_wl_unit_changed(self, unit):
-        """Re-read the min/max numbers as `unit` (they are *not* converted --
-        the range they describe changes), rescale their limits/decimals
-        to match, and relabel the lambda^2 axis."""
+        """Convert the min/max numbers to `unit` so they keep describing the
+        same range, rescale their limits/decimals to match, and relabel the
+        lambda^2 axis."""
+        old_m = WL_UNITS_M[self._wl_unit_prev]
+        self._wl_unit_prev = unit
+        lo_mm = self.wl_min.value() * old_m / 1e-3
+        hi_mm = self.wl_max.value() * old_m / 1e-3
         scale = 1e-3 / WL_UNITS_M[unit]  # mm -> unit
-        decimals = {'mm': 6, 'cm': 6, 'm': 7}[unit]  # the range's lower limit is 1e-4 mm in any unit
+        decimals = {'μm': 4, 'mm': 6, 'cm': 6, 'm': 7}[unit]  # the range's lower limit is 1e-4 mm in any unit
+        # One redraw below instead of one per spin-box change (and none from
+        # the intermediate, clamped values).
+        for box in (self.wl_min, self.wl_max):
+            box.blockSignals(True)
         self.wl_min.setDecimals(decimals)
         self.wl_max.setDecimals(decimals)
         self.wl_min.setRange(self.WL_MIN_RANGE_MM[0] * scale, self.WL_MIN_RANGE_MM[1] * scale)
         self.wl_max.setRange(self.WL_MAX_RANGE_MM[0] * scale, self.WL_MAX_RANGE_MM[1] * scale)
+        self.wl_min.setValue(lo_mm * scale)
+        self.wl_max.setValue(hi_mm * scale)
+        for box in (self.wl_min, self.wl_max):
+            box.blockSignals(False)
         self.canvas.set_wl_unit(unit)
         self.refresh_rmsynth_empty_axis()
         self.update_plot()
@@ -1961,9 +2032,19 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
     def apply_plot_preferences(self, **changes):
         """Store `changes` (PLOT_PREFS keys) and restyle every canvas."""
         PLOT_PREFS.update(changes)
+        check = getattr(self, 'show_bands_check', None)  # Measurements tab's Show, mirrors bands_on
+        if check is not None and check.isChecked() != PLOT_PREFS['bands_on']:
+            check.blockSignals(True)
+            check.setChecked(PLOT_PREFS['bands_on'])
+            check.blockSignals(False)
         for canvas in (self.canvas, self.stokes_canvas, self.rmsynth_canvas):
             apply_plot_prefs(canvas)
         self.update_plot()
+
+    def on_show_bands_toggled(self, checked):
+        self.apply_plot_preferences(bands_on=checked)
+        if getattr(self, 'preferences_dialog', None) is not None:
+            self.preferences_dialog.refresh_widgets()
 
     def show_preferences(self):
         if getattr(self, 'preferences_dialog', None) is None:
@@ -2014,6 +2095,10 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         top_row = QHBoxLayout()
         top_row.addWidget(self.show_main_check)
         top_row.addStretch(1)
+        self.show_legend_check = QCheckBox('Show legend')
+        self.show_legend_check.setChecked(True)
+        self.show_legend_check.toggled.connect(self.on_show_legend_toggled)
+        top_row.addWidget(self.show_legend_check)
         outer.addLayout(top_row)
         self.load_curve_button = QPushButton('Load Model')
         self.load_curve_button.setToolTip(
@@ -2034,7 +2119,8 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         self.clear_all_curves_button.clicked.connect(self.clear_all_curves_action)
         load_row.addWidget(self.clear_all_curves_button)
         outer.addLayout(load_row)
-        self.comparison_rows_widget = QWidget()
+        self.comparison_rows_widget = CurveDropArea()
+        self.comparison_rows_widget.reordered.connect(self.move_curve)
         self.comparison_rows_layout = QVBoxLayout(self.comparison_rows_widget)
         self.comparison_rows_layout.setAlignment(Qt.AlignTop)
         scroll = QScrollArea()
@@ -2064,6 +2150,13 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
         except OSError as e:
             QMessageBox.warning(self, 'Export tex', f'Could not save the table:\n{e}')
 
+    def on_show_legend_toggled(self, checked):
+        for canvas in (self.canvas, self.stokes_canvas, self.rmsynth_canvas):
+            canvas.show_legend = checked
+            sync_legend_visibility(canvas)
+            canvas.draw_idle()
+        self.update_plot()
+
     def on_show_main_toggled(self, checked):
         self.canvas.show_main = self.stokes_canvas.show_main = checked
         self.update_plot()
@@ -2075,15 +2168,24 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             if widget is not None:
                 widget.setParent(None)  # off-screen immediately; deleteLater alone leaves it painted until the event loop runs
                 widget.deleteLater()
-        for curve in self.curves:
-            layout.addWidget(self.build_curve_row(curve))
+        for i, curve in enumerate(self.curves):
+            layout.addWidget(self.build_curve_row(curve, i))
 
-    def build_curve_row(self, curve):
+    def move_curve(self, src, dst):
+        """Drag-reorder in the Comparison tab: self.curves is kept in tab
+        order (top = first in the legend, drawn last -- see
+        widgets._curve_zorder)."""
+        self.curves.insert(dst, self.curves.pop(src))
+        self.refresh_curves()
+
+    def build_curve_row(self, curve, index):
         box = QGroupBox()
         box_layout = QVBoxLayout(box)
         box_layout.setContentsMargins(6, 6, 6, 6)
         row = QHBoxLayout()
         row.setSpacing(3)
+
+        row.addWidget(DragHandle(index, box))
 
         color_button = QPushButton()
         color_button.setFixedSize(26, 26)
@@ -2713,6 +2815,12 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             # model in a fresh session, where func.__name__ won't already be
             # in MODELS_BY_NAME -- see load_model_action.
             data['custom_definition'] = CUSTOM_MODEL_DEFS[func]
+        elif is_composite(func):
+            # Same, for each custom model used as a component screen.
+            defs = {code: CUSTOM_MODEL_DEFS[SCREENS[code]['func']]
+                    for code in func.composite['codes'] if SCREENS[code].get('custom')}
+            if defs:
+                data['custom_definitions'] = defs
         return data
 
     def export_curve_action(self, curve):
@@ -2814,28 +2922,14 @@ class MainWindow(QMainWindow, SamplingMixin, MeasurementsMixin):
             with open(path) as f:
                 data = json.load(f)
             model_name = data['model']
+            # A custom model this session has never seen (see
+            # save_model_action) -- rebuilt and registered under the same
+            # name it was saved with, whether it's the model itself or a
+            # component of a saved multi-component one.
             if model_name not in MODELS_BY_NAME and 'custom_definition' in data:
-                # This session has never seen this custom model (see
-                # save_model_action) -- rebuild and register it under the
-                # same name it was saved with, then insert it into the
-                # dropdown just like open_custom_model_dialog does for a
-                # freshly-built one.
-                cd = data['custom_definition']
-                # j_lo/j_hi/p_lo/p_hi replaced the old single-sided z1/z2
-                # bounds -- a file saved before that change only has
-                # z1/z2, so fall back to the closest equivalent under the
-                # new scheme (z1 was always emiss's upper bound with an
-                # implicit 0 lower bound; z2 was always phi''s lower bound
-                # with an implicit 1 upper bound) rather than silently
-                # reverting to the new all-purpose (0, 1) defaults.
-                func = build_custom_model(
-                    cd['label'], cd['emiss_expr'], cd['phi_expr'],
-                    {n: tuple(v) for n, v in cd['param_specs'].items()},
-                    j_lo=cd.get('j_lo', 0.0), j_hi=cd.get('j_hi', cd.get('z1', 1.0)),
-                    p_lo=cd.get('p_lo', cd.get('z2', 0.0)), p_hi=cd.get('p_hi', 1.0),
-                    title=cd.get('title'), name=model_name)
-                insert_at = self.model_combo.count() - 1  # just above the sentinel
-                self.model_combo.insertItem(insert_at, MODELS[func].label, func)
+                self.register_saved_custom(model_name, data['custom_definition'])
+            for code, cd in data.get('custom_definitions', {}).items():
+                self.register_saved_custom(code, cd)
             func = get_model_by_name(model_name)
             params = dict(data['parameters'])
             if model_name in LEGACY_MODELS:

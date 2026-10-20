@@ -11,8 +11,9 @@ import colorsys
 import numpy as np
 import matplotlib as mpl
 import matplotlib.colors as mcolors
-from PyQt5.QtWidgets import QLineEdit
-from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import QLineEdit, QLabel, QWidget, QVBoxLayout
+from PyQt5.QtCore import QTimer, Qt, QMimeData, pyqtSignal
+from PyQt5.QtGui import QDrag, QPainter, QPixmap
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -56,7 +57,7 @@ DEFAULT_PLOT_PREFS = {
     'marker_edge_width': 1.5, 'marker_edge_color': '#000000',
     'bands_on': False, 'bands_alpha': 0.3,
     'ylim_err_factor_p': 8, 'ylim_err_factor_evpa': 4,
-    'evpa_full_span': 170, 'evpa_full_ylim': (-100, 100),
+    'evpa_full_span': 170, 'evpa_full_ylim': (-95, 95),
 }
 
 SLIDER_STEPS = 10000  # integer resolution backing each QSlider
@@ -288,6 +289,9 @@ def apply_plot_prefs(canvas):
             line.set_linewidth(p['curve_width'])
             if name not in COMPONENT_LINES:
                 line.set_linestyle(CURVE_LINESTYLES[p['curve_style']])
+    line_qu = getattr(canvas, 'line_QU', None)  # Polar Q-U rainbow trajectory: a LineCollection, not in MAIN_CURVE_COLORS
+    if line_qu is not None:
+        line_qu.set_linewidth(p['curve_width'])
     canvas._bands_sig = None
     if hasattr(canvas, '_ref_dirty'):
         canvas._ref_dirty = True  # data points are rebuilt with the new marker style
@@ -530,7 +534,7 @@ class BlitDragMixin:
         if not self.isVisible():
             return
         arts = self._blit_artists()
-        legends = [lg for lg in (ax.get_legend() for ax in self.fig.axes) if lg is not None]
+        legends = [lg for lg in (ax.get_legend() for ax in self.fig.axes) if lg is not None and lg.get_visible()]
         key = (self.width(), self.height(), tuple(id(a) for _, a in arts), tuple(id(lg) for lg in legends),
                tuple((ax.get_xlim(), ax.get_ylim()) for ax in self.fig.axes))
         state = self._blit_state
@@ -576,7 +580,7 @@ def _finite_bounds(arr, fallback):
 
 
 # Wavelength units offered by the Wavelength range box -> meters per unit.
-WL_UNITS_M = {'mm': 1e-3, 'cm': 1e-2, 'm': 1.0}
+WL_UNITS_M = {'μm': 1e-6, 'mm': 1e-3, 'cm': 1e-2, 'm': 1.0}
 
 # Line styles offered for Add curve curves (Comparison tab dropdown).
 CURVE_LINESTYLES = {
@@ -590,9 +594,27 @@ CURVE_LINESTYLES = {
 
 
 def _curve_signature(curves):
-    """Hashable (name, color, linestyle) per curve -- what a legend/line
-    style sync needs to notice changing, as opposed to the curves' data."""
-    return tuple((c['name'], c['color'], c['linestyle'], c['linewidth']) for c in curves)
+    """Hashable (id, name, color, linestyle, linewidth) per curve -- what a
+    legend/line style sync needs to notice changing, as opposed to the
+    curves' data. Order matters: it is the stacking order too."""
+    return tuple((c['id'], c['name'], c['color'], c['linestyle'], c['linewidth']) for c in curves)
+
+
+def sync_legend_visibility(canvas):
+    """Show or hide every legend of `canvas` per its show_legend flag (the
+    Comparison tab's Show legend box); called wherever a legend is (re)built."""
+    visible = getattr(canvas, 'show_legend', True)
+    for ax in canvas.fig.axes:
+        legend = ax.get_legend()
+        if legend is not None:
+            legend.set_visible(visible)
+
+
+def _curve_zorder(i, n):
+    """zorder of the i-th of n added curves: the first one in the list (top
+    of the Comparison tab, first in the legend) is drawn last, i.e. on top.
+    Stays between the posterior-sample lines (3) and the data (5)."""
+    return 4 + 0.9 * (n - 1 - i) / max(n, 1)
 
 
 def _curve_data_key(curves):
@@ -602,7 +624,8 @@ def _curve_data_key(curves):
     return tuple((c['id'], c['rev']) for c in curves)
 
 
-def _style_curve_line(line, curve, label):
+def _style_curve_line(line, curve, label, zorder):
+    line.set_zorder(zorder)
     line.set_color(curve['color'])
     line.set_linestyle(CURVE_LINESTYLES[curve['linestyle']])
     line.set_linewidth(curve['linewidth'])
@@ -660,8 +683,14 @@ def _qu_point_style(fmt, color):
     return ref_point_style(fmt=fmt, mfc=color, color=color)
 
 
-def _meas_point_style(color, fmt='o'):
-    return dict(fmt=fmt, ms=4, mew=0.5, mec='k', color=color, ecolor=color, alpha=0.85, capsize=2, zorder=6)
+def _meas_point_style(color, fmt=None):
+    """Measurements-tab simulated point: marker format (unless `fmt` pins one,
+    as for the Q/U spectra), size and contour/error-line width follow the
+    marker preferences; colors stay per-band."""
+    p = PLOT_PREFS
+    return dict(fmt=fmt or p['marker'], ms=p['marker_size'], mew=p['marker_edge_width'], mec='k', color=color,
+                ecolor=color, elinewidth=p['marker_edge_width'], capthick=p['marker_edge_width'],
+                alpha=0.85, capsize=2, zorder=6)
 
 
 def _draw_errorbar_overlay(ax, x, y, style, xerr=None, yerr=None):
@@ -694,7 +723,7 @@ class ModelPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
         self._resize_setup()
         self.ax_x.yaxis.tick_right()
         self.ax_x.yaxis.set_label_position('right')
-        self.xlabel_text = self.fig.text(0.5, 0.05, r'$\lambda^2$ [ mm$^2$ ]', ha='center',
+        self.xlabel_text = self.fig.text(0.5, 0.03, r'$\lambda^2$ [ mm$^2$ ]', ha='center',
                                     fontsize=PLOT_PREFS['label'], color=PLOT_PREFS['label_color'])
         self.w2_scale = 1.0  # lambda^2 [mm^2] -> the selected wavelength unit's square, see set_wl_unit
 
@@ -706,7 +735,7 @@ class ModelPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
         _bound_yaxis_ticklabels(self.ax_p)
         # labelpad=25: rotation=270 + tick_right() above put this ylabel
         # right against its own tick labels at the default pad.
-        self.ax_x.set_ylabel(r'$\chi$ [ deg ]', rotation=270, labelpad=45)
+        self.ax_x.set_ylabel(r'$\chi$ [ deg ]', rotation=270, labelpad=25)
         style_grid(self.ax_x)
         _bound_yaxis_ticklabels(self.ax_x)
         self.line_p, = self.ax_p.plot([], [], **main_curve_style('line_p'))
@@ -794,16 +823,18 @@ class ModelPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
         sig = _curve_signature(self.perm_curves) + (self.legend_fontsize,)
         if sig != self._perm_style_sig:
             self._perm_style_sig = sig
-            for c, ln_p, ln_x, samples in zip(self.perm_curves, self.perm_lines_p, self.perm_lines_x,
-                                              self.perm_sample_lines):
-                _style_curve_line(ln_p, c, c['name'])
-                _style_curve_line(ln_x, c, '_nolegend_')
+            n = len(self.perm_curves)
+            for i, (c, ln_p, ln_x, samples) in enumerate(zip(self.perm_curves, self.perm_lines_p, self.perm_lines_x,
+                                                             self.perm_sample_lines)):
+                _style_curve_line(ln_p, c, c['name'], _curve_zorder(i, n))
+                _style_curve_line(ln_x, c, '_nolegend_', _curve_zorder(i, n))
                 _style_sample_lines(samples, c)
             legend = self.ax_p.get_legend()
             if legend is not None:
                 legend.remove()
             if self.perm_lines_p:
                 self.ax_p.legend(handles=self.perm_lines_p, loc='best', fontsize=self.legend_fontsize)
+            sync_legend_visibility(self)
         return self._perm_arrays
 
     def set_wl_unit(self, unit):
@@ -845,7 +876,7 @@ class ModelPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
         self.meas_artists = _clear_artists(self.meas_artists)
         if self.meas_bands:
             for band in self.meas_bands:
-                style = _meas_point_style(band['color'], fmt='D')
+                style = _meas_point_style(band['color'])
                 self.meas_artists.append(_draw_errorbar_overlay(
                     self.ax_p, band['w2'] * self.w2_scale, band['p'], style, yerr=band['p_err']))
                 self.meas_artists.append(_draw_errorbar_overlay(
@@ -1177,13 +1208,14 @@ class StokesPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
         sig = _curve_signature(self.perm_curves) + (self.ax_I_two_comp, self.legend_fontsize)
         if sig != self._perm_style_sig:
             self._perm_style_sig = sig
-            for c, ln_I, lines, samples in zip(self.perm_curves, self.perm_lines_I, self.perm_lines_QU,
-                                               self.perm_sample_lines):
+            n = len(self.perm_curves)
+            for i, (c, ln_I, lines, samples) in enumerate(zip(self.perm_curves, self.perm_lines_I, self.perm_lines_QU,
+                                                              self.perm_sample_lines)):
                 _style_sample_lines(samples, c)
-                _style_curve_line(ln_I, c, c['name'])
+                _style_curve_line(ln_I, c, c['name'], _curve_zorder(i, n))
                 for k, ln in enumerate(lines):
                     # Spectra mode: only the Q line carries the curve's legend entry
-                    _style_curve_line(ln, c, c['name'] if k == 0 else '_nolegend_')
+                    _style_curve_line(ln, c, c['name'] if k == 0 else '_nolegend_', _curve_zorder(i, n))
             # Legends: the usual I/I1/I2 and Q/U ones only while no curve has
             # been added; once one has, just the curves' own labels.
             if self.perm_curves:
@@ -1201,6 +1233,7 @@ class StokesPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
                               else [self.line_Q, self.line_U])
                 self.ax_QU.legend(handles_QU, [h.get_label() for h in handles_QU], loc='upper right',
                                   fontsize=self.legend_fontsize)
+            sync_legend_visibility(self)
         return self._perm_arrays
 
     def build_qu_mode(self):
@@ -1232,12 +1265,13 @@ class StokesPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
             self.ax_QU.set_xlabel(r'$q$ [ % ]')
             # labelpad=25, not the default ~4 -- see ModelPlot.ax_x's own
             # comment (same rotation=270 + tick_right() crowding).
-            self.ax_QU.set_ylabel(r'$u$ [ % ]', rotation=270, labelpad=45)
+            self.ax_QU.set_ylabel(r'$u$ [ % ]', rotation=270, labelpad=25)
             # Percent values: plain tick labels, never an x10^n offset above the axis.
             self.ax_QU.ticklabel_format(axis='both', style='plain', useOffset=False)
             self.line_Q = self.line_U = None
             self.line_Q1 = self.line_U1 = self.line_Q2 = self.line_U2 = self.line_Q3 = self.line_U3 = None
-            self.line_QU = LineCollection([], cmap=QU_RAINBOW_CMAP, norm=mcolors.Normalize(0, 1), zorder=3)
+            self.line_QU = LineCollection([], cmap=QU_RAINBOW_CMAP, norm=mcolors.Normalize(0, 1), zorder=3,
+                                       linewidths=PLOT_PREFS['curve_width'])
             self.ax_QU.add_collection(self.line_QU)
             self.sample_lines_Q, self.sample_lines_U = [], []
             self.sample_lines_QU = [self.ax_QU.plot([], [], color='tab:purple', alpha=0.1, lw=0.6, zorder=1)[0]
@@ -1248,7 +1282,7 @@ class StokesPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
             self.ax_QU.axhline(0.0, linestyle='dashed', color='k')
         else:
             self.ax_QU.set_xlabel(r'$\nu$ [ GHz ]')
-            self.ax_QU.set_ylabel(r'$Q$, $U$ [ normalized ]', rotation=270, labelpad=45)
+            self.ax_QU.set_ylabel(r'$Q$, $U$ [ normalized ]', rotation=270, labelpad=25)
             _bound_yaxis_ticklabels(self.ax_QU)
             self.ax_QU.set_xscale(self.xscale or 'linear')
             style_grid(self.ax_QU)
@@ -1264,6 +1298,7 @@ class StokesPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
             self.line_Q3, = self.ax_QU.plot([], [], linestyle='dashdot', **main_curve_style('line_Q3', True))
             self.line_U3, = self.ax_QU.plot([], [], linestyle='dashdot', **main_curve_style('line_U3', True))
             self.ax_QU.legend(loc='upper right')
+            sync_legend_visibility(self)
             self.sample_lines_QU = []
             self.sample_lines_Q = [self.ax_QU.plot([], [], color='green', alpha=0.08, lw=0.6, zorder=1)[0]
                                     for _ in range(n_samples)]
@@ -1747,8 +1782,111 @@ class RMSynthPlot(ResizeFastMixin, FigureCanvas):
         ax.set_ylim(0, 1.3 * max(np.max(amp_dirty), np.max(amp_clean), 1e-12))
         ax.set_title(f'Faraday spectrum - from {source_label}')
         ax.legend(loc='upper right', fontsize=PLOT_PREFS['legend'])
+        sync_legend_visibility(self)
         apply_fixed_margins(self.fig, self)
         self.draw_idle()
 
     def _apply_margins(self):
         apply_fixed_margins(self.fig, self)
+
+
+class DragHandle(QLabel):
+    """Grip at the left corner of a Comparison-tab curve box: press and drag
+    it to start a QDrag carrying the box's current position in the list
+    (see CurveDropArea)."""
+
+    def __init__(self, index, box):
+        super().__init__('\u2630')  # trigram "grip"
+        self.index = index
+        self.box = box
+        self.setFixedWidth(16)
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.OpenHandCursor)
+        self.setToolTip('Drag to reorder: the top curve is first in the legend and drawn last (on top).')
+        self._press_pos = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.pos()
+
+    def mouseMoveEvent(self, event):
+        if self._press_pos is None or not event.buttons() & Qt.LeftButton:
+            return
+        if (event.pos() - self._press_pos).manhattanLength() < 4:
+            return
+        self._press_pos = None
+        mime = QMimeData()
+        mime.setData(CurveDropArea.MIME, str(self.index).encode())
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        pixmap = self.box.grab()  # ghost of the whole box follows the cursor
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(self.mapTo(self.box, event.pos()))
+        self.setCursor(Qt.ClosedHandCursor)
+        drag.exec_(Qt.MoveAction)
+        self.setCursor(Qt.OpenHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        self._press_pos = None
+
+
+class CurveDropArea(QWidget):
+    """Container of the Comparison tab's curve boxes (a QVBoxLayout of
+    them). Accepts DragHandle drags, draws a line where the box would land
+    and emits reordered(from_index, to_index) on drop, to_index being the
+    position in the list after the moved item is taken out."""
+    MIME = 'application/x-polvista-curve-index'
+    reordered = pyqtSignal(int, int)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self._drop_slot = None  # insertion slot 0..n among the current boxes, None when not dragging
+
+    def _boxes(self):
+        lay = self.layout()
+        return [lay.itemAt(i).widget() for i in range(lay.count()) if lay.itemAt(i).widget() is not None]
+
+    def _slot_at(self, y):
+        for i, box in enumerate(self._boxes()):
+            if y < box.geometry().center().y():
+                return i
+        return len(self._boxes())
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(self.MIME):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        self._drop_slot = self._slot_at(event.pos().y())
+        self.update()
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self._drop_slot = None
+        self.update()
+
+    def dropEvent(self, event):
+        slot = self._slot_at(event.pos().y())
+        src = int(bytes(event.mimeData().data(self.MIME)).decode())
+        self._drop_slot = None
+        self.update()
+        dst = slot - 1 if slot > src else slot
+        event.acceptProposedAction()
+        if dst != src:
+            # Deferred: the drag's source widget is destroyed by the rebuild.
+            QTimer.singleShot(0, lambda: self.reordered.emit(src, dst))
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._drop_slot is None:
+            return
+        boxes = self._boxes()
+        if not boxes:
+            return
+        y = (boxes[self._drop_slot].geometry().top() - 2 if self._drop_slot < len(boxes)
+             else boxes[-1].geometry().bottom() + 2)
+        painter = QPainter(self)
+        painter.setPen(self.palette().highlight().color())
+        for dy in (-1, 0, 1):
+            painter.drawLine(0, y + dy, self.width(), y + dy)
