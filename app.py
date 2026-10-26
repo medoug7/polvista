@@ -543,6 +543,7 @@ class PreferencesDialog(QDialog):
                  ('tick', 'Tick labels'), ('legend', 'Legend'))
     GRID_WHICH = (('both', 'Both'), ('major', 'Major'), ('none', 'None'))
     GRID_STYLES = (('solid', 'Solid'), ('dashed', 'Dashed'), ('dotted', 'Dotted'))
+    XTICK_FORMATS = (('plain', 'Plain'), ('sci', 'Scientific notation'))
 
     def __init__(self, main):
         super().__init__(main)
@@ -582,6 +583,19 @@ class PreferencesDialog(QDialog):
         palette_combo.currentTextChanged.connect(lambda t: self.main.apply_plot_preferences(comparison_palette=t))
         self._register('comparison_palette', palette_combo, palette_combo.setCurrentText)
         curve_grid.addWidget(palette_combo, 3, 1)
+        curve_grid.addWidget(QLabel('Legend side'), 4, 0)
+        side_row = QHBoxLayout()
+        side_group = QButtonGroup(self)
+        side_buttons = {}
+        for value, text in (('p', 'p'), ('x', 'χ')):
+            button = QRadioButton(text)
+            button.toggled.connect(lambda on, v=value: on and self.main.apply_plot_preferences(legend_side=v))
+            side_group.addButton(button)
+            side_row.addWidget(button)
+            side_buttons[value] = button
+        side_row.addStretch(1)
+        self._register('legend_side', side_group, lambda v: side_buttons[v].setChecked(True))
+        curve_grid.addLayout(side_row, 4, 1)
         self._register('curve_scheme', scheme_group, lambda v: scheme_buttons[v].setChecked(True))
         layout.addWidget(curve_box)
 
@@ -621,7 +635,8 @@ class PreferencesDialog(QDialog):
         grid_layout.addWidget(QLabel('Linewidth'), 0, 0)
         grid_layout.addWidget(self._spin('grid_width', 0.1, 10.0, 0.1), 0, 1)
         for row, (key, text, options) in enumerate((
-                ('grid_which', 'Axis', self.GRID_WHICH), ('grid_style', 'Linestyle', self.GRID_STYLES)),
+                ('grid_which', 'Axis', self.GRID_WHICH), ('grid_style', 'Linestyle', self.GRID_STYLES),
+                ('xtick_format', 'x-axis', self.XTICK_FORMATS)),
                 start=1):
             grid_layout.addWidget(QLabel(text), row, 0)
             group = QButtonGroup(self)

@@ -19,7 +19,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.collections import LineCollection
 import matplotlib.transforms as mtransforms
-from matplotlib.ticker import NullFormatter, NullLocator
+from matplotlib.ticker import NullFormatter, NullLocator, ScalarFormatter, LogFormatterSciNotation, FuncFormatter
 
 from matplotlib import mathtext as _mathtext
 
@@ -37,7 +37,10 @@ from polvista.rm_synthesis import sci_latex
 
 # Default figure preferences (Preferences menu): the values polvista starts
 # with and that Restore falls back to. Font sizes in points; grid_which is
-# 'both' (major + faint minor), 'major' or 'none'; grid_style is a
+# 'both' (major + faint minor), 'major' or 'none'; xtick_format ('plain' or
+# 'sci') is the x tick-label format of the vs-lambda^2 / vs-frequency plots;
+# legend_side ('p' or 'x') is the subplot of the vs-lambda^2 figure holding the
+# legend; grid_style is a
 # CURVE_LINESTYLES key for curve_style, a matplotlib linestyle name for
 # grid_style; curve_scheme is 'default' (each curve its own color) or 'custom'
 # (all of the visualizer's model curves in curve_color); curve_samples is the
@@ -50,7 +53,7 @@ DEFAULT_PLOT_PREFS = {
     'title': 27, 'label': 25, 'tick': 22, 'legend': 20,
     'title_color': '#000000', 'label_color': '#000000',
     'tick_color': '#000000', 'legend_color': '#000000',
-    'grid_which': 'both', 'grid_style': 'solid', 'grid_width': 1.0,
+    'grid_which': 'both', 'grid_style': 'solid', 'grid_width': 1.0, 'xtick_format': 'plain', 'legend_side': 'p',
     'curve_width': 2.5, 'curve_style': 'solid', 'curve_scheme': 'default', 'curve_color': '#000000', 'comparison_palette': 'polvista',
     'curve_samples': 0,
     'marker': 'o', 'marker_size': 4, 'marker_fill': '#000000',
@@ -277,6 +280,8 @@ def apply_plot_prefs(canvas):
             offset.set_fontsize(p['tick'])
             offset.set_color(p['tick_color'])
         apply_grid(ax)
+        if getattr(ax, '_polvista_xformat', False):
+            apply_xtick_format(ax)
         legend = ax.get_legend()
         if legend is not None:
             for text in legend.get_texts():
@@ -556,13 +561,38 @@ class BlitDragMixin:
         self.blit(self.fig.bbox)
 
 
-def style_grid(ax):
+def apply_xtick_format(ax):
+    """Set `ax`'s major x tick labels per PLOT_PREFS['xtick_format']: 'plain'
+    keeps matplotlib's default, 'sci' uses scientific notation (a x10^n
+    offset on a linear axis, powers of ten on a log one). Re-applied after
+    set_xscale/clear(), which reset the formatter."""
+    log = ax.get_xscale() == 'log'
+    if PLOT_PREFS['xtick_format'] == 'sci':
+        if log:
+            ax.xaxis.set_major_formatter(LogFormatterSciNotation())  # 10^0, 10^1
+        else:
+            fmt = ScalarFormatter(useMathText=True)
+            fmt.set_powerlimits((0, 0))
+            ax.xaxis.set_major_formatter(fmt)
+    elif log:
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f'{v:g}'))  # 1, 10
+    else:
+        ax.xaxis.set_major_formatter(ScalarFormatter())
+    ax.xaxis.get_offset_text().set_fontsize(PLOT_PREFS['tick'])
+    ax.xaxis.get_offset_text().set_color(PLOT_PREFS['tick_color'])
+
+
+def style_grid(ax, xformat=False):
     """Major grid at full strength, minor grid fainter and unlabeled. Must be
     re-applied after set_xscale/set_yscale/clear(), which reset the locators
-    and formatters (a log axis otherwise labels its minor ticks)."""
+    and formatters (a log axis otherwise labels its minor ticks). `xformat`
+    also applies the x tick-label format preference (lambda^2 / frequency axes)."""
     ax._polvista_minor = None
     ax.minorticks_on()
     apply_grid(ax)
+    if xformat:
+        apply_xtick_format(ax)
+        ax._polvista_xformat = True
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.yaxis.set_minor_formatter(NullFormatter())
 
@@ -731,12 +761,12 @@ class ModelPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
         # expensive, so slider drags reuse these Line2D objects via
         # set_data() instead of clear()+replot().
         self.ax_p.set_ylabel(r'$p$ [ % ]')
-        style_grid(self.ax_p)
+        style_grid(self.ax_p, xformat=True)
         _bound_yaxis_ticklabels(self.ax_p)
         # labelpad=25: rotation=270 + tick_right() above put this ylabel
         # right against its own tick labels at the default pad.
         self.ax_x.set_ylabel(r'$\chi$ [ deg ]', rotation=270, labelpad=25)
-        style_grid(self.ax_x)
+        style_grid(self.ax_x, xformat=True)
         _bound_yaxis_ticklabels(self.ax_x)
         self.line_p, = self.ax_p.plot([], [], **main_curve_style('line_p'))
         self.line_x, = self.ax_x.plot([], [], **main_curve_style('line_x'))
@@ -820,7 +850,7 @@ class ModelPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
                 ln_x, = self.ax_x.plot(w2, x_c, zorder=4)
                 self.perm_lines_p.append(ln_p)
                 self.perm_lines_x.append(ln_x)
-        sig = _curve_signature(self.perm_curves) + (self.legend_fontsize,)
+        sig = _curve_signature(self.perm_curves) + (self.legend_fontsize, PLOT_PREFS['legend_side'])
         if sig != self._perm_style_sig:
             self._perm_style_sig = sig
             n = len(self.perm_curves)
@@ -829,11 +859,13 @@ class ModelPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
                 _style_curve_line(ln_p, c, c['name'], _curve_zorder(i, n))
                 _style_curve_line(ln_x, c, '_nolegend_', _curve_zorder(i, n))
                 _style_sample_lines(samples, c)
-            legend = self.ax_p.get_legend()
-            if legend is not None:
-                legend.remove()
+            for ax in (self.ax_p, self.ax_x):
+                legend = ax.get_legend()
+                if legend is not None:
+                    legend.remove()
             if self.perm_lines_p:
-                self.ax_p.legend(handles=self.perm_lines_p, loc='best', fontsize=self.legend_fontsize)
+                ax_leg = self.ax_x if PLOT_PREFS['legend_side'] == 'x' else self.ax_p
+                ax_leg.legend(handles=self.perm_lines_p, loc='best', fontsize=self.legend_fontsize)
             sync_legend_visibility(self)
         return self._perm_arrays
 
@@ -933,8 +965,8 @@ class ModelPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
         if xscale != self.xscale:
             self.ax_p.set_xscale(xscale)
             self.ax_x.set_xscale(xscale)
-            style_grid(self.ax_p)
-            style_grid(self.ax_x)
+            style_grid(self.ax_p, xformat=True)
+            style_grid(self.ax_x, xformat=True)
             self.xscale = xscale
         xlo, xhi = np.min(w2) * 0.9, np.max(w2) * 1.05
         perm = self._refresh_permanent(wl_ext, w2)
@@ -1065,7 +1097,7 @@ class StokesPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
         self.ax_I.set_xlabel(r'$\nu$ [ GHz ]')
         self.ax_I.set_ylabel(r'$I$ [ normalized ]')
         self.ax_I.set_yscale('log')
-        style_grid(self.ax_I)
+        style_grid(self.ax_I, xformat=True)
         self.line_I, = self.ax_I.plot([], [], label=r'$I$', **main_curve_style('line_I'))
         # Per-component curves for two-component models (see
         # models.stokes_components) -- component 1 dashed, component 2
@@ -1249,6 +1281,7 @@ class StokesPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
         self._samples_cache_key = _SAMPLES_CACHE_UNSET
         self._samples_polar_cache_key = _SAMPLES_CACHE_UNSET
         self.ax_QU.clear()
+        self.ax_QU._polvista_xformat = False  # set again by style_grid in Spectra mode only (Polar's x is q, not nu)
         self._bands_sig = None  # the clear() above dropped ax_QU's shaded bands
         apply_grid(self.ax_QU)
         # Mirror the y-axis onto the right spine (like ModelPlot.ax_x) so
@@ -1285,7 +1318,7 @@ class StokesPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
             self.ax_QU.set_ylabel(r'$Q$, $U$ [ normalized ]', rotation=270, labelpad=25)
             _bound_yaxis_ticklabels(self.ax_QU)
             self.ax_QU.set_xscale(self.xscale or 'linear')
-            style_grid(self.ax_QU)
+            style_grid(self.ax_QU, xformat=True)
             self.line_QU = None
             self.line_Q, = self.ax_QU.plot([], [], label=r'$Q$', **main_curve_style('line_Q'))
             self.line_U, = self.ax_QU.plot([], [], label=r'$U$', **main_curve_style('line_U'))
@@ -1391,10 +1424,10 @@ class StokesPlot(BlitDragMixin, CenterMixin, ResizeFastMixin, FigureCanvas):
         xscale = 'log' if log_xscale else 'linear'
         if xscale != self.xscale:
             self.ax_I.set_xscale(xscale)
-            style_grid(self.ax_I)
+            style_grid(self.ax_I, xformat=True)
             if self.mode == 'Spectra':
                 self.ax_QU.set_xscale(xscale)
-                style_grid(self.ax_QU)
+                style_grid(self.ax_QU, xformat=True)
             self.xscale = xscale
 
         self.line_I.set_data(nu_s, arrays['I_s'])

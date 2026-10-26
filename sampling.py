@@ -536,10 +536,22 @@ class _KwargsWorker(QThread):
     (signatures differ per worker), and override `catch_types` if
     SystemExit needs catching too (see MultiNestWorker)."""
     catch_types = (Exception,)
+    # Strong refs to workers whose run() hasn't fully returned yet. The
+    # owners set `self.xx_worker = None` from inside finished_ok/failed
+    # slots (and when dropping a stale corner build), which can happen
+    # before the thread has actually finished; letting the Python wrapper
+    # be collected then aborts with "QThread: Destroyed while thread is
+    # still running".
+    _running = set()
 
     def __init__(self, kwargs, parent=None):
         super().__init__(parent)
         self.kwargs = kwargs
+        _KwargsWorker._running.add(self)
+        self.finished.connect(self._release)
+
+    def _release(self):
+        _KwargsWorker._running.discard(self)
 
     def run(self):
         try:
